@@ -23,6 +23,7 @@
 #include "DmMotor.hpp"
 #include "Joint.hpp"
 #include "Controller.hpp"
+#include "TransformPlanner.hpp"
 
 // ========================================================================
 // 全局电机指针
@@ -46,6 +47,18 @@ static BSP::JOINT::JointManager joint_manager;
 //   - 每周期 Update 从 JointManager 读 feedback → PID → Motor.ctrl_Mit
 //   - Stage03 仅 Pitch 使能；Yaw/Fold 失能但发送零力矩保持在线
 static BSP::CTRL::GimbalController gimbal_controller;
+
+// ========================================================================
+// TransformPlanner 全局实例(Stage05 变形规划器)
+// ========================================================================
+// 设计原因：
+//   - Stage05 合并实现 Motion Planner + Morphology Manager
+//   - 接收 Watch 命令(EXPAND/CONTRACT/ABORT/RESET)
+//   - 按状态机执行两段串行动作（Pitch 先 → Fold 后 / Fold 先 → Pitch 后）
+//   - TRANSITION 状态写入 Controller_Data.pitch/fold.target_angle
+//   - 终态/IDLE/ABORT 释放 target 给 Watch
+//   - 调用位置：JointManager.Update 之后，syncDataToController 之前（Step 2.5）
+static BSP::PLANNER::TransformPlanner transform_planner;
 
 // ========================================================================
 // Watch ↔ Joint 同步辅助
@@ -97,34 +110,70 @@ static inline void syncJointToData(const BSP::JOINT::Joint &joint, Joint_Data_Un
  * @brief Watch → JointController(每周期同步，允许在线调参/启停)
  *
  * 同步字段(Watch 可写)：
- *   target_angle     : 目标角度(rad)
- *   kp/ki/kd         : PID 参数
- *   torque_limit     : 输出力矩限幅
- *   break_i          : 积分隔离阈值
- *   limit_i          : 积分输出限幅
- *   enabled          : 使能标志
+ *   target_angle        : 目标角度(rad)
+ *   kp/ki/kd            : 角度环 PID 参数(单级模式=主PID; 串级模式=外环)
+ *   torque_limit        : 输出力矩限幅
+ *   break_i             : 角度环积分隔离阈值
+ *   limit_i             : 角度环积分输出限幅
+ *   cascade_mode        : 串级模式开关(0=单级, 1=串级)
+ *   vel_kp/vel_ki/vel_kd: 速度环 PID 参数(仅 cascade_mode=1 生效)
+ *   vel_limit           : 速度环输出限幅(rad/s)
+ *   break_i_vel         : 速度环积分隔离阈值
+ *   limit_i_vel         : 速度环积分输出限幅
+ *   enabled             : 使能标志
+ *
+ * @note cascade_mode 切换时会清空两个 PID 状态，避免残留积分导致输出跳变
  */
 static inline void syncDataToController(const Controller_Data_Unit_t &data,
                                         BSP::CTRL::JointController &ctrl)
 {
-    // PID 参数(Watch 在线调参)
+    // 角度环 PID 参数(Watch 在线调参)
     ctrl.kpid.kp = data.kp;
     ctrl.kpid.ki = data.ki;
     ctrl.kpid.kd = data.kd;
+
+    // 速度环 PID 参数(仅 cascade_mode=1 时使用)
+    ctrl.kpid_vel.kp = data.vel_kp;
+    ctrl.kpid_vel.ki = data.vel_ki;
+    ctrl.kpid_vel.kd = data.vel_kd;
 
     // 限幅参数
     ctrl.torque_limit = data.torque_limit;
     ctrl.break_i      = data.break_i;
     ctrl.limit_i      = data.limit_i;
+    ctrl.vel_limit     = data.vel_limit;
+    ctrl.break_i_vel   = data.break_i_vel;
+    ctrl.limit_i_vel   = data.limit_i_vel;
+
+    // 重力补偿参数(Watch 在线标定)
+    //   仅串级模式生效(gravity_enable && cascade_mode)
+    //   公式: gravity_torque = gravity_k * cos(feedback_angle)
+    ctrl.gravity_k     = data.gravity_k;
+    ctrl.gravity_enable = data.gravity_enable ? 1 : 0;
 
     // 同步到 PID 内部(积分隔离 + 积分限幅)
     ctrl.position_pid.pid.Break_I = data.break_i;
-    ctrl.position_pid.pid.MixI     = data.limit_i;
+    ctrl.position_pid.pid.MixI    = data.limit_i;
+    ctrl.velocity_pid.pid.Break_I = data.break_i_vel;
+    ctrl.velocity_pid.pid.MixI    = data.limit_i_vel;
+
+    // 串级模式切换：检测到模式变化时清空两个 PID，避免状态污染
+    //   单级→串级：清空速度环（之前没运行过）
+    //   串级→单级：清空速度环（不再使用）
+    {
+        uint8_t new_mode = data.cascade_mode ? 1 : 0;
+        if (new_mode != ctrl.cascade_mode)
+        {
+            ctrl.cascade_mode = new_mode;
+            ctrl.position_pid.clearPID();
+            ctrl.velocity_pid.clearPID();
+        }
+    }
 
     // 目标角度同步规则：
     //   - 控制器首次运行时(target_inited=0)：target 由 feedback 自动初始化
     //   - 控制器已初始化(target_inited=1)：Watch 中的 target_angle 生效
-    //   - 这样保证上电瞬间 error=0，不会输出冲击力矩
+    //   这样保证上电瞬间 error=0，不会输出冲击力矩
     if (ctrl.target_inited)
     {
         ctrl.target_angle = data.target_angle;
@@ -146,7 +195,10 @@ static inline void syncDataToController(const Controller_Data_Unit_t &data,
  *
  * 回写字段(Watch 只读)：
  *   feedback_angle : 反馈角度
- *   error          : 位置误差
+ *   error          : 角度环误差
+ *   vel_target     : 速度环目标(=角度环输出, 串级模式有效)
+ *   vel_feedback   : 速度环反馈(=Joint.velocity)
+ *   vel_error      : 速度环误差
  *   torque_output  : 输出力矩
  *   limit_min/max  : 关节限位
  */
@@ -156,8 +208,13 @@ static inline void syncControllerToData(const BSP::CTRL::JointController &ctrl,
 {
     data.feedback_angle = ctrl.feedback_angle;
     data.error          = ctrl.error;
+    data.vel_target     = ctrl.vel_target;
+    data.vel_feedback   = ctrl.vel_feedback;
+    data.vel_error      = ctrl.vel_error;
     data.torque_output  = ctrl.torque_output;
+    data.gravity_torque = ctrl.gravity_torque;  // 重力补偿输出(N·m)
     data.enabled        = ctrl.enabled;
+    data.cascade_mode   = ctrl.cascade_mode;
     // 回写 target_angle：首次初始化时让 Watch 看到当前实际 target
     data.target_angle   = ctrl.target_angle;
     // 限位值从 Joint 同步
@@ -234,7 +291,25 @@ void GimbalUpdate()
     joint_manager.Update(dm4310_yaw_pitch, dm4340_fold);
 
     // ---------------------------------------------------------------
+    // Step 2.5: TransformPlanner.Update（Stage05 变形动作规划）
+    //   位置：Joint feedback 已更新 / Controller target 尚未同步
+    //   职责：
+    //     - 读 Watch 命令(Transform_Config.cmd)
+    //     - 状态机执行（IDLE/TRANSITION/终态/ABORT）
+    //     - TRANSITION 状态: 写 Controller_Data.pitch/fold.target_angle
+    //     - 终态/IDLE/ABORT: 不写（释放给 Watch）
+    //     - 异常(超时/离线): snap target 到 feedback（Hold 当前位置）
+    //   调用频率：1kHz（与 GimbalUpdate 一致）
+    // ---------------------------------------------------------------
+    transform_planner.Update(joint_manager,
+                             Controller_Data,
+                             Transform_Config,
+                             Transform_Status);
+
+    // ---------------------------------------------------------------
     // Step 3: Watch → GimbalController(在线调参 / 设目标 / 启停)
+    //   注意：Planner 在 Step 2.5 已可能修改 pitch/fold.target_angle
+    //         此处 syncDataToController 会将最新 target 同步到 JointController
     // ---------------------------------------------------------------
     syncDataToController(Controller_Data.yaw,   gimbal_controller.yaw);
     syncDataToController(Controller_Data.pitch, gimbal_controller.pitch);
@@ -260,30 +335,14 @@ void GimbalUpdate()
 
     // ---------------------------------------------------------------
     // Step 6: VOFA+ 波形发送（降频到 500Hz）
-    //   1kHz 任务每 2 次发送 1 次，避免串口带宽饱和
-    //   115200bps ≈ 11520 字节/秒，每帧 28 字节 × 500Hz = 14000 字节/秒
-    //   接近带宽上限，DMA 忙时会自动跳过
-    //
-    //   6 通道分配（当前仅观测 Pitch）：
-    //     CH0: pitch.target_angle   目标角度（rad）
-    //     CH1: pitch.feedback_angle 反馈角度（rad）
-    //     CH2: pitch.error          位置误差（rad）
-    //     CH3: pitch.torque_output   输出力矩（N·m）
-    //     CH4: joint.pitch.real_angle Joint 层真实角度（rad）
-    //     CH5: 0.0f                  预留
+    //   调用 Variable.cpp 中的 VofaSendDebugChannels()
+    //   修改通道配置：只需改 Variable.cpp，无需改此文件
     // ---------------------------------------------------------------
     static uint8_t vofa_counter = 0;
     vofa_counter++;
     if (vofa_counter >= 2)
     {
         vofa_counter = 0;
-        APP::Vofa.Send6Floats(
-            gimbal_controller.pitch.target_angle,    // CH0: 目标角度
-            gimbal_controller.pitch.feedback_angle,  // CH1: 反馈角度
-            gimbal_controller.pitch.error,           // CH2: 位置误差
-            gimbal_controller.pitch.torque_output,   // CH3: 输出力矩
-            joint_manager.pitch.getRealAngle(),      // CH4: Joint 真实角度
-            0.0f                                     // CH5: 预留
-        );
+        VofaSendDebugChannels();  // ← 在 Variable.cpp 中实现，方便修改通道
     }
 }

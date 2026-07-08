@@ -112,19 +112,27 @@ typedef struct
 // 单关节 Controller 数据结构(Watch 可观察 + 在线调参)
 // ========================================================================
 /**
- * @brief 单关节 Controller 数据（位置式 PID）
+ * @brief 单关节 Controller 数据（位置式 PID，支持单级/串级）
  *
  *   --- 输入(可写) ---
  *   target_angle      : 目标角度(rad)
- *   kp/ki/kd          : PID 参数
- *   torque_limit       : 力矩限幅(N·m)
- *   break_i            : 积分隔离阈值(rad)
- *   limit_i            : 积分输出限幅(N·m)
+ *   kp/ki/kd          : 角度环 PID 参数（单级模式 = 主 PID；串级模式 = 外环）
+ *   torque_limit       : 输出力矩限幅(N·m)
+ *   break_i            : 角度环积分隔离阈值(rad)
+ *   limit_i            : 角度环积分输出限幅(N·m)
+ *   cascade_mode       : 串级模式开关(0=单级位置式, 1=串级 角度环+速度环均位置式)
+ *   vel_kp/vel_ki/vel_kd : 速度环 PID 参数（仅 cascade_mode=1 时生效）
+ *   vel_limit          : 速度环输出限幅(rad/s) = 角度环输出限幅
+ *   break_i_vel        : 速度环积分隔离阈值(rad/s)
+ *   limit_i_vel        : 速度环积分输出限幅(N·m)
  *   enabled            : 使能(1=控制中)
  *
  *   --- 输出(只读) ---
  *   feedback_angle    : 反馈角度(rad)
- *   error             : 位置误差(rad)
+ *   error             : 角度环误差(rad)
+ *   vel_target        : 速度环目标(rad/s) = 角度环 PID 输出（串级模式有效）
+ *   vel_feedback      : 速度环反馈(rad/s) = Joint.velocity
+ *   vel_error         : 速度环误差(rad/s)
  *   torque_output     : 最终输出力矩(N·m)
  *   limit_min/max     : 关节限位(rad)
  */
@@ -132,18 +140,33 @@ typedef struct
 {
     // --- 输入(Watch 可调) ---
     float    target_angle;     // 目标角度(rad)
-    float    kp;               // 比例系数
-    float    ki;               // 积分系数
-    float    kd;               // 微分系数
+    float    kp;               // 角度环比例系数
+    float    ki;               // 角度环积分系数
+    float    kd;               // 角度环微分系数
     float    torque_limit;     // 输出力矩限幅(N·m)
-    float    break_i;          // 积分隔离阈值(rad)
-    float    limit_i;          // 积分输出限幅(N·m)
+    float    break_i;          // 角度环积分隔离阈值(rad)
+    float    limit_i;          // 角度环积分输出限幅(N·m)
+    uint8_t  cascade_mode;     // 串级模式开关: 0=单级位置式, 1=串级(角度环+速度环均位置式)
+    float    vel_kp;           // 速度环比例系数(仅 cascade_mode=1 生效)
+    float    vel_ki;           // 速度环积分系数
+    float    vel_kd;           // 速度环微分系数
+    float    vel_limit;        // 速度环输出限幅(rad/s) = 角度环输出限幅
+    float    break_i_vel;      // 速度环积分隔离阈值(rad/s)
+    float    limit_i_vel;      // 速度环积分输出限幅(N·m)
     uint8_t  enabled;          // 使能标志(1=控制中)
+
+    // --- 重力补偿(Watch 可调, 仅串级模式生效) ---
+    float    gravity_k;        // 重力补偿系数(N·m), 公式: m·g·r, Watch 在线标定
+    uint8_t  gravity_enable;   // 重力补偿使能: 0=关, 1=开(串级模式专用, Fold Stage04)
 
     // --- 输出(Watch 只读) ---
     float    feedback_angle;   // 反馈角度(rad)
-    float    error;            // 位置误差(rad)
+    float    error;            // 角度环误差(rad)
+    float    vel_target;       // 速度环目标(rad/s) = 角度环 PID 输出
+    float    vel_feedback;     // 速度环反馈(rad/s)
+    float    vel_error;        // 速度环误差(rad/s)
     float    torque_output;    // PID 输出力矩(N·m)
+    float    gravity_torque;   // 重力补偿输出(N·m), Watch 观察用
     float    limit_min;        // 关节限位下限(rad)，从 Joint 同步
     float    limit_max;        // 关节限位上限(rad)，从 Joint 同步
 } Controller_Data_Unit_t;
@@ -173,10 +196,101 @@ typedef struct
 } Controller_Data_t;
 
 // ========================================================================
+// Stage05 变形规划器配置参数（Watch 可调）
+// ========================================================================
+/**
+ * @brief 变形动作规划器配置（Stage05）
+ *
+ * Watch 中可直接修改这些参数，实时影响变形动作：
+ *   pitch_expand      : 展开后 Pitch 水平位(rad) [Fold 展开后 Pitch 的水平目标]
+ *   pitch_contract    : 收起 Pitch 角度(rad)      [最收缩位]
+ *   fold_expand       : 展开 Fold 角度(rad)       [最大上抬角度]
+ *   fold_contract     : 收起 Fold 角度(rad)       [最小角度 0]
+ *   arrive_eps        : 到位误差阈值(rad)         [默认 0.02 ≈ 1.1°]
+ *   arrive_timeout_ms : 单步超时(ms)              [默认 3000，避免卡死]
+ *   cmd               : 命令输入(单次触发)
+ *                       0=NONE  1=EXPAND  2=CONTRACT  3=ABORT  4=RESET
+ *
+ * 动作序列（严格串行，避免 Fold 转动时干扰 Pitch）：
+ *   展开: pitch→pitch_expand → 等 pitch 到位 → fold→fold_expand → EXPANDED
+ *   收起: fold→fold_contract → 等 fold 到位  → pitch→pitch_contract → CONTRACTED
+ *
+ * @note cmd 由 Planner 消费后自动清零（cfg.cmd=0）
+ */
+typedef struct
+{
+    float    pitch_expand;       // 展开后 Pitch 水平位(rad), 实测 0.126987755
+    float    pitch_contract;     // 收起 Pitch 角度(rad),     实测 -0.792750061
+    float    fold_expand;        // 展开 Fold 角度(rad),      实测 0.901044846
+    float    fold_contract;      // 收起 Fold 角度(rad),      实测 0.0
+    float    arrive_eps;         // 到位误差阈值(rad), 默认 0.02
+    uint16_t arrive_timeout_ms;  // 单步超时(ms),      默认 3000
+    uint8_t  cmd;                // 命令: 0=NONE 1=EXPAND 2=CONTRACT 3=ABORT 4=RESET
+} Transform_Config_t;
+
+// ========================================================================
+// Stage05 变形规划器状态（Watch 观察）
+// ========================================================================
+/**
+ * @brief 变形动作规划器运行时状态（Stage05）
+ *
+ * Watch 中展开 Transform_Status 即可观察变形过程：
+ *   state            : 当前状态(0=IDLE, 1=EXPAND_PITCH_PRE, 2=EXPAND_FOLD_DEPLOY,
+ *                      3=EXPANDED, 4=CONTRACT_FOLD_RETURN, 5=CONTRACT_PITCH_RETURN,
+ *                      6=CONTRACTED, 7=ABORT)
+ *   step             : 当前步骤序号(0=待机/终态, 1=第一步, 2=第二步)
+ *   pitch_target_now : 当前下发的 pitch target(rad)
+ *                      [TRANSITION: Planner 写入值; 终态/IDLE/ABORT: Controller_Data 中的值]
+ *   fold_target_now  : 当前下发的 fold target(rad)
+ *   pitch_err        : 实时 pitch 误差(rad) = pitch_target_now - pitch_fb
+ *   fold_err         : 实时 fold 误差(rad)  = fold_target_now  - fold_fb
+ *   step_elapsed_ms  : 当前步已耗时(ms), 仅 TRANSITION 状态累加
+ *   pitch_online     : pitch 在线状态(1=在线)
+ *   fold_online      : fold 在线状态(1=在线)
+ *   last_error       : ABORT 原因(0=正常, 1=TIMEOUT, 2=MOTOR_OFFLINE, 3=ABORT_CMD)
+ */
+typedef struct
+{
+    uint8_t  state;               // 当前状态(0..7)
+    uint8_t  step;                // 当前步骤序号(0/1/2)
+    float    pitch_target_now;    // 当前 pitch target(rad)
+    float    fold_target_now;     // 当前 fold target(rad)
+    float    pitch_err;           // pitch 误差(rad)
+    float    fold_err;            // fold 误差(rad)
+    uint16_t step_elapsed_ms;     // 当前步已耗时(ms)
+    uint8_t  pitch_online;        // pitch 在线状态
+    uint8_t  fold_online;         // fold 在线状态
+    uint8_t  last_error;          // ABORT 原因(0/1/2/3)
+} Transform_Status_t;
+
+// ========================================================================
 // 全局变量 extern 声明(定义在 Variable.cpp)
 // ========================================================================
 extern Joint_Data_t       Joint_Data;        // 关节状态(Stage01-02)
 extern Controller_Data_t  Controller_Data;   // 控制器状态(Stage03)
+extern Transform_Config_t  Transform_Config;  // 变形规划器配置(Stage05)
+extern Transform_Status_t  Transform_Status;  // 变形规划器状态(Stage05)
+
+// ========================================================================
+// VOFA+ 调试通道发送函数(定义在 Variable.cpp)
+// ========================================================================
+/**
+ * @brief VOFA+ 6 通道发送函数（在 GimbalUpdate 中调用）
+ *
+ * 数据来源：Controller_Data.pitch（方便在 Variable.cpp 中修改通道配置）
+ *
+ * 通道分配（Stage03 Pitch 串级 PID 调参观测）：
+ *   CH0: pitch.target_angle    目标角度（rad）       外环输入
+ *   CH1: pitch.feedback_angle  反馈角度（rad）       外环反馈
+ *   CH2: pitch.error           角度环误差（rad）     外环误差
+ *   CH3: pitch.torque_output   输出力矩（N·m）       内环输出
+ *   CH4: pitch.vel_target      速度环目标（rad/s）   外环输出=内环输入
+ *   CH5: pitch.vel_feedback    速度环反馈（rad/s）   内环反馈
+ *
+ * @note 调用频率：由 GimbalInit.cpp 控制（500Hz 降频）
+ *       修改通道配置：只需改 Variable.cpp 中的实现，无需改 GimbalInit.cpp
+ */
+extern void VofaSendDebugChannels(void);
 
 #ifdef __cplusplus
 }

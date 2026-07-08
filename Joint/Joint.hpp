@@ -242,8 +242,8 @@ public:
         // Pitch: 有限位, direction=-1(抬枪编码器减小), 实测标定值
         pitch.Init(
             0.8825f,     // offset (实测)
-            -0.8228f,    // limit_min (枪口最低, 实测)
-            0.6481f,     // limit_max (枪口最高, 实测)
+            -0.7927f,    // limit_min (枪口最低, 实测)
+             0.6481f,     // limit_max (枪口最高, 实测)
             -1.0f,       // direction
             false        // continuous
         );

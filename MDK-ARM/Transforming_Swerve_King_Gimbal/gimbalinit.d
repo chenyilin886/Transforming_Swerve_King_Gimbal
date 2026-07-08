@@ -779,4 +779,5 @@ transforming_swerve_king_gimbal/gimbalinit.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\unary_negate.h \
   ..\BSP\Motor\DM\DmMotor.hpp ..\BSP\Motor\MotorBase.hpp \
   ..\BSP\Common\StateWatch\state_watch.hpp ..\Joint\Joint.hpp \
-  ..\Algorithm\Controller.hpp ..\Algorithm\PID.hpp ..\BSP\stdxxx.hpp
+  ..\Algorithm\Controller.hpp ..\Algorithm\PID.hpp ..\BSP\stdxxx.hpp \
+  ..\Planner\TransformPlanner.hpp
