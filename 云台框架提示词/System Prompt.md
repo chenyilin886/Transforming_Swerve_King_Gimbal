@@ -387,6 +387,23 @@ IMU姿态解算
 每次新增、删除或重构代码后，请同步维护整个 Keil 工程
 更新 Keil 工程树（Project Tree）
 将所有新增的 `.c`、`.cpp` 源文件加入对应 Group。注意：`.h`、`.hpp` 文件无需加入 Project Tree。仅需要加入可编译源文件。
+在Keil工程中手动添加需要加的文件，在 Project 窗口中创建需要加的 Group
+验证编译通过
+
+这让的操作每次帮我修改完代码后请你帮我完成
+例如：
+“需要在Keil工程中手动添加DR16.cpp文件：
+
+1. 打开Keil工程
+2. 在Project窗口中创建新的Group：
+   - 右键点击工程名
+   - 选择"Add Group..."
+   - 命名为"BSP/Remote"或"Remote"
+3. 添加源文件：
+   - 右键点击新创建的Group
+   - 选择"Add Existing Files..."
+   - 添加 BSP/Remote/DR16.cpp
+4. 编译验证“
 
 # 注释原则
 生成代码必须添加完整注释。说明：为什么这样设计；作用；输入；输出；数据流；状态；接口关系；调试观察点；采用算法原因。

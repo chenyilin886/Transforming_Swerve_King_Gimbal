@@ -110,10 +110,11 @@ Joint_Data_t Joint_Data = {
 //   - torque_limit 按电机型号填入安全值：DM4310=10Nm, DM4340=28Nm
 //   - break_i / limit_i 给保守初值
 //   - cascade_mode:
-//       Yaw / Fold = 0  (单级位置式, Stage04 启用)
-//       Pitch       = 1  (串级 角度环+速度环均位置式, Stage03 验证对象)
-//   - vel_limit / break_i_vel / limit_i_vel 仅 Pitch 串级生效
-//   - enabled: 仅 Pitch 使能(Stage03 验证对象)，Yaw/Fold 待 Stage04
+//       Yaw  = 1  (串级 角度环+速度环均位置式, 连续旋转, Stage04 验证对象)
+//       Pitch = 1  (串级 角度环+速度环均位置式, Stage03 验证对象)
+//       Fold = 1  (串级 角度环+速度环均位置式, Stage04 验证对象)
+//   - vel_limit / break_i_vel / limit_i_vel 仅 cascade_mode=1 时生效
+//   - enabled: Pitch/Fold 使能, Yaw 默认失能(Watch 在线使能)
 //   - target_angle=0：上电后由 Controller 自动初始化为当前角度
 //
 // 注意：
@@ -121,23 +122,32 @@ Joint_Data_t Joint_Data = {
 //   - 即使 cascade_mode=1，上电也是安全的（不会输出冲击力矩）
 //   - Watch 中先调 vel_kp(内环) → 再调 kp(外环) → 给 target → 观察响应
 Controller_Data_t Controller_Data = {
-    // --- Yaw 控制器(DM4310 #1, 单级位置式) ---
+    // --- Yaw 控制器(DM4310 #1, 串级 角度环+速度环均位置式) ---
+    //   Stage04 验证对象：检查串级 PID + 连续旋转角度处理
+    //   外环: 角度环(位置式) → 输出速度目标 rad/s
+    //   内环: 速度环(位置式) → 输出力矩 N·m
+    //   调参顺序建议:
+    //     ① vel_kp 内环 P(从 0.05 起调, 观察速度环跟随)
+    //     ② vel_kd 内环 D(抑制速度环震荡, 0.001 起调)
+    //     ③ kp    外环 P(从 5.0 起调, 观察角度跟随)
+    //     ④ kd    外环 D(0.1 起调, 抑制角度超调)
+    //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .yaw = {
         .target_angle    = 0.0f,
-        .kp              = 0.0f,
-        .ki              = 0.0f,
-        .kd              = 0.0f,
+        .kp              = 0.0f,    // 角度环 P, 建议起点 5.0
+        .ki              = 0.0f,    // 角度环 I
+        .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 10.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
-        .break_i         = 0.1f,     // 误差<0.1rad 才积分
-        .limit_i         = 2.0f,     // 积分限幅 2 N·m
-        .cascade_mode    = 0,        // 单级位置式(Stage04 启用)
-        .vel_kp          = 0.0f,
-        .vel_ki          = 0.0f,
-        .vel_kd          = 0.0f,
-        .vel_limit       = 0.0f,
-        .break_i_vel     = 0.0f,
-        .limit_i_vel     = 0.0f,
-        .enabled         = 0,        // Stage04 启用
+        .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
+        .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
+        .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
+        .vel_kp          = 0.0f,    // 速度环 P, 建议起点 0.05
+        .vel_ki          = 0.0f,    // 速度环 I
+        .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.001
+        .vel_limit       = 10.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
+        .break_i_vel     = 1.0f,     // 速度误差<1rad/s 才积分
+        .limit_i_vel     = 2.0f,     // 速度环 I 项 ≤ 2 N·m
+        .enabled         = 1,        // 默认使能, 与 Pitch/Fold 一致
         .gravity_k       = 0.0f,    // Yaw 不需要重力补偿(水平旋转)
         .gravity_enable  = 0,        // Yaw 不启用
         .feedback_angle  = 0.0f,
@@ -175,8 +185,20 @@ Controller_Data_t Controller_Data = {
         .break_i_vel     = 1.0f,     // 速度误差<1rad/s 才积分
         .limit_i_vel     = 2.0f,     // 速度环 I 项 ≤ 2 N·m
         .enabled         = 1,        // Stage03 启用 Pitch
-        .gravity_k       = 0.0f,    // Pitch 暂不需要重力补偿
-        .gravity_enable  = 0,        // Pitch 暂不启用
+        // --- 重力补偿(加摩擦轮后必需) ---
+        //   物理模型: T_gravity = m·g·r·cos(θ)
+        //     θ = 枪口绝对俯仰角 = IMU pitch(IMU 闭环下 feedback_angle)
+        //     枪口水平(θ=0):    cos(0)=1,   重力矩最大 → 需要补偿最大
+        //     枪口垂直(θ=π/2):  cos(π/2)=0, 重力矩为 0  → 补偿为 0
+        //   标定方法: Watch 观察 gravity_torque, 从 2.0 起调:
+        //     ① 抬不起来 → 增大 gravity_k
+        //     ② 自发上抬 → 减小 gravity_k
+        //     ③ 最终标定值 = 枪口水平时的静态保持力矩
+        //   注意: gravity_enable=1 且 cascade_mode=1 时生效
+        //         IMU 离线切编码器时, 若编码器零位≠枪口水平, 补偿会不准
+        //         (当前编码器零位已标定为枪口水平, 可放心使用)
+        .gravity_k       = 3.0f,    // 重力补偿系数(N·m), 保守初值, Watch 在线标定
+        .gravity_enable  = 1,        // ← 启用 Pitch 重力补偿(加摩擦轮后必需)
         .feedback_angle  = 0.0f,
         .error           = 0.0f,
         .vel_target      = 0.0f,
@@ -267,7 +289,7 @@ Transform_Config_t Transform_Config = {
     .pitch_contract    = -0.792750061f,   // 收起 Pitch 角度(实测)
     .fold_expand       = 0.901044846f,    // 展开 Fold 最大上抬(实测)
     .fold_contract     = 0.0f,            // 收起 Fold 最小角度(机械限位)
-    .arrive_eps        = 0.02f,           // 到位阈值 0.02rad ≈ 1.1°
+    .arrive_eps        = 0.1f,           // 到位阈值 0.1rad ≈ 1.1°
     .arrive_timeout_ms = 3000,            // 单步超时 3000ms
     .cmd               = 0,               // NONE（上电待命）
 };
@@ -287,31 +309,208 @@ Transform_Status_t Transform_Status = {
 };
 
 // ========================================================================
+// DR16 遥控器数据全局实例（Stage04）
+// ========================================================================
+// 初始化策略：
+//   - 所有值初始化为 0（遥控器离线状态）
+//   - offline = 1（初始判定为离线）
+//   - 首次收到遥控器数据后，DR16.Parse() 更新内部状态
+//   - GimbalUpdate 中调用 DR16.IsOffline() → 更新离线状态
+//   - 同步到 DR16_Data → Watch 观察全部遥控器状态
+//
+// 数据流：
+//   UART3 DMA接收 → HAL_UARTEx_RxEventCallback → DR16.Parse()
+//     → 更新内部状态(joystick_right_/switch_left_/keyboard_等)
+//     → GimbalUpdate 每 1ms 调用 DR16.IsOffline() 检测离线
+//     → Variable.cpp 同步到 DR16_Data → Watch 实时观察
+DR16_Data_t DR16_Data = {
+    // --- 摇杆状态（ch0~ch3） ---
+    .ch0 = 0.0f,               // 右摇杆X轴
+    .ch1 = 0.0f,               // 右摇杆Y轴
+    .ch2 = 0.0f,               // 左摇杆X轴
+    .ch3 = 0.0f,               // 左摇杆Y轴
+
+    // --- 开关状态（S1/S2） ---
+    .s1 = 0,                   // S1: 左开关 UNKNOWN
+    .s2 = 0,                   // S2: 右开关 UNKNOWN
+
+    // --- 鼠标状态 ---
+    .mouse_vel_x      = 0.0f,
+    .mouse_vel_y      = 0.0f,
+    .mouse_left       = 0,
+    .mouse_right      = 0,
+
+    // --- 键盘按键状态 ---
+    .key_w            = 0,
+    .key_s            = 0,
+    .key_a            = 0,
+    .key_d            = 0,
+    .key_shift        = 0,
+    .key_ctrl         = 0,
+    .key_q            = 0,
+    .key_e            = 0,
+    .key_r            = 0,
+    .key_f            = 0,
+    .key_g            = 0,
+    .key_z            = 0,
+    .key_x            = 0,
+    .key_c            = 0,
+    .key_v            = 0,
+    .key_b            = 0,
+
+    // --- 拨轮状态 ---
+    .wheel            = 0.0f,
+
+    // --- 离线状态 ---
+    .online           = 0,     // 初始离线（0=离线, 1=在线）
+};
+
+// ========================================================================
+// IMU 数据全局实例（Stage03 接入传感器）
+// ========================================================================
+// 初始化策略：
+//   - 所有姿态数据初始化为 0（IMU 离线状态）
+//   - online = 0（初始判定为离线）
+//   - 首次收到 IMU 数据后，imu.Parse() 更新内部 euler/gyr/acc/quat/addYaw
+//   - GimbalUpdate 每 1ms 调用 imu.IsOffline() 检测离线
+//   - 同步到 IMU_Data → Watch 观察全部姿态数据
+//
+// 单位说明：
+//   保留 IMU 原始单位(deg / deg/s / g)，便于 Watch 直接核对传感器输出。
+//   后续接入控制环时再换算为 rad / rad/s。
+//
+// 数据流：
+//   UART1 DMA接收 → HAL_UARTEx_RxEventCallback → imu.Parse()
+//     → memcpy 解析(82字节) → 更新内部状态
+//     → GimbalUpdate 同步到 IMU_Data → Watch 实时观察
+IMU_Data_t IMU_Data = {
+    // --- 欧拉角（deg） ---
+    .yaw             = 0.0f,
+    .pitch           = 0.0f,
+    .roll            = 0.0f,
+
+    // --- 角速度（deg/s） ---
+    .gyro_x          = 0.0f,
+    .gyro_y          = 0.0f,
+    .gyro_z          = 0.0f,
+
+    // --- 加速度（g） ---
+    .acc_x           = 0.0f,
+    .acc_y           = 0.0f,
+    .acc_z           = 0.0f,
+
+    // --- 四元数 ---
+    .quat_w          = 0.0f,
+    .quat_x          = 0.0f,
+    .quat_y          = 0.0f,
+    .quat_z          = 0.0f,
+
+    // --- 累计角度（deg） ---
+    .add_yaw         = 0.0f,
+
+    // --- 状态 ---
+    .temperature     = 0,       // 温度(°C)
+    .online          = 0,       // 初始离线（0=离线, 1=在线）
+};
+
+// ========================================================================
+// 遥控器状态机全局实例（Stage05+: 急停 + 展开/收起控制）
+// ========================================================================
+// 初始化策略：
+//   estop_active=0    上电默认非急停
+//   s1/s2/last_s1=0   UNKNOWN 状态（首周期强制走边沿检测 else 分支）
+//   saved_*_en=0      急停前 enabled 备份（首周期无意义）
+//   planner_cmd_sent=0 本周期未发命令
+Remote_State_t Remote_State = {
+    .estop_active    = 0,
+    .remote_offline  = 0,    // 上电默认遥控器离线（等待首包）
+    .s1              = 0,
+    .s2              = 0,
+    .last_s1         = 0,
+    .planner_cmd_sent = 0,
+    .saved_yaw_en    = 0,
+    .saved_pitch_en  = 0,
+    .saved_fold_en   = 0,
+};
+
+// ========================================================================
+// LK4005 电机数据全局实例（数据接收验证用）
+// ========================================================================
+// 初始化策略：
+//   - 所有字段初始化为 0
+//   - online=0 初始离线，首次收到反馈帧后由 GimbalUpdate 同步置 1
+//   - status1_valid=0 表示尚未调用 ReadStatus1() 或未收到响应
+//
+// 数据流：
+//   CAN1 中断 → LK4005::Parse → Configure → unit_data_[0]
+//     → GimbalUpdate 同步到 LK4005_Data → Watch 观察
+LK4005_Data_t LK4005_Data = {
+    .angle           = 0.0f,
+    .velocity        = 0.0f,
+    .torque          = 0.0f,
+    .temperature     = 0.0f,
+    .raw_angle       = 0,
+    .raw_velocity    = 0,
+    .raw_current     = 0,
+    .raw_cmd         = 0,
+    .voltage         = 0,
+    .error_state     = 0,
+    .status1_valid   = 0,
+    .online          = 0,
+};
+
+// ========================================================================
 // VOFA+ 调试通道发送函数
 // ========================================================================
 /**
  * @brief VOFA+ 6 通道发送函数
  *
- * 数据来源：Controller_Data.pitch（用户可在此修改通道配置）
+ * 数据来源：Controller_Data.yaw（Yaw 串级 PID 调参观测）
  *
- * 当前通道分配（Stage03 Pitch 串级 PID 调参观测）：
- *   CH0: pitch.target_angle    目标角度（rad）       外环输入
- *   CH1: pitch.feedback_angle  反馈角度（rad）       外环反馈
- *   CH2: pitch.error           角度环误差（rad）     外环误差
- *   CH3: pitch.torque_output   输出力矩（N·m）       内环输出
- *   CH4: pitch.vel_target      速度环目标（rad/s）   外环输出=内环输入
- *   CH5: pitch.vel_feedback    速度环反馈（rad/s）   内环反馈
+ * 当前通道分配（Stage04 Yaw 串级 PID 调参观测）：
+ *   CH0: yaw.target_angle    目标角度（rad）       外环输入
+ *   CH1: yaw.feedback_angle  反馈角度（rad）       外环反馈（normalized_angle）
+ *   CH2: yaw.error           角度环误差（rad）     外环误差（最短路径）
+ *   CH3: yaw.torque_output   输出力矩（N·m）       内环输出
+ *   CH4: yaw.vel_target      速度环目标（rad/s）   外环输出=内环输入
+ *   CH5: yaw.vel_feedback    速度环反馈（rad/s）   内环反馈
  *
  * 修改通道配置示例：
- *   - 观察 Yaw：改用 Controller_Data.yaw.target_angle 等
- *   - 观察 Joint：改用 Joint_Data.pitch.real_angle 等
+ *   - 观察 Pitch：改用 Controller_Data.pitch.target_angle 等
+ *   - 观察 Joint：改用 Joint_Data.yaw.real_angle 等
  *   - 观察电机原始数据：改用 Motor 层接口（需 extern 声明）
  *
  * @note 调用频率：由 GimbalInit.cpp 降频控制（500Hz）
  */
 void VofaSendDebugChannels(void)
 {
-    // === Stage05 变形规划器 6 通道（动作序列观测）===
+    // === Yaw 串级 PID 6 通道（Stage04 调参观测）===
+    //   用于观察 Yaw 串级 PID 的角度环/速度环跟随情况
+    //   调试方法：
+    //     ① Watch 中设 yaw.enabled = 1 使能 Yaw 控制器
+    //     ② Watch 中调 vel_kp(内环) → kp(外环) → 设 target_angle
+    //     ③ 观察 CH0(target) 与 CH1(feedback) 是否跟随
+    //     ④ 持续旋转 Yaw 跨越 ±π 边界，观察 CH2(error) 是否走最短路径
+    //        （error 应在 [-π, π] 内，不应出现 ±2π 跳变）
+    //     ⑤ 异常时观察 CH3(torque) 是否饱和、CH4/CH5 速度环是否跟随
+    //
+    //   通道分配：
+    //     CH0: Controller_Data.yaw.target_angle    Yaw 目标(rad)
+    //     CH1: Controller_Data.yaw.feedback_angle  Yaw 反馈(rad, normalized)
+    //     CH2: Controller_Data.yaw.error           角度环误差(rad)
+    //     CH3: Controller_Data.yaw.torque_output   输出力矩(N·m)
+    //     CH4: Controller_Data.yaw.vel_target      速度环目标(rad/s)
+    //     CH5: Controller_Data.yaw.vel_feedback    速度环反馈(rad/s)
+    APP::Vofa.Send6Floats(
+        Controller_Data.yaw.target_angle,      // CH0: Yaw 目标角度
+        Controller_Data.yaw.feedback_angle,    // CH1: Yaw 反馈角度(normalized)
+        Controller_Data.yaw.error,             // CH2: 角度环误差(最短路径)
+        Controller_Data.yaw.torque_output,     // CH3: 输出力矩
+        Controller_Data.yaw.vel_target,        // CH4: 速度环目标
+        Controller_Data.yaw.vel_feedback       // CH5: 速度环反馈
+    );
+
+    // === Stage05 变形规划器 6 通道（动作序列观测，已注释）===
     //   用于观察展开/收起过程中 Pitch/Fold 的 target/feedback 跟随
     //   调试方法：
     //     ① Watch 中改 Transform_Config.cmd = 1 (EXPAND) → 观察波形
@@ -326,6 +525,7 @@ void VofaSendDebugChannels(void)
     //     CH3: Controller_Data.fold.target_angle  Fold 目标(rad)
     //     CH4: Controller_Data.fold.feedback_angle Fold 反馈(rad)
     //     CH5: Transform_Status.step_elapsed_ms / 1000.0f  步骤耗时(s)
+    /*
     APP::Vofa.Send6Floats(
         (float)Transform_Status.state,                        // CH0: 状态机
         Controller_Data.pitch.target_angle,                   // CH1: Pitch 目标
@@ -334,6 +534,7 @@ void VofaSendDebugChannels(void)
         Controller_Data.fold.feedback_angle,                  // CH4: Fold 反馈
         (float)Transform_Status.step_elapsed_ms / 1000.0f     // CH5: 步骤耗时(s)
     );
+    */
 
     // === Fold 重力补偿 6 通道（Stage04 标定观测，已注释）===
     //   标定 gravity_k 时切回此配置

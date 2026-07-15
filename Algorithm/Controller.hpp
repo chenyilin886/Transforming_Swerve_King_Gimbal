@@ -110,6 +110,7 @@ public:
     float break_i_vel;       ///< 速度环积分隔离阈值(rad/s), |vel_error|<此值才积分
     float limit_i_vel;       ///< 速度环积分输出限幅(N·m)
     uint8_t cascade_mode;    ///< 串级模式开关: 0=单级位置式, 1=串级(角度环+速度环均位置式)
+    uint8_t continuous;      ///< 连续旋转标志: 1=Yaw(连续旋转, 角度走最短路径), 0=Pitch/Fold(有限位)
 
     // --- 运行时状态（Watch 可观察）---
     float target_angle;      ///< 目标角度(rad)
@@ -137,7 +138,7 @@ public:
         : kpid(0, 0, 0), kpid_vel(0, 0, 0),
           torque_limit(0), break_i(0), limit_i(0),
           vel_limit(0), break_i_vel(0), limit_i_vel(0),
-          cascade_mode(0),
+          cascade_mode(0), continuous(0),
           target_angle(0), feedback_angle(0),
           error(0), vel_target(0), vel_feedback(0), vel_error(0),
           torque_output(0),
@@ -191,6 +192,7 @@ public:
         enabled        = 0;
         target_inited  = 0;
         cascade_mode   = 0;   // 默认单级，Pitch 由 GimbalController.Init 置 1
+        continuous     = 0;   // 默认有限位，Yaw 由 GimbalController.Init 置 1
 
         // 重力补偿初始化（默认关闭，由 Variable.cpp 在线启用）
         gravity_k      = 0;
@@ -240,6 +242,23 @@ public:
             return 0.0f;
         }
 
+        // === 连续旋转关节角度误差最短路径处理 ===
+        //   Yaw 连续旋转时，target 与 feedback 可能跨越 ±π 边界。
+        //   若直接用 target - feedback，误差会接近 ±2π，导致 PID 输出反向冲击。
+        //   处理方法：把 target 限制在 feedback ± π 范围内，使误差落在 [-π, π]。
+        //   wrapToPi(target - feedback) 返回最短路径误差，再加回 feedback 得到等效 target。
+        //
+        //   举例：feedback = 3.0 rad, target = -3.0 rad
+        //     未处理：error = -3.0 - 3.0 = -6.0 rad（错误，绕远路）
+        //     处理后：error = wrapToPi(-6.0) = 0.28 rad（正确，走最短路径）
+        //     target_used = 3.0 + 0.28 = 3.28 rad（等效目标）
+        float target_used = target_angle;
+        if (continuous)
+        {
+            float err_short = BSP::JOINT::wrapToPi(target_angle - feedback_angle);
+            target_used = feedback_angle + err_short;
+        }
+
         if (cascade_mode)
         {
             // === 串级 PID：外环角度环（位置式）→ 内环速度环（位置式）===
@@ -247,7 +266,7 @@ public:
             // 外环：角度误差 → 速度目标(rad/s), 限幅到 [-vel_limit, vel_limit]
             vel_target = (float)position_pid.GetPidPos(
                 kpid,
-                (double)target_angle,
+                (double)target_used,
                 (double)feedback_angle,
                 (double)vel_limit
             );
@@ -267,7 +286,7 @@ public:
             // === 单级位置式 PID（Yaw/Fold 路径，与 Stage03 之前行为一致）===
             torque_output = (float)position_pid.GetPidPos(
                 kpid,
-                (double)target_angle,
+                (double)target_used,
                 (double)feedback_angle,
                 (double)torque_limit
             );
@@ -386,17 +405,100 @@ public:
     JointController pitch;    ///< Pitch 控制器
     JointController fold;     ///< Fold 控制器
 
+    // --- IMU 传感器闭环相关（由 GimbalUpdate 在 Update 前写入）---
+
+    /**
+     * @brief IMU Yaw 反馈角度(rad)
+     *
+     * 由 GimbalInit.cpp GimbalUpdate() 在调用 Update() 前写入：
+     *   yaw_imu_angle = -BSP::IMU::imu.getAddYaw() * (π/180)
+     *
+     * 取负原因：IMU Euler_yaw 正方向与编码器方向相反
+     *   （向右转时编码器角度增大，但 IMU Euler_yaw 减小）
+     *
+     * addYaw 说明：HI12H3 欧拉角 Yaw 范围 [-180°, 180°]，过 ±180° 跳变
+     *   IMU 内部 AddCaclu() 将跳变转换为连续累计角度，支持多圈旋转
+     *
+     * 当 imu_online=1 时，Update() 中 Yaw 外环反馈使用此值
+     * 当 imu_online=0 时，Update() 中 Yaw 外环反馈回退到编码器
+     */
+    float yaw_imu_angle;
+
+    /**
+     * @brief IMU 在线标志
+     *
+     * 1 = IMU 在线 → Yaw 外环使用 IMU 反馈（传感器闭环）
+     * 0 = IMU 离线 → Yaw 外环回退到编码器反馈（安全回退）
+     *
+     * 由 GimbalInit.cpp 根据 BSP::IMU::imu.isOnline() 设置
+     *
+     * 离线回退测试方法：手动拔掉 IMU 串口线，观察 Yaw 是否平稳切换到编码器闭环
+     */
+    uint8_t imu_online;
+
+    /**
+     * @brief Yaw 反馈源标识（Watch 可观察）
+     *
+     * 1 = IMU 传感器闭环（imu_online=1 时）
+     * 0 = 编码器回退（imu_online=0 时，安全回退）
+     *
+     * 在 Update() 中根据 imu_online 自动设置
+     * Watch 中观察此值可判断当前 Yaw 反馈来源
+     */
+    uint8_t yaw_fb_source;
+
+    /**
+     * @brief IMU Pitch 反馈角度(rad)
+     *
+     * 由 GimbalInit.cpp GimbalUpdate() 在调用 Update() 前写入：
+     *   pitch_imu_angle = BSP::IMU::imu.getPitch() * (π/180)
+     *
+     * 不取负原因：实测确认 IMU Pitch 正方向与编码器方向一致
+     *   （枪口抬起时编码器角度增大，IMU Pitch 也增大）
+     *
+     * getPitch() 说明：HI12H3 欧拉角 Pitch，范围 [-90°, 90°]
+     *   Pitch 是有限位关节，不需要 addAngle 累加
+     *
+     * 当 imu_online=1 时，Update() 中 Pitch 外环反馈使用此值
+     * 当 imu_online=0 时，Update() 中 Pitch 外环反馈回退到编码器
+     *
+     * 【Fold 影响分析】
+     *   IMU 安装在枪口端（Pitch 之后），IMU Pitch 直接测量枪口绝对俯仰
+     *   不管 Fold 展开/收起，IMU Pitch 始终反映枪口在世界坐标系中的真实俯仰角
+     *   → IMU 闭环下 target 含义一致：枪口俯仰角，不受 Fold 影响
+     *   → 编码器闭环下 target 含义随 Fold 变化，需要 Fold 管理器动态调整
+     *   注意：机械限位仍依赖 Fold 状态（不同 Fold 下可达范围不同），
+     *         但当前阶段先不做动态限位，等 Morphology Manager 阶段再完善
+     */
+    float pitch_imu_angle;
+
+    /**
+     * @brief Pitch 反馈源标识（Watch 可观察）
+     *
+     * 1 = IMU 传感器闭环（imu_online=1 时）
+     * 0 = 编码器回退（imu_online=0 时，安全回退）
+     *
+     * 在 Update() 中根据 imu_online 自动设置
+     * Watch 中观察此值可判断当前 Pitch 反馈来源
+     */
+    uint8_t pitch_fb_source;
+
     /**
      * @brief 初始化三关节控制器
      *
-     * Stage03 配置策略：
-     *   - Yaw / Fold : 单级位置式 PID（cascade_mode=0），Stage04 启用
-     *   - Pitch      : 串级 PID（cascade_mode=1），外环角度环 + 内环速度环，均位置式
+     * 配置策略：
+     *   - Yaw   : 串级 PID（cascade_mode=1），连续旋转（continuous=1），外环角度环 + 内环速度环
+     *   - Pitch : 串级 PID（cascade_mode=1），有限位，外环角度环 + 内环速度环
+     *   - Fold  : 串级 PID（cascade_mode=1），有限位，外环角度环 + 内环速度环
      *
-     * Pitch 串级参数说明：
+     * 串级参数说明：
      *   vel_limit     = 10 rad/s   (DM4310 VMAX=30, 保守取 10, 防止速度环目标过大)
      *   break_i_vel   = 1.0 rad/s  (速度误差<1才积分, 防止启停时积分饱和)
      *   limit_i_vel   = 2.0 N·m    (速度环 I 项≤2Nm, 防止积分主导)
+     *
+     * Yaw 连续旋转处理：
+     *   continuous=1 → Compute() 中对 target 做 wrapToPi 最短路径处理
+     *   避免跨越 ±π 边界时误差突变（详见 Compute 注释）
      *
      * @note PID 参数(kp/ki/kd)由 Variable.cpp 通过 syncDataToController 在线覆盖
      */
@@ -405,10 +507,19 @@ public:
         // Init(关节类型, 力矩限幅(N·m), 积分隔离阈值(rad), 积分限幅(N·m)
         //      [, vel_limit(rad/s), break_i_vel(rad/s), limit_i_vel(N·m)])
 
-        // --- Yaw: DM4310 TMAX=10 N·m, 单级位置式(Stage04) ---
-        yaw.Init(JointType::YAW, 10.0f, 0.1f, 2.0f);
-        //          类型      力矩上限  误差<0.1rad才积分 I项≤2Nm
-        yaw.Disable();
+        // --- Yaw: DM4310 TMAX=10 N·m, 串级(角度环+速度环均位置式), 连续旋转 ---
+        //   Stage04 验证对象：检查串级 PID + 连续旋转角度处理
+        //   continuous=1: Compute() 中 target 走最短路径，避免 ±π 边界误差突变
+        yaw.Init(JointType::YAW,
+                 10.0f,    // torque_limit: 力矩上限 10 N·m
+                 0.1f,     // break_i:      角度误差<0.1rad 才积分
+                 2.0f,     // limit_i:      角度环 I 项 ≤ 2 N·m
+                 10.0f,    // vel_limit:    速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
+                 1.0f,     // break_i_vel:  速度误差<1rad/s 才积分
+                 2.0f);    // limit_i_vel:  速度环 I 项 ≤ 2 N·m
+        yaw.continuous    = 1;   // ← Yaw 连续旋转（启用最短路径角度处理）
+        yaw.cascade_mode  = 1;   // ← 启用串级模式
+        yaw.Enable();              // 默认使能，与 Pitch/Fold 一致
 
         // --- Pitch: DM4310 TMAX=10 N·m, 串级(角度环+速度环均位置式) ---
         //   Stage03 验证对象
@@ -435,6 +546,13 @@ public:
                   5.0f);    // limit_i_vel:  速度环 I 项 ≤ 5 N·m
         fold.cascade_mode = 1;   // ← 启用串级模式
         fold.Enable();
+
+        // IMU 传感器闭环初始化
+        yaw_imu_angle   = 0.0f;    // 由 GimbalUpdate 写入 IMU addYaw(deg→rad, 取负)
+        pitch_imu_angle = 0.0f;    // 由 GimbalUpdate 写入 IMU pitch(deg→rad, 不取负)
+        imu_online      = 0;        // 默认 IMU 离线，GimbalUpdate 中根据实际状态设置
+        yaw_fb_source   = 0;        // 默认编码器反馈
+        pitch_fb_source = 0;        // 默认编码器反馈
     }
 
     /**
@@ -444,7 +562,26 @@ public:
      *   单级模式: target_angle + feedback_angle              → PID → torque
      *   串级模式: target_angle + feedback_angle + velocity   → [角度环→速度环] → torque
      *       ↑                  ↑                  ↑                ↓
-     *   Watch/SM         Joint.getRealAngle()  Joint.getVelocity()  Motor.ctrl_Mit
+     *   Watch/SM     Yaw:   IMU addYaw(在线)         Joint.getVelocity()  Motor.ctrl_Mit
+     *                Yaw:   getNormalizedAngle(离线回退)
+     *                Pitch: IMU getPitch(在线)
+     *                Pitch: getRealAngle(离线回退)
+     *                Fold:  getRealAngle(无IMU)
+     *
+     * Yaw IMU 传感器闭环：
+     *   - IMU 在线(imu_online=1)：外环反馈 = yaw_imu_angle（IMU addYaw, 取负+deg→rad）
+     *     优势：云台世界坐标系绝对航向 → 自动抗底盘扰动
+     *   - IMU 离线(imu_online=0)：外环反馈回退到编码器 getNormalizedAngle()
+     *     安全：编码器闭环虽不能抗底盘扰动，但保证不会疯车
+     *   - 内环速度反馈始终用编码器 getVelocity()（与电机力矩直接关联，闭环更紧）
+     *
+     * Pitch IMU 传感器闭环：
+     *   - IMU 在线(imu_online=1)：外环反馈 = pitch_imu_angle（IMU getPitch, deg→rad）
+     *     优势：枪口绝对俯仰角 → target 含义与 Fold 状态无关
+     *   - IMU 离线(imu_online=0)：外环反馈回退到编码器 getRealAngle()
+     *     安全：编码器闭环保证基本功能
+     *   - IMU 闭环下不做编码器坐标系限位钳位（IMU 反馈不在编码器坐标系）
+     *     机械限位延后到 Morphology Manager 阶段处理
      *
      * @param jm     JointManager（提供三个 Joint 的 feedback_angle + velocity）
      * @param dm4310 Yaw+Pitch 电机指针（可为 nullptr）
@@ -454,11 +591,33 @@ public:
                 BSP::MOTOR::DM::DM4310 *dm4310,
                 BSP::MOTOR::DM::DM4340 *dm4340)
     {
-        // --- Yaw 关节（DM4310 #1）---
+        // --- Yaw 关节（DM4310 #1, IMU 传感器闭环 + 编码器回退）---
+        //   外环角度反馈：
+        //     IMU 在线 → yaw_imu_angle（IMU addYaw, 取负+deg→rad, 连续累加支持多圈）
+        //     IMU 离线 → jm.yaw.getNormalizedAngle()（编码器回退, [-π, π]）
+        //   内环速度反馈：始终用编码器 jm.yaw.getVelocity()
+        //   连续旋转：continuous=1 → Compute() 中 wrapToPi 最短路径处理
         if (dm4310 != nullptr && jm.yaw.isOnline())
         {
-            float fb  = jm.yaw.getRealAngle();
-            float vel = jm.yaw.getVelocity();
+            float fb;
+            if (imu_online)
+            {
+                // IMU 传感器闭环：世界坐标系绝对航向
+                //   yaw_imu_angle 由 GimbalUpdate 写入 = -addYaw × (π/180)
+                //   addYaw 已跨 ±180° 连续累加，天然支持多圈旋转
+                fb = yaw_imu_angle;
+                yaw_fb_source = 1;  // 标记当前使用 IMU 反馈
+            }
+            else
+            {
+                // 编码器回退：IMU 离线时的安全降级
+                //   getNormalizedAngle() 归一化到 [-π, π]
+                //   wrapToPi 保证与累积 target 的误差走最短路径
+                fb = jm.yaw.getNormalizedAngle();
+                yaw_fb_source = 0;  // 标记当前使用编码器反馈
+            }
+
+            float vel = jm.yaw.getVelocity();  // 内环始终用编码器速度
             float tgt = yaw.target_angle;
             float torque = yaw.Compute(tgt, fb, vel);
             dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.yaw.getConfig().direction);
@@ -466,21 +625,56 @@ public:
         else if (dm4310 != nullptr)
         {
             yaw.Clear();
+            yaw_fb_source = 0;
             dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         }
 
-        // --- Pitch 关节（DM4310 #2, Stage03 串级验证对象）---
+        // --- Pitch 关节（DM4310 #2, IMU 传感器闭环 + 编码器回退）---
+        //   外环角度反馈：
+        //     IMU 在线 → pitch_imu_angle（IMU getPitch, deg→rad, 方向与编码器一致不取负）
+        //     IMU 离线 → jm.pitch.getRealAngle()（编码器回退）
+        //   内环速度反馈：始终用编码器 jm.pitch.getVelocity()
+        //   IMU 闭环下：target 含义是枪口绝对俯仰角，不受 Fold 影响
+        //   IMU 闭环下不做 clampTarget（编码器坐标系限位不适用于 IMU 反馈）
+        //
+        //   新方案：变形期间 Pitch 也用 IMU 闭环保持水平(target=0 rad)
+        //   Planner 写入 pitch.target=0（IMU 水平目标），Controller 用 IMU 反馈
+        //   IMU 离线时自动回退到编码器反馈（安全保护）
         if (dm4310 != nullptr && jm.pitch.isOnline())
         {
-            float fb  = jm.pitch.getRealAngle();
-            float vel = jm.pitch.getVelocity();   // 串级内环速度反馈
-            float tgt = clampTarget(jm.pitch, pitch.target_angle);
+            float fb;
+            float tgt;
+            if (imu_online)
+            {
+                // IMU 传感器闭环：枪口绝对俯仰角
+                //   pitch_imu_angle = getPitch() × (π/180)，不取负（方向一致）
+                //   IMU Pitch 范围 [-90°, 90°]，对应 [-π/2, π/2]
+                //   变形期间 target=0（枪口水平），非变形期间 target 由 Watch/Planner 设定
+                fb = pitch_imu_angle;
+                // IMU 闭环下不做编码器坐标系限位钳位
+                //   target 含义是枪口绝对俯仰(rad)，不在编码器坐标系
+                //   机械限位延后到 Morphology Manager 阶段
+                tgt = pitch.target_angle;
+                pitch_fb_source = 1;  // 标记当前使用 IMU 反馈
+            }
+            else
+            {
+                // 编码器闭环：IMU 离线时安全回退
+                //   getRealAngle() 包含 offset 和 direction 修正
+                //   clampTarget() 做编码器坐标系限位钳位
+                fb = jm.pitch.getRealAngle();
+                tgt = clampTarget(jm.pitch, pitch.target_angle);
+                pitch_fb_source = 0;  // 标记当前使用编码器反馈
+            }
+
+            float vel = jm.pitch.getVelocity();   // 内环始终用编码器速度
             float torque = pitch.Compute(tgt, fb, vel);
             dm4310->ctrl_Mit(2, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.pitch.getConfig().direction);
         }
         else if (dm4310 != nullptr)
         {
             pitch.Clear();
+            pitch_fb_source = 0;
             dm4310->ctrl_Mit(2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         }
 

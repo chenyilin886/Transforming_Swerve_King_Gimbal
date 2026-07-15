@@ -169,6 +169,7 @@ typedef struct
     float    gravity_torque;   // 重力补偿输出(N·m), Watch 观察用
     float    limit_min;        // 关节限位下限(rad)，从 Joint 同步
     float    limit_max;        // 关节限位上限(rad)，从 Joint 同步
+    uint8_t  feedback_source;  // 反馈源标识: 0=编码器, 1=IMU(Yaw 专用), Watch 观察用
 } Controller_Data_Unit_t;
 
 // ========================================================================
@@ -235,10 +236,9 @@ typedef struct
  * @brief 变形动作规划器运行时状态（Stage05）
  *
  * Watch 中展开 Transform_Status 即可观察变形过程：
- *   state            : 当前状态(0=IDLE, 1=EXPAND_PITCH_PRE, 2=EXPAND_FOLD_DEPLOY,
- *                      3=EXPANDED, 4=CONTRACT_FOLD_RETURN, 5=CONTRACT_PITCH_RETURN,
- *                      6=CONTRACTED, 7=ABORT)
- *   step             : 当前步骤序号(0=待机/终态, 1=第一步, 2=第二步)
+ *   state            : 当前状态(0=IDLE, 1=EXPAND_SIMULTANEOUS, 2=EXPANDED,
+ *                      3=CONTRACT_SIMULTANEOUS, 4=CONTRACTED, 5=ABORT)
+ *   step             : 当前步骤序号(0=待机/终态, 1=执行中)
  *   pitch_target_now : 当前下发的 pitch target(rad)
  *                      [TRANSITION: Planner 写入值; 终态/IDLE/ABORT: Controller_Data 中的值]
  *   fold_target_now  : 当前下发的 fold target(rad)
@@ -264,12 +264,256 @@ typedef struct
 } Transform_Status_t;
 
 // ========================================================================
+// 遥控器状态机数据结构（Stage05+: 急停 + 展开/收起控制）
+// ========================================================================
+/**
+ * @brief 遥控器状态机数据（Watch 可观察）
+ *
+ * 职责：
+ *   1. 急停状态管理（S1==DOWN && S2==DOWN）
+ *   2. S1 边沿检测 → 生成 Planner 命令(EXPAND/CONTRACT)
+ *   3. 急停时保存/恢复各关节 enabled 状态
+ *
+ * 数据流：
+ *   DR16.S1/S2 → Remote_State(estop_active/last_s1)
+ *                ├─ estop_active=1 → Controller_Data.{yaw,pitch,fold}.enabled=0
+ *                └─ S1 边沿变化    → Transform_Config.cmd = EXPAND/CONTRACT
+ *
+ * Watch 观察点：
+ *   estop_active       : 急停激活标志(1=急停中, 0=正常)
+ *   remote_offline     : 遥控器离线标志(1=离线, 0=在线) 【建议 Watch】
+ *   s1/s2              : 当前 S1/S2 原始值(1=UP, 2=DOWN, 3=MIDDLE)
+ *   last_s1            : 上一周期 S1（边沿检测用）
+ *   planner_cmd_sent   : 本周期发送的 Planner 命令
+ *                        (0=NONE, 1=EXPAND, 2=CONTRACT, 3=ABORT)
+ *   saved_yaw_en       : 急停前 yaw.enabled（退出急停时恢复）
+ *   saved_pitch_en     : 急停前 pitch.enabled
+ *   saved_fold_en      : 急停前 fold.enabled
+ *
+ * @note 急停触发条件：
+ *       ① S1==DOWN && S2==DOWN
+ *       ② 遥控器离线（remote_offline==1）
+ *       急停退出条件：S1/S2 不都是 DOWN 且遥控器在线
+ *       急停时摇杆积分失效（Step 2.6 跳过）
+ */
+typedef struct
+{
+    uint8_t estop_active;      // 急停激活标志(0=正常, 1=急停中) 【建议 Watch】
+    uint8_t remote_offline;    // 遥控器离线标志(0=在线, 1=离线) 【建议 Watch】
+    uint8_t s1;                // 当前 S1 原始值(1=UP, 2=DOWN, 3=MIDDLE) 【建议 Watch】
+    uint8_t s2;                // 当前 S2 原始值(1=UP, 2=DOWN, 3=MIDDLE) 【建议 Watch】
+    uint8_t last_s1;           // 上一周期 S1（边沿检测用）
+    uint8_t planner_cmd_sent;  // 本周期发送的 Planner 命令(0/1/2/3) 【建议 Watch】
+    uint8_t saved_yaw_en;      // 急停前 yaw.enabled（退出时恢复）
+    uint8_t saved_pitch_en;    // 急停前 pitch.enabled
+    uint8_t saved_fold_en;     // 急停前 fold.enabled
+} Remote_State_t;
+
+// ========================================================================
+// DR16 遥控器数据结构（Stage04）
+// ========================================================================
+/**
+ * @brief DR16 遥控器数据（Watch 可观察）
+ *
+ * Watch 中展开 DR16_Data 即可观察遥控器全部状态：
+ *   ch0/ch1/ch2/ch3     : 摇杆值（ch0=右X, ch1=右Y, ch2=左X, ch3=左Y）
+ *   s1/s2               : 拨杆开关状态（s1=左开关, s2=右开关）
+ *   mouse_vel_x/y       : 鼠标速度，范围 [-1.0, 1.0]
+ *   mouse_left/right    : 鼠标按键状态(0=未按下, 1=按下)
+ *   keyboard            : 键盘按键状态（位域结构体）
+ *   wheel               : 拨轮值，范围 [-1.0, 1.0]
+ *   online              : 遥控器在线状态(0=离线, 1=在线)
+ *
+ * 数据流：
+ *   UART3 DMA接收 → HAL_UARTEx_RxEventCallback → DR16.Parse()
+ *     → 更新内部状态 → Variable.cpp 回写 DR16_Data → Watch 观察
+ *
+ * 命名规范（符合RoboMaster习惯）：
+ *   - ch0: 右摇杆X轴（joystick_channel0）
+ *   - ch1: 右摇杆Y轴（joystick_channel1）
+ *   - ch2: 左摇杆X轴（joystick_channel2）
+ *   - ch3: 左摇杆Y轴（joystick_channel3）
+ *   - s1:  左开关（switch_left，遥控器左侧）
+ *   - s2:  右开关（switch_right，遥控器右侧）
+ *   - online: 遥控器在线状态（0=离线，1=在线）
+ *
+ * @note 所有值在遥控器离线时自动归零
+ */
+typedef struct
+{
+    // --- 摇杆状态（ch0~ch3） ---
+    float ch0;                 // 右摇杆X轴，[-1.0, 1.0]
+    float ch1;                 // 右摇杆Y轴，[-1.0, 1.0]
+    float ch2;                 // 左摇杆X轴，[-1.0, 1.0]
+    float ch3;                 // 左摇杆Y轴，[-1.0, 1.0]
+
+    // --- 开关状态（S1/S2） ---
+    uint8_t s1;                // S1: 左开关(0=UNKNOWN, 1=UP, 2=DOWN, 3=MIDDLE)
+    uint8_t s2;                // S2: 右开关(0=UNKNOWN, 1=UP, 2=DOWN, 3=MIDDLE)
+
+    // --- 鼠标状态 ---
+    float mouse_vel_x;         // 鼠标X轴速度，[-1.0, 1.0]
+    float mouse_vel_y;         // 鼠标Y轴速度，[-1.0, 1.0]
+    uint8_t mouse_left;        // 鼠标左键(0=未按下, 1=按下)
+    uint8_t mouse_right;       // 鼠标右键(0=未按下, 1=按下)
+
+    // --- 键盘按键状态（位域） ---
+    uint8_t key_w;             // W键
+    uint8_t key_s;             // S键
+    uint8_t key_a;             // A键
+    uint8_t key_d;             // D键
+    uint8_t key_shift;         // Shift键
+    uint8_t key_ctrl;          // Ctrl键
+    uint8_t key_q;             // Q键
+    uint8_t key_e;             // E键
+    uint8_t key_r;             // R键
+    uint8_t key_f;             // F键
+    uint8_t key_g;             // G键
+    uint8_t key_z;             // Z键
+    uint8_t key_x;             // X键
+    uint8_t key_c;             // C键
+    uint8_t key_v;             // V键
+    uint8_t key_b;             // B键
+
+    // --- 拨轮状态 ---
+    float wheel;               // 拨轮值，[-1.0, 1.0]
+
+    // --- 离线状态 ---
+    uint8_t online;            // 遥控器在线状态(0=离线, 1=在线)
+} DR16_Data_t;
+
+// ========================================================================
+// IMU 数据结构（Stage03 接入传感器）
+// ========================================================================
+/**
+ * @brief HI12H3 IMU 数据（Watch 可观察）
+ *
+ * Watch 中展开 IMU_Data 即可观察 IMU 全部姿态数据：
+ *   yaw/pitch/roll     : 欧拉角(单位: deg，IMU 原始输出)
+ *   gyro_x/y/z         : 角速度(单位: deg/s)
+ *   acc_x/y/z          : 加速度(单位: g)
+ *   quat_w/x/y/z       : 四元数
+ *   add_yaw            : Yaw 累计角度(单位: deg，跨 ±180° 连续累加)
+ *   temperature        : 温度(单位: °C)
+ *   online             : 在线状态(0=离线, 1=在线)
+ *
+ * 数据流：
+ *   UART1 DMA接收 → HAL_UARTEx_RxEventCallback → imu.Parse()
+ *     → memcpy 解析 → 更新内部 euler/gyr/acc/quat/addYaw
+ *     → GimbalUpdate 同步到 IMU_Data → Watch 观察
+ *
+ * 单位说明：
+ *   本阶段(正确解析传感器数据)保留 IMU 原始单位(deg / deg/s / g)，
+ *   便于 Watch 直接核对传感器输出是否正确。
+ *   后续接入控制环时，在 Controller/上层换算为 rad / rad/s。
+ *
+ * 轴向映射(与参考工程一致)：
+ *   Euler_yaw   → 云台 Yaw
+ *   Euler_pitch → 云台 Pitch
+ *   Euler_roll  → Roll
+ *
+ * @note 传感器：HI12H3，输出频率 200Hz，波特率 256000(USART1)
+ */
+typedef struct
+{
+    // --- 欧拉角（deg） ---
+    float yaw;             // 航向角(deg)，[-180, 180]
+    float pitch;           // 俯仰角(deg)，[-180, 180]
+    float roll;            // 横滚角(deg)，[-180, 180]
+
+    // --- 角速度（deg/s） ---
+    float gyro_x;          // X 轴角速度(deg/s)
+    float gyro_y;          // Y 轴角速度(deg/s)
+    float gyro_z;          // Z 轴角速度(deg/s)
+
+    // --- 加速度（g） ---
+    float acc_x;           // X 轴加速度(g)
+    float acc_y;           // Y 轴加速度(g)
+    float acc_z;           // Z 轴加速度(g)
+
+    // --- 四元数 ---
+    float quat_w;          // 四元数 W
+    float quat_x;          // 四元数 X
+    float quat_y;          // 四元数 Y
+    float quat_z;          // 四元数 Z
+
+    // --- 累计角度（deg） ---
+    float add_yaw;         // Yaw 累计角度(deg，跨 ±180° 连续)
+
+    // --- 状态 ---
+    int8_t  temperature;   // 温度(°C)
+    uint8_t online;        // 在线状态(0=离线, 1=在线)
+} IMU_Data_t;
+
+// ========================================================================
+// LK4005 电机数据结构（数据接收验证用）
+// ========================================================================
+/**
+ * @brief LK4005 电机数据（Watch 可观察）
+ *
+ * Watch 中展开 LK4005_Data 即可观察电机反馈状态，验证数据接收：
+ *   --- SI 单位（输出端，由 MotorBase.unit_data_ 同步）---
+ *   angle        : 输出端角度(rad)，0~2π（编码器单圈）
+ *   velocity     : 输出端角速度(rad/s)
+ *   torque       : 输出端力矩(N·m)
+ *   temperature  : 温度(°C)
+ *
+ *   --- 原始反馈（LKFeedback 解析结果，便于核对协议解析）---
+ *   raw_angle    : 编码器原始值(0~65535)
+ *   raw_velocity : 电机端 RPM 原始值(int16)
+ *   raw_current  : 反馈电流原始值(int16, ±2048)
+ *   raw_cmd      : 命令字节(0xA1=力矩反馈, ...)
+ *
+ *   --- 状态1缓存（需主动调用 ReadStatus1() 后才有数据）---
+ *   voltage      : 电压(mV)
+ *   error_state  : 错误状态位(0=无错误)
+ *   status1_valid: 状态1缓存是否有效
+ *
+ *   --- 在线状态 ---
+ *   online       : 在线状态(0=离线, 1=在线)
+ *
+ * 数据流：
+ *   CAN1 接收中断 → LK4005::Parse → Configure → unit_data_[0]
+ *     → GimbalUpdate 同步到 LK4005_Data → Watch 观察
+ *
+ * @note 当前任务：仅验证数据接收。
+ *       LK4005 需周期性发送 ctrl_Torque(1, 0) 维持反馈上报，
+ *       GimbalUpdate 中每周期调用一次。
+ */
+typedef struct
+{
+    // --- SI 单位（输出端，与 MotorBase.unit_data_ 一致）---
+    float    angle;            // 输出端角度(rad)，0~2π
+    float    velocity;         // 输出端角速度(rad/s)
+    float    torque;           // 输出端力矩(N·m)
+    float    temperature;      // 温度(°C)
+
+    // --- 原始反馈（调试用）---
+    uint16_t raw_angle;        // 编码器原始值(0~65535)
+    int16_t  raw_velocity;     // 电机端 RPM 原始值
+    int16_t  raw_current;      // 反馈电流原始值(±2048)
+    uint8_t  raw_cmd;          // 命令字节(0xA1=力矩反馈, ...)
+
+    // --- 状态1缓存（0x9A 响应）---
+    uint16_t voltage;          // 电压(mV)
+    uint8_t  error_state;      // 错误状态位(0=无错误)
+    uint8_t  status1_valid;    // 状态1缓存是否有效(0/1)
+
+    // --- 在线状态 ---
+    uint8_t  online;           // 在线状态(0=离线, 1=在线)
+} LK4005_Data_t;
+
+// ========================================================================
 // 全局变量 extern 声明(定义在 Variable.cpp)
 // ========================================================================
 extern Joint_Data_t       Joint_Data;        // 关节状态(Stage01-02)
 extern Controller_Data_t  Controller_Data;   // 控制器状态(Stage03)
 extern Transform_Config_t  Transform_Config;  // 变形规划器配置(Stage05)
 extern Transform_Status_t  Transform_Status;  // 变形规划器状态(Stage05)
+extern DR16_Data_t        DR16_Data;         // 遥控器状态(Stage04)
+extern IMU_Data_t         IMU_Data;          // IMU 姿态状态(Stage03 接入传感器)
+extern Remote_State_t     Remote_State;      // 遥控器状态机(急停+展开/收起)
+extern LK4005_Data_t      LK4005_Data;       // LK4005 电机反馈状态
 
 // ========================================================================
 // VOFA+ 调试通道发送函数(定义在 Variable.cpp)

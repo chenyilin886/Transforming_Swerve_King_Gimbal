@@ -31,6 +31,8 @@ transforming_swerve_king_gimbal/gimbalinit.o: \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_flash_ramfunc.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pwr.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pwr_ex.h \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_tim.h \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_tim_ex.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_uart.h \
   ..\Application\Variable.hpp ..\Application\Vofa.hpp \
   ..\Core\Inc\usart.h ..\Core\Inc\can.h ..\HAL\CAN\can_hal.hpp \
@@ -778,6 +780,7 @@ transforming_swerve_king_gimbal/gimbalinit.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\pointer_to_unary_function.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\unary_negate.h \
   ..\BSP\Motor\DM\DmMotor.hpp ..\BSP\Motor\MotorBase.hpp \
-  ..\BSP\Common\StateWatch\state_watch.hpp ..\Joint\Joint.hpp \
-  ..\Algorithm\Controller.hpp ..\Algorithm\PID.hpp ..\BSP\stdxxx.hpp \
-  ..\Planner\TransformPlanner.hpp
+  ..\BSP\Common\StateWatch\state_watch.hpp ..\BSP\Motor\Lk\LkMotor.hpp \
+  ..\Joint\Joint.hpp ..\Algorithm\Controller.hpp ..\Algorithm\PID.hpp \
+  ..\BSP\stdxxx.hpp ..\Planner\TransformPlanner.hpp \
+  ..\BSP\Remote\DR16.hpp ..\BSP\IMU\HI12H3_IMU.hpp

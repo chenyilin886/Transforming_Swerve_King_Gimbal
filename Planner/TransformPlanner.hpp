@@ -6,42 +6,43 @@
  * @brief Stage05 变形动作规划器（Motion Planner + Morphology Manager 合并实现）
  *
  * 设计背景：
- *   RM2026 三关节可变形云台，Fold 会改变整个云台几何结构。因此展开/收起
- *   必须严格串行执行，避免 Fold 转动过程中干扰 Pitch（机械干涉 / PID 冲击）。
+ *   RM2026 三关节可变形云台，Fold 改变云台几何结构。
+ *   新方案：Pitch 和 Fold 同时动作，Pitch 靠 IMU 闭环保持水平，Fold 走编码器到位。
  *
- * 用户动作序列要求（严格串行，先后执行，不同时转动）：
+ * 用户动作序列要求（并行执行）：
  *
  *   展开(EXPAND):
- *     ① Pitch 先摆到 pitch_expand（Fold 展开后 Pitch 的水平位）
- *     ② 等待 Pitch 到位
- *     ③ Fold 展开到 fold_expand
- *     ④ 等待 Fold 到位 → EXPANDED 终态
+ *     ① Pitch IMU 闭环保持水平(target=0 rad) + Fold 编码器闭环 → fold_expand
+ *     ② 等待 Fold 到位 → EXPANDED 终态
  *
  *   收起(CONTRACT):
- *     ① Fold 先收回 fold_contract（最小角度 0）
- *     ② 等待 Fold 到位
- *     ③ Pitch 收回到 pitch_contract（最收缩角度）
- *     ④ 等待 Pitch 到位 → CONTRACTED 终态
+ *     ① Pitch IMU 闭环保持水平(target=0 rad) + Fold 编码器闭环 → fold_contract
+ *     ② 等待 Fold 到位 → CONTRACTED 终态
+ *
+ * 关键设计：
+ *   - Pitch 始终用 IMU 闭环保持水平(target=0 rad)，不受 Fold 转动影响
+ *   - Fold 用编码器闭环精确到位(target=fold_expand/fold_contract)
+ *   - 到位判定只看 Fold，不看 Pitch（Pitch 是持续保持，无需"到位"）
+ *   - IMU 离线时不切换 target（保持 target=0，由 Controller 层安全回退）
  *
  * 模块落点（按 System Prompt 分层）：
  *   本模块合并了 Motion Planner（动作顺序/等待/超时）和 Morphology Manager
- *   （形态状态管理）两层职责。Stage05 仅两段串行动作，合并实现避免"谁拥有
- *   target"的歧义。未来形态变复杂（半展开/运输/维修等）可再拆出独立的
- *   MorphologyManager，接口已为此预留（state 枚举可扩展）。
+ *   （形态状态管理）两层职责。
  *
  * 数据流（与现有架构兼容，仅插入 Step 2.5）：
  *   Watch.cmd ──→ TransformPlanner.Update()
  *                  │
- *                  ├─ 读 JointManager feedback（pitch/fold real_angle）
+ *                  ├─ 读 JointManager feedback（fold real_angle）
  *                  ├─ 状态机转移（IDLE/TRANSITION/终态/ABORT）
  *                  └─ TRANSITION 状态: 写 Controller_Data.pitch/fold.target_angle
  *                     终态/IDLE/ABORT: 不写（释放给 Watch）
  *
  * Target 归属规则（关键设计）：
- *   - TRANSITION 状态（4 个中间态）：Planner 每周期覆盖 target_angle
+ *   - TRANSITION 状态：Planner 每周期覆盖 target_angle
+ *     pitch.target = 0 (IMU 水平)
+ *     fold.target  = fold_expand / fold_contract (编码器目标)
  *   - 终态（EXPANDED/CONTRACTED）/ IDLE / ABORT：Planner 不写 target
- *     Watch 可直接手动控制 → 方便到位后手动微调 / 调 PID
- *   - 进入终态瞬间，Controller_Data 中保留的就是终点目标值（如 pitch_expand）
+ *     Watch 可直接手动控制
  *
  * ABORT 安全策略：
  *   - 触发条件：用户 cmd=ABORT / 单步超时 / 电机离线
@@ -62,23 +63,21 @@ namespace BSP::PLANNER
  * @brief 变形状态机枚举（Morphology + Motion 子状态合并）
  *
  * 状态流向：
- *   IDLE ──cmd=EXPAND──→ EXPAND_PITCH_PRE ──→ EXPAND_FOLD_DEPLOY ──→ EXPANDED
- *   EXPANDED ──cmd=CONTRACT──→ CONTRACT_FOLD_RETURN ──→ CONTRACT_PITCH_RETURN ──→ CONTRACTED
- *   CONTRACTED ──cmd=EXPAND──→ EXPAND_PITCH_PRE ──→ ...
+ *   IDLE ──cmd=EXPAND──→ EXPAND_SIMULTANEOUS ──Fold到位──→ EXPANDED
+ *   EXPANDED ──cmd=CONTRACT──→ CONTRACT_SIMULTANEOUS ──Fold到位──→ CONTRACTED
+ *   CONTRACTED ──cmd=EXPAND──→ EXPAND_SIMULTANEOUS ──→ ...
  *   任意 TRANSITION ──cmd=ABORT/超时/离线──→ ABORT ──cmd=RESET──→ IDLE
  *
- * @note 数值固定，Watch 中可直接用整数观察（0..7）
+ * @note 数值固定，Watch 中可直接用整数观察（0..5）
  */
 enum class TransformState : uint8_t
 {
-    IDLE                   = 0,  // 待机（上电默认）
-    EXPAND_PITCH_PRE       = 1,  // 展开第1步: pitch → pitch_expand
-    EXPAND_FOLD_DEPLOY     = 2,  // 展开第2步: fold → fold_expand
-    EXPANDED               = 3,  // 展开终态（释放 target 给 Watch）
-    CONTRACT_FOLD_RETURN  = 4,  // 收起第1步: fold → fold_contract
-    CONTRACT_PITCH_RETURN = 5,  // 收起第2步: pitch → pitch_contract
-    CONTRACTED             = 6,  // 收起终态（释放 target 给 Watch）
-    ABORT                  = 7,  // 异常退出（Hold 当前位置）
+    IDLE                    = 0,  // 待机（上电默认）
+    EXPAND_SIMULTANEOUS     = 1,  // 展开: Pitch IMU保持水平 + Fold→fold_expand
+    EXPANDED                = 2,  // 展开终态（释放 target 给 Watch）
+    CONTRACT_SIMULTANEOUS   = 3,  // 收起: Pitch IMU保持水平 + Fold→fold_contract
+    CONTRACTED              = 4,  // 收起终态（释放 target 给 Watch）
+    ABORT                   = 5,  // 异常退出（Hold 当前位置）
 };
 
 /**
@@ -117,10 +116,8 @@ enum class TransformError : uint8_t
  */
 static inline bool isTransitionState(TransformState s)
 {
-    return s == TransformState::EXPAND_PITCH_PRE ||
-           s == TransformState::EXPAND_FOLD_DEPLOY ||
-           s == TransformState::CONTRACT_FOLD_RETURN ||
-           s == TransformState::CONTRACT_PITCH_RETURN;
+    return s == TransformState::EXPAND_SIMULTANEOUS ||
+           s == TransformState::CONTRACT_SIMULTANEOUS;
 }
 
 /**
@@ -139,8 +136,8 @@ static inline bool isTerminalState(TransformState s)
  *
  * 职责：
  *   1. 接收 Watch 命令（EXPAND/CONTRACT/ABORT/RESET）
- *   2. 按状态机执行两段串行动作（Pitch 先 → Fold 后 / Fold 先 → Pitch 后）
- *   3. 到位检测（误差阈值 + 超时）
+ *   2. 按状态机执行并行动作（Pitch IMU保持水平 + Fold 编码器到位）
+ *   3. 到位检测（仅 Fold，误差阈值 + 超时）
  *   4. 异常处理（ABORT 时 snap target 到 feedback）
  *   5. 写入 Controller_Data.pitch/fold.target_angle（仅 TRANSITION 状态）
  *
@@ -172,16 +169,18 @@ public:
      * @brief 周期更新（1kHz 调用）
      *
      * 流程：
-     *   1. 读取 Joint feedback（pitch/fold real_angle + online）
+     *   1. 读取 Joint feedback（fold real_angle + online）
      *   2. 命令解析（ABORT 优先级最高，ABORT 状态只接受 RESET）
      *   3. 状态机执行：
      *      - 离线/超时检查 → ABORT
-     *      - 到位检查 → 进入下一状态
+     *      - 到位检查（仅 Fold）→ 进入终态
      *   4. 写入 target（仅 TRANSITION 状态）
+     *      pitch.target = 0 (IMU 水平)
+     *      fold.target  = fold_expand / fold_contract (编码器目标)
      *   5. 更新观察状态（Transform_Status）
      *   6. 步进时间（step_elapsed_ms++）
      *
-     * @param jm         JointManager（读 pitch/fold feedback）
+     * @param jm         JointManager（读 fold feedback）
      * @param ctrl_data  Controller_Data（写 target，仅 TRANSITION 状态）
      * @param cfg        Transform_Config（读参数 + 命令；消费后 cmd 清零）
      * @param status     Transform_Status（写观察状态，每周期更新）
@@ -194,7 +193,9 @@ public:
                 Transform_Status_t &status)
     {
         // === 1. 读取 feedback ===
-        float pitch_fb = jm.pitch.getRealAngle();
+        //   Pitch: 不需要读 feedback（IMU 闭环保持水平，无需到位判定）
+        //   Fold:  需要读编码器 feedback 做到位判定
+        float pitch_fb = jm.pitch.getRealAngle();  // 仅用于 ABORT 时 snap
         float fold_fb  = jm.fold.getRealAngle();
         bool  pitch_online = jm.pitch.isOnline();
         bool  fold_online  = jm.fold.isOnline();
@@ -241,15 +242,15 @@ public:
         {
             if (cmd == TransformCmd::EXPAND)
             {
-                // 进入展开第一步：Pitch 先摆到 pitch_expand
-                state_ = TransformState::EXPAND_PITCH_PRE;
+                // 进入展开：Pitch IMU保持水平 + Fold展开
+                state_ = TransformState::EXPAND_SIMULTANEOUS;
                 step_elapsed_ms_ = 0;
                 cfg.cmd = static_cast<uint8_t>(TransformCmd::NONE);
             }
             else if (cmd == TransformCmd::CONTRACT)
             {
-                // 进入收起第一步：Fold 先收回 fold_contract
-                state_ = TransformState::CONTRACT_FOLD_RETURN;
+                // 进入收起：Pitch IMU保持水平 + Fold收起
+                state_ = TransformState::CONTRACT_SIMULTANEOUS;
                 step_elapsed_ms_ = 0;
                 cfg.cmd = static_cast<uint8_t>(TransformCmd::NONE);
             }
@@ -262,7 +263,7 @@ public:
         bool  ctrl_fold  = false;
         float pitch_tgt  = 0.0f;
         float fold_tgt   = 0.0f;
-        uint8_t step_idx = 0;   // 0=待机/终态, 1=第一步, 2=第二步
+        uint8_t step_idx = 0;   // 0=待机/终态, 1=执行中
 
         switch (state_)
         {
@@ -270,61 +271,33 @@ public:
             case TransformState::IDLE:
                 break;
 
-            // --- 展开第1步：Pitch 先摆到 pitch_expand ---
-            case TransformState::EXPAND_PITCH_PRE:
+            // --- 展开：Pitch IMU保持水平 + Fold→fold_expand ---
+            case TransformState::EXPAND_SIMULTANEOUS:
             {
                 ctrl_pitch = true;
-                pitch_tgt  = cfg.pitch_expand;
+                pitch_tgt  = 0.0f;                // Pitch: IMU 水平目标(枪口绝对俯仰=0)
+                ctrl_fold  = true;
+                fold_tgt   = cfg.fold_expand;     // Fold: 编码器目标值
                 step_idx   = 1;
 
-                // 离线检查
-                if (!pitch_online)
-                {
-                    enterAbort(status, TransformError::MOTOR_OFFLINE,
-                               ctrl_data, pitch_fb, fold_fb);
-                    return;
-                }
-                // 超时检查（用 > 而非 >=，避免边界误触发）
-                if (step_elapsed_ms_ > cfg.arrive_timeout_ms)
-                {
-                    enterAbort(status, TransformError::TIMEOUT,
-                               ctrl_data, pitch_fb, fold_fb);
-                    return;
-                }
-                // 到位检查
-                if (fabsf(pitch_tgt - pitch_fb) < cfg.arrive_eps)
-                {
-                    // 进入展开第2步：Fold 展开
-                    state_ = TransformState::EXPAND_FOLD_DEPLOY;
-                    step_elapsed_ms_ = 0;
-                }
-                break;
-            }
-
-            // --- 展开第2步：Fold 展开（Pitch 保持 pitch_expand）---
-            case TransformState::EXPAND_FOLD_DEPLOY:
-            {
-                ctrl_pitch = true;
-                pitch_tgt  = cfg.pitch_expand;   // Pitch 保持展开位，防止漂移
-                ctrl_fold  = true;
-                fold_tgt   = cfg.fold_expand;
-                step_idx   = 2;
-
+                // 离线检查（Fold 必须在线，Pitch 离线由 Controller 层处理）
                 if (!fold_online)
                 {
                     enterAbort(status, TransformError::MOTOR_OFFLINE,
                                ctrl_data, pitch_fb, fold_fb);
                     return;
                 }
+                // 超时检查
                 if (step_elapsed_ms_ > cfg.arrive_timeout_ms)
                 {
                     enterAbort(status, TransformError::TIMEOUT,
                                ctrl_data, pitch_fb, fold_fb);
                     return;
                 }
+                // 到位检查：只看 Fold
                 if (fabsf(fold_tgt - fold_fb) < cfg.arrive_eps)
                 {
-                    // 进入展开终态
+                    // Fold 到位 → 进入展开终态
                     state_ = TransformState::EXPANDED;
                     step_elapsed_ms_ = 0;
                 }
@@ -335,60 +308,33 @@ public:
             case TransformState::EXPANDED:
                 break;
 
-            // --- 收起第1步：Fold 先收回（Pitch 保持 pitch_expand）---
-            case TransformState::CONTRACT_FOLD_RETURN:
+            // --- 收起：Pitch IMU保持水平 + Fold→fold_contract ---
+            case TransformState::CONTRACT_SIMULTANEOUS:
             {
                 ctrl_pitch = true;
-                pitch_tgt  = cfg.pitch_expand;   // Pitch 保持展开位，避免 Fold 收回时干涉
+                pitch_tgt  = 0.0f;                // Pitch: IMU 水平目标(枪口绝对俯仰=0)
                 ctrl_fold  = true;
-                fold_tgt   = cfg.fold_contract;
+                fold_tgt   = cfg.fold_contract;   // Fold: 编码器目标值
                 step_idx   = 1;
 
+                // 离线检查
                 if (!fold_online)
                 {
                     enterAbort(status, TransformError::MOTOR_OFFLINE,
                                ctrl_data, pitch_fb, fold_fb);
                     return;
                 }
+                // 超时检查
                 if (step_elapsed_ms_ > cfg.arrive_timeout_ms)
                 {
                     enterAbort(status, TransformError::TIMEOUT,
                                ctrl_data, pitch_fb, fold_fb);
                     return;
                 }
+                // 到位检查：只看 Fold
                 if (fabsf(fold_tgt - fold_fb) < cfg.arrive_eps)
                 {
-                    // 进入收起第2步：Pitch 收回
-                    state_ = TransformState::CONTRACT_PITCH_RETURN;
-                    step_elapsed_ms_ = 0;
-                }
-                break;
-            }
-
-            // --- 收起第2步：Pitch 收回（Fold 保持 fold_contract）---
-            case TransformState::CONTRACT_PITCH_RETURN:
-            {
-                ctrl_pitch = true;
-                pitch_tgt  = cfg.pitch_contract;
-                ctrl_fold  = true;
-                fold_tgt   = cfg.fold_contract;   // Fold 保持收起位
-                step_idx   = 2;
-
-                if (!pitch_online)
-                {
-                    enterAbort(status, TransformError::MOTOR_OFFLINE,
-                               ctrl_data, pitch_fb, fold_fb);
-                    return;
-                }
-                if (step_elapsed_ms_ > cfg.arrive_timeout_ms)
-                {
-                    enterAbort(status, TransformError::TIMEOUT,
-                               ctrl_data, pitch_fb, fold_fb);
-                    return;
-                }
-                if (fabsf(pitch_tgt - pitch_fb) < cfg.arrive_eps)
-                {
-                    // 进入收起终态
+                    // Fold 到位 → 进入收起终态
                     state_ = TransformState::CONTRACTED;
                     step_elapsed_ms_ = 0;
                 }
@@ -406,6 +352,8 @@ public:
 
         // === 4. 写入 target（仅 TRANSITION 状态）===
         // TRANSITION 状态：Planner 覆盖 target
+        //   pitch.target = 0 (IMU 水平) → Controller IMU 闭环保持枪口水平
+        //   fold.target  = fold_expand / fold_contract (编码器目标)
         // 终态/IDLE/ABORT：不写，Watch 直接控制
         if (ctrl_pitch)
         {
