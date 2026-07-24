@@ -355,6 +355,70 @@ public:
     // 原始数据访问(Watch 调试用)
     // ====================================================================
 
+    // ====================================================================
+    // 多圈累计角度接口(拨盘位置环专用)
+    // ====================================================================
+    //
+    // 设计原因：
+    //   LK 协议反馈为单圈角度(0~2π)，做位置环(如拨盘供弹累计角度)时
+    //   需要连续累计角度，不能在 0/2π 边界跳变。
+    //   参考 H_SG_Gimbal 参考工程 M2006.getAddAngleDeg() 接口设计。
+    //
+    // 维护方式：
+    //   Configure() 中每次解析反馈时：
+    //     delta = wrapToPi(curr_angle - last_angle_rad_[i])  // 跨边界处理
+    //     multi_turn_angle_rad_[i] += delta
+    //     last_angle_rad_[i] = curr_angle
+    //
+    // 使用场景：
+    //   - 拨盘位置环 PID 反馈(DialController)
+    //   - 任何需要多圈连续角度的场合
+
+    /**
+     * @brief 获取指定电机的多圈累计角度(rad)
+     * @param id 1-based 索引(1..N)
+     * @return 累计角度(rad)，上电后以当前位置为零位累加
+     *
+     * @note 与参考工程 M2006.getAddAngleDeg() 接口对齐(单位换算为 rad)。
+     *       上电时累计角度初始化为 0(以当前单圈角度为起点)。
+     *       若需要重置，调用 resetMultiTurn(id)。
+     */
+    float getAddAngleRad(uint8_t id) const
+    {
+        if (id == 0 || id > N) return 0.0f;
+        return multi_turn_angle_rad_[id - 1];
+    }
+
+    /**
+     * @brief 获取指定电机的多圈累计角度(度)
+     * @param id 1-based 索引(1..N)
+     * @return 累计角度(度)
+     *
+     * @note 与参考工程 M2006.getAddAngleDeg() 接口完全对齐。
+     *       用于 DialController 位置环反馈(单位: 度)。
+     */
+    float getAddAngleDeg(uint8_t id) const
+    {
+        return getAddAngleRad(id) * 180.0f / PI;
+    }
+
+    /**
+     * @brief 重置多圈累计角度(以当前单圈角度为新起点)
+     * @param id 1-based 索引(1..N)
+     *
+     * 使用场景：
+     *   - 拨盘校准(将当前位置设为零位)
+     *   - 切换控制模式时清零累计
+     *   - 卡弹解卡后重置目标参考
+     */
+    void resetMultiTurn(uint8_t id)
+    {
+        if (id == 0 || id > N) return;
+        multi_turn_angle_rad_[id - 1] = 0.0f;
+        last_angle_rad_[id - 1] = this->unit_data_[id - 1].angle;
+        multi_turn_inited_[id - 1] = 1;
+    }
+
     /**
      * @brief 获取原始反馈数据(未转 SI 单位)
      * @param id 1-based 电机索引
@@ -403,21 +467,61 @@ protected:
     LKFeedback feedback_[N] = {};          // 原始反馈数据(中间存储)
     LKStatus1  status1_[N] = {};           // 状态1缓存(0x9A 响应)
 
+    // --- 多圈累计角度相关(拨盘位置环专用) ---
+    // 设计原因：LK 协议只反馈单圈角度(0~2π)，位置环需要连续累计角度。
+    float    multi_turn_angle_rad_[N] = {};  // 多圈累计角度(rad)
+    float    last_angle_rad_[N]       = {};  // 上次单圈角度(rad, 用于跨边界检测)
+    uint8_t  multi_turn_inited_[N]    = {};  // 多圈累计是否已初始化(0=未初始化, 1=已初始化)
+
+    /**
+     * @brief 将角度差归一化到 [-π, π](跨 0/2π 边界处理)
+     * @param diff 角度差(curr - last)
+     * @return 归一化后的角度差
+     *
+     * 用途：多圈累计时，若 curr 从 0.01 跳到 6.27，实际只转了 -0.02 rad，
+     *       而不是 +6.26 rad。wrapToPi 把 +6.26 修正为 -0.02。
+     */
+    static inline float wrapToPi(float diff)
+    {
+        while (diff >  PI) diff -= 2.0f * PI;
+        while (diff < -PI) diff += 2.0f * PI;
+        return diff;
+    }
+
     /**
      * @brief 将原始反馈数据转换为 SI 国际单位
      * @param i        电机槽位下标(0-based)
      * @param fb       原始反馈数据
      *
      * 转换公式：
-     *   angle(rad)     = raw_angle × (360/65536) × (π/180)  [输出端单圈角度]
+     *   angle(rad)     = raw_angle × (360/65536) × (π/180)   [电机端单圈角度, 0~2π]
      *   velocity(rad/s)= raw_velocity × (1/减速比) × (2π/60) [输出端角速度]
      *   torque(N·m)    = raw_current × 力矩转换系数          [输出端力矩]
      *   temperature(°C)= raw_temperature                      [直接值]
+     *
+     * @note 关于"电机端 vs 输出端"角度:
+     *   - LK 协议反馈的 fb.angle 是电机端(转子)单圈角度(0~65535 → 0~360°)
+     *   - 单圈角度 unit_data_[i].angle 保存为电机端 rad(0~2π), 用于跨边界检测
+     *   - 多圈累计角度 multi_turn_angle_rad_ 是输出端累计 rad, 通过 delta 除以
+     *     减速比实现 (参考工程 Lk_motor.hpp deg_to_real = 1/reduction_ratio)
+     *   - 对外暴露的 getAddAngleRad()/getAddAngleDeg() 返回输出端累计角度
+     *
+     * @warning 不能把单圈角度直接除以减速比!
+     *   若 curr_angle 除以减速比, 范围会变成 [0, 2π/减速比], wrapToPi() 的跨边界
+     *   检测会完全失效(它假设输入是 [0, 2π]), 导致每跨边界 multi_turn 被错误地
+     *   减去一整圈, feedback_angle 永远上不去。
+     *   正确做法: 单圈角度保持电机端, 在 delta 累计时除以减速比。
+     *
+     * 多圈累计维护：
+     *   首次解析：以当前单圈角度为起点，累计角度=0
+     *   后续解析：delta = wrapToPi(curr - last) ÷ 减速比 → 累加到 multi_turn_angle_rad_
      */
     void Configure(size_t i, const LKFeedback &fb)
     {
-        // 角度: 编码器计数 → 度 → 弧度(输出端, 0~2π)
-        this->unit_data_[i].angle = fb.angle * params_.encoder_to_deg * DEG2RAD;
+        // 单圈角度: 编码器计数 → 电机端度 → 电机端rad (0~2π)
+        // 保持电机端单圈范围, 用于 wrapToPi 跨边界检测
+        float curr_angle = fb.angle * params_.encoder_to_deg * DEG2RAD;
+        this->unit_data_[i].angle = curr_angle;
 
         // 角速度: 电机端 RPM → 输出端 rad/s
         this->unit_data_[i].velocity = fb.velocity * params_.rpm_to_radps;
@@ -430,6 +534,26 @@ protected:
 
         // 角加速度: LK 协议无此字段, 预留
         this->unit_data_[i].accel = 0.0f;
+
+        // --- 多圈累计角度维护(输出端, rad) ---
+        if (!multi_turn_inited_[i])
+        {
+            // 首次解析：以当前位置为零位
+            multi_turn_angle_rad_[i] = 0.0f;
+            last_angle_rad_[i]       = curr_angle;
+            multi_turn_inited_[i]    = 1;
+        }
+        else
+        {
+            // 跨边界处理：wrapToPi 把 ±2π 跳变修正为 ±0 附近的小值
+            // (curr_angle 是电机端单圈角度, 范围 [0, 2π], wrapToPi 假设此范围)
+            float delta_motor = wrapToPi(curr_angle - last_angle_rad_[i]);
+            // 电机端 delta → 输出端 delta: 除以减速比
+            // (电机转 10 圈 = 输出端转 1 圈)
+            float delta_output = delta_motor / params_.reduction_ratio;
+            multi_turn_angle_rad_[i] += delta_output;
+            last_angle_rad_[i]        = curr_angle;
+        }
     }
 
     /**
@@ -464,7 +588,14 @@ protected:
  *   - 力矩常数:      0.06 N·m/A
  *   - 反馈电流最大值: 2048(原始值)
  *   - 实际电流最大值: 4 A
- *   - 编码器分辨率:   65536 counts/rev(16位, 输出端)
+ *   - 编码器分辨率:   65536 counts/rev(16位, 电机端/转子端)
+ *
+ * @note 单位换算(关键):
+ *   - LK 协议反馈的 fb.angle 是电机端单圈角度(0~65535 → 0~360°电机端)
+ *   - 单圈角度 unit_data_[i].angle 保持为电机端 rad(0~2π), 用于 wrapToPi 跨边界检测
+ *   - 多圈累计角度 multi_turn_angle_rad_ 是输出端累计 rad, 通过 delta 除以
+ *     减速比实现 (参考工程 Lk_motor.hpp deg_to_real = 1/reduction_ratio)
+ *   - 对外暴露的 getAddAngleRad()/getAddAngleDeg() 返回输出端累计角度
  *
  * CAN 配置: motor_id=1(接 CAN1)
  *   - 命令帧 ID = 0x141

@@ -340,7 +340,7 @@
               <MiscControls>-Wno-c++17-extensions</MiscControls>
               <Define>USE_HAL_DRIVER,STM32F407xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../BSP;../BSP/Common/StateWatch;../BSP/Motor;../BSP/Motor/DM;../BSP/Motor/Lk;../BSP/Remote;../BSP/IMU;../Joint;../Algorithm;../HAL/CAN;../HAL/CAN/interface;../HAL/CAN/impl;../Application;../Planner;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../BSP;../BSP/Common/StateWatch;../BSP/Motor;../BSP/Motor/DM;../BSP/Motor/Lk;../BSP/Motor/Dji;../BSP/Remote;../BSP/IMU;../Joint;../Algorithm;../HAL/CAN;../HAL/CAN/interface;../HAL/CAN/impl;../Application;../Planner;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -718,9 +718,29 @@
               <FilePath>../Application/Variable.cpp</FilePath>
             </File>
             <File>
+              <FileName>ShootFSM.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../Application/ShootFSM.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>ShootTask.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../Application/ShootTask.cpp</FilePath>
+            </File>
+            <File>
               <FileName>Vofa.cpp</FileName>
               <FileType>8</FileType>
               <FilePath>../Application/Vofa.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>BoardComm.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../Application/Communication/BoardComm.cpp</FilePath>
+            </File>
+            <File>
+              <FileName>ChassisModeManager.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../Application/Communication/ChassisModeManager.cpp</FilePath>
             </File>
             <File>
               <FileName>GimbalInit.hpp</FileName>

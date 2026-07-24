@@ -219,7 +219,6 @@ osStatus_t osKernelInitialize (void) {
   return (stat);
 }
 
-
 osStatus_t osKernelGetInfo (osVersion_t *version, char *id_buf, uint32_t id_size) {
 
   if (version != NULL) {

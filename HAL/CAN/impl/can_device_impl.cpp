@@ -65,14 +65,20 @@ void CanDevice::start()
  */
 bool CanDevice::send(const Frame &frame)
 {
-    // 检查发送邮箱是否有空闲
-    if (HAL_CAN_GetTxMailboxesFreeLevel(handle_) == 0)
+    // 等待空闲邮箱（轮询，最多等 ~100us）
+    //   STM32F407 CAN1 仅 3 个 TX 邮箱；4 帧/周期必然有 1 帧需等待前序帧发送完成。
+    //   CAN 1Mbps 发送一帧 ≈ 100us，3 邮箱全部排空 ≈ 300us，远小于 1kHz 周期。
+    //   不 AbortTxRequest：强行中止会取消其他挂起帧，导致对应电机丢命令。
     {
-        // 邮箱满时取消所有挂起的发送请求(防止 Bus-off 后邮箱锁死)
-        // 当 CAN 总线无应答时，AutoRetransmission 会让帧无限重试占据邮箱，
-        // 导致后续发送全部失败。取消挂起帧可释放邮箱。
-        HAL_CAN_AbortTxRequest(handle_, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
-        return false;
+        uint32_t wait_cycles = 10000;  // ~100us @ 168MHz
+        while (HAL_CAN_GetTxMailboxesFreeLevel(handle_) == 0 && wait_cycles > 0)
+        {
+            wait_cycles--;
+        }
+        if (wait_cycles == 0)
+        {
+            return false;
+        }
     }
 
     CAN_TxHeaderTypeDef tx_header{};

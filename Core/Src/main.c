@@ -98,7 +98,7 @@ int main(void)
   MX_USART6_UART_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  GimbalInit();  /* 初始�?? CAN 总线 + 电机实例 + 注册接收回调 */
+  GimbalInit();  /* 初始? CAN 总线 + 电机实例 + 注册接收回调 */
   /* USER CODE END 2 */
 
   /* Init scheduler */

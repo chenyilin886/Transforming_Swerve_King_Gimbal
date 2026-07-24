@@ -61,6 +61,13 @@ const osThreadAttr_t GimbalTask_attributes = {
   .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for ShootTask */
+osThreadId_t ShootTaskHandle;
+const osThreadAttr_t ShootTask_attributes = {
+  .name = "ShootTask",
+  .stack_size = 768 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -69,6 +76,7 @@ const osThreadAttr_t GimbalTask_attributes = {
 
 void StartDefaultTask(void *argument);
 void gimbalTask(void *argument);
+extern void shootTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -104,6 +112,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of GimbalTask */
   GimbalTaskHandle = osThreadNew(gimbalTask, NULL, &GimbalTask_attributes);
+
+  /* creation of ShootTask */
+  ShootTaskHandle = osThreadNew(shootTask, NULL, &ShootTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */

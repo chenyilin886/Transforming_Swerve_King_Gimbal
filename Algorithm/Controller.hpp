@@ -16,14 +16,15 @@
  *   2. GimbalController(三关节控制器)：
  *      - 持有 3 个 JointController + JointManager 指针 + Motor 指针
  *      - 每周期 Update：读取 Joint feedback → PID → Motor.ctrl_Mit
- *      - 统一以 MIT 纯力矩模式输出: ctrl_Mit(id, 0, 0, 0, 0, torque)
+ *      - 输出 MIT 力矩模式: ctrl_Mit(id, 0, 0, 0, kd_min, torque)
+ *        kd_min=0.1 维持电机 MIT 活跃（kp=kd=0 时部分固件会停止回复）
  *
  * 数据流：
  *   target_angle ──┐
  *                  ├→ 位置式 PID → torque (限幅 torque_limit)
  *   feedback_angle ┘
  *        ↓
- *   Motor.ctrl_Mit(id, 0, 0, 0, 0, torque × direction)
+ *   Motor.ctrl_Mit(id, 0, 0, 0, kd_min, torque × direction)
  */
 
 #include "PID.hpp"
@@ -345,6 +346,7 @@ public:
     void Disable()
     {
         enabled = 0;
+        target_inited = 0;  // 复位 bumpless，下次 Enable 后首次 Compute 自动同步目标到反馈值
         position_pid.clearPID();
         velocity_pid.clearPID();
         torque_output = 0;
@@ -378,6 +380,79 @@ public:
         target_angle = current_feedback;
         position_pid.clearPID();
         velocity_pid.clearPID();
+    }
+
+    /**
+     * @brief 速度环单环计算（跟随模式专用）
+     *
+     * 用于底盘跟随模式，Yaw轴从串级PID切换到速度环单环控制。
+     * 此时Yaw轴不抵抗底盘扰动，根治反转现象。
+     *
+     * @param target_vel     目标角速度(rad/s)
+     * @param feedback_vel   反馈角速度(rad/s)，来自IMU陀螺仪
+     * @param kpid_vel       速度环PID参数(kp/ki/kd)
+     * @retval 输出力矩(N·m)，范围 [-torque_limit, torque_limit]
+     */
+    float ComputeVelocity(float target_vel, float feedback_vel, Kpid_t kpid_vel)
+    {
+        vel_target = target_vel;
+        vel_feedback = feedback_vel;
+        vel_error = vel_target - vel_feedback;
+
+        if (!enabled)
+        {
+            velocity_pid.clearPID();
+            vel_error = 0;
+            torque_output = 0;
+            return 0.0f;
+        }
+
+        // 单级速度环PID（位置式）
+        torque_output = (float)velocity_pid.GetPidPos(
+            kpid_vel,
+            (double)vel_target,
+            (double)vel_feedback,
+            (double)torque_limit
+        );
+
+        return torque_output;
+    }
+
+    /**
+     * @brief 切换到速度环单环模式（跟随模式）
+     *
+     * 平滑过渡：从串级PID切换到速度环单环
+     * - cascade_mode = 0（单级模式）
+     * - 清空PID状态，避免冲击
+     * - 速度目标从当前IMU速度开始
+     *
+     * @param initial_vel 初始速度目标(rad/s)，建议使用当前IMU角速度
+     */
+    void SwitchToVelocityMode(float initial_vel)
+    {
+        cascade_mode = 0;  // 切换到单级模式
+        vel_target = initial_vel;
+        velocity_pid.clearPID();  // 清空积分，防止冲击
+        target_inited = 0;  // 重置，避免下次Compute自动设target
+    }
+
+    /**
+     * @brief 切换回串级PID模式（其他模式）
+     *
+     * 平滑过渡：从速度环单环切换回串级PID
+     * - cascade_mode = 1（串级模式）
+     * - 清空PID状态，避免冲击
+     * - 角度目标从当前IMU角度开始
+     *
+     * @param initial_angle 初始角度目标(rad)，建议使用当前IMU角度
+     */
+    void SwitchToCascadeMode(float initial_angle)
+    {
+        cascade_mode = 1;  // 切换到串级模式
+        target_angle = initial_angle;
+        position_pid.clearPID();
+        velocity_pid.clearPID();
+        target_inited = 1;  // 防止Compute自动覆盖target
     }
 };
 
@@ -597,89 +672,97 @@ public:
         //     IMU 离线 → jm.yaw.getNormalizedAngle()（编码器回退, [-π, π]）
         //   内环速度反馈：始终用编码器 jm.yaw.getVelocity()
         //   连续旋转：continuous=1 → Compute() 中 wrapToPi 最短路径处理
-        if (dm4310 != nullptr && jm.yaw.isOnline())
+        //
+        //   【跟随模式特殊处理】
+        //   如果yaw处于速度环单环模式（cascade_mode=0），说明在跟随模式下，
+        //   GimbalInit.cpp中已经直接调用ComputeVelocity()和ctrl_Mit()，
+        //   此处跳过，避免重复控制。
+        if (dm4310 != nullptr)
         {
-            float fb;
-            if (imu_online)
-            {
-                // IMU 传感器闭环：世界坐标系绝对航向
-                //   yaw_imu_angle 由 GimbalUpdate 写入 = -addYaw × (π/180)
-                //   addYaw 已跨 ±180° 连续累加，天然支持多圈旋转
-                fb = yaw_imu_angle;
-                yaw_fb_source = 1;  // 标记当前使用 IMU 反馈
-            }
-            else
-            {
-                // 编码器回退：IMU 离线时的安全降级
-                //   getNormalizedAngle() 归一化到 [-π, π]
-                //   wrapToPi 保证与累积 target 的误差走最短路径
-                fb = jm.yaw.getNormalizedAngle();
-                yaw_fb_source = 0;  // 标记当前使用编码器反馈
-            }
+            // 检查是否在跟随模式（速度环单环）
+            if (yaw.cascade_mode == 0) {
+                // 跟随模式：已在GimbalInit中直接控制，此处仅更新反馈源标志
+                yaw_fb_source = imu_online ? 2 : 0;  // 2=IMU速度环模式
+            } else {
+                // 串级PID模式：正常计算
+                float fb;
+                if (jm.yaw.isOnline() && imu_online)
+                {
+                    // IMU 传感器闭环：世界坐标系绝对航向
+                    //   yaw_imu_angle 由 GimbalUpdate 写入 = -addYaw × (π/180)
+                    //   addYaw 已跨 ±180° 连续累加，天然支持多圈旋转
+                    fb = yaw_imu_angle;
+                    yaw_fb_source = 1;  // 标记当前使用 IMU 反馈
+                }
+                else
+                {
+                    // 编码器回退：IMU 离线时的安全降级
+                    //   getNormalizedAngle() 归一化到 [-π, π]
+                    //   wrapToPi 保证与累积 target 的误差走最短路径
+                    fb = jm.yaw.getNormalizedAngle();
+                    yaw_fb_source = 0;  // 标记当前使用编码器反馈
+                }
 
-            float vel = jm.yaw.getVelocity();  // 内环始终用编码器速度
-            float tgt = yaw.target_angle;
-            float torque = yaw.Compute(tgt, fb, vel);
-            dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.yaw.getConfig().direction);
+                float vel = jm.yaw.getVelocity();  // 内环始终用编码器速度
+                float tgt = yaw.target_angle;
+                float torque = yaw.Compute(tgt, fb, vel);
+                dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.yaw.getConfig().direction);
+            }
         }
-        else if (dm4310 != nullptr)
+        else
         {
             yaw.Clear();
             yaw_fb_source = 0;
-            dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         }
 
-        // --- Pitch 关节（DM4310 #2, IMU 传感器闭环 + 编码器回退）---
+        // --- Pitch 关节（DM4310 #2, IMU 传感器闭环）---
         //   外环角度反馈：
         //     IMU 在线 → pitch_imu_angle（IMU getPitch, deg→rad, 方向与编码器一致不取负）
-        //     IMU 离线 → jm.pitch.getRealAngle()（编码器回退）
+        //     IMU 离线 → 停控（零力矩保持，不输出 PID）
         //   内环速度反馈：始终用编码器 jm.pitch.getVelocity()
         //   IMU 闭环下：target 含义是枪口绝对俯仰角，不受 Fold 影响
         //   IMU 闭环下不做 clampTarget（编码器坐标系限位不适用于 IMU 反馈）
         //
         //   新方案：变形期间 Pitch 也用 IMU 闭环保持水平(target=0 rad)
         //   Planner 写入 pitch.target=0（IMU 水平目标），Controller 用 IMU 反馈
-        //   IMU 离线时自动回退到编码器反馈（安全保护）
-        if (dm4310 != nullptr && jm.pitch.isOnline())
+        //   IMU 离线时停控，不发 PID 力矩（仅用 kd_min 维持 MIT 活跃回复）
+        if (dm4310 != nullptr)
         {
-            float fb;
-            float tgt;
-            if (imu_online)
+            if (jm.pitch.isOnline() && imu_online)
             {
                 // IMU 传感器闭环：枪口绝对俯仰角
                 //   pitch_imu_angle = getPitch() × (π/180)，不取负（方向一致）
                 //   IMU Pitch 范围 [-90°, 90°]，对应 [-π/2, π/2]
                 //   变形期间 target=0（枪口水平），非变形期间 target 由 Watch/Planner 设定
-                fb = pitch_imu_angle;
+                float fb = pitch_imu_angle;
                 // IMU 闭环下不做编码器坐标系限位钳位
                 //   target 含义是枪口绝对俯仰(rad)，不在编码器坐标系
                 //   机械限位延后到 Morphology Manager 阶段
-                tgt = pitch.target_angle;
+                float tgt = pitch.target_angle;
+                float vel = jm.pitch.getVelocity();
+                float torque = pitch.Compute(tgt, fb, vel);
+                dm4310->ctrl_Mit(2, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.pitch.getConfig().direction);
                 pitch_fb_source = 1;  // 标记当前使用 IMU 反馈
             }
             else
             {
-                // 编码器闭环：IMU 离线时安全回退
-                //   getRealAngle() 包含 offset 和 direction 修正
-                //   clampTarget() 做编码器坐标系限位钳位
-                fb = jm.pitch.getRealAngle();
-                tgt = clampTarget(jm.pitch, pitch.target_angle);
-                pitch_fb_source = 0;  // 标记当前使用编码器反馈
+                // IMU 离线：停控，清 PID，发零力矩帧维持电机 MIT 在线
+                pitch.Clear();
+                dm4310->ctrl_Mit(2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                pitch_fb_source = 0;
             }
-
-            float vel = jm.pitch.getVelocity();   // 内环始终用编码器速度
-            float torque = pitch.Compute(tgt, fb, vel);
-            dm4310->ctrl_Mit(2, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.pitch.getConfig().direction);
         }
-        else if (dm4310 != nullptr)
+        else
         {
             pitch.Clear();
             pitch_fb_source = 0;
-            dm4310->ctrl_Mit(2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         }
 
         // --- Fold 关节（DM4340 #1）---
-        if (dm4340 != nullptr && jm.fold.isOnline())
+        // 【修复死锁】
+        //   原条件 jm.fold.isOnline() 导致：离线时不发 ctrl_Mit → 电机看门狗超时 → 永久离线
+        //   修复：只要电机实例存在就发 ctrl_Mit（kp=kd=0 的帧也能维持电机反馈在线）
+        if (dm4340 != nullptr)
         {
             float fb  = jm.fold.getRealAngle();
             float vel = jm.fold.getVelocity();
@@ -687,10 +770,9 @@ public:
             float torque = fold.Compute(tgt, fb, vel);
             dm4340->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.fold.getConfig().direction);
         }
-        else if (dm4340 != nullptr)
+        else
         {
             fold.Clear();
-            dm4340->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
         }
     }
 

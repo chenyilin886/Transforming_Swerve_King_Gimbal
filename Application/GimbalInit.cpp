@@ -26,11 +26,15 @@
 #include "can_hal.hpp"
 #include "DmMotor.hpp"
 #include "LkMotor.hpp"
+#include "DjiMotor.hpp"
 #include "Joint.hpp"
 #include "Controller.hpp"
+// DialController.hpp 已移到 ShootFSM.hpp 中 include（发射机构控制迁移到 ShootTask）
 #include "TransformPlanner.hpp"
 #include "DR16.hpp"
 #include "HI12H3_IMU.hpp"
+#include "Communication/BoardComm.hpp"
+#include "Communication/ChassisModeManager.hpp"  // 底盘模式状态机
 
 // ========================================================================
 // 全局电机指针
@@ -47,6 +51,14 @@ namespace BSP::MOTOR::LK
 //   ID=1, CAN1, 用于 Pitch 关节力矩控制（数据接收验证阶段）
 //   使用前必须：GimbalInit 中创建实例 + On(1) 使能 + GimbalUpdate 周期性 ctrl_Torque
 LK4005* lk4005_motor = nullptr;
+}
+
+namespace BSP::MOTOR::DJI
+{
+// GM3508 全局指针（DjiMotor.hpp 中 extern 声明）
+//   两个电机 ID=1, 2, CAN1, 用于摩擦轮速度控制
+//   使用前必须：GimbalInit 中创建实例 + On() 使能 + ShootTask 周期性 ctrl_Current + sendCAN
+GM3508<2>* motor_3508 = nullptr;
 }
 
 // ========================================================================
@@ -74,6 +86,38 @@ static BSP::CTRL::GimbalController gimbal_controller;
 //   - 终态/IDLE/ABORT 释放 target 给 Watch
 //   - 调用位置：JointManager.Update 之后，syncDataToController 之前（Step 2.5）
 static BSP::PLANNER::TransformPlanner transform_planner;
+
+// ========================================================================
+// 发射机构（拨盘 + 摩擦轮预留）控制已迁移到 ShootTask
+// ========================================================================
+// 迁移说明：
+//   旧版：dial_controller 在 GimbalInit.cpp 作为 static 实例，由 GimbalUpdate()
+//         每 1ms 同步调用 updateDialControl()。
+//   新版：拨盘控制已迁移到独立的 FreeRTOS 任务 ShootTask（4ms 周期, 250Hz），
+//         由 Class_ShootFSM 统一管理发射机构状态机：
+//           shootTask (4ms)
+//             └─→ Class_ShootFSM::Control()
+//                   ├─→ updateStateMachine_()        // 安全检查 + 状态切换
+//                   ├─→ applyStateToDialConfig_()    // state → Dial_Config.enabled
+//                   ├─→ dial_ctrl.Update(...)        // 委托拨盘双环控制
+//                   ├─→ updateFriction_()            // 预留: 摩擦轮控制(空)
+//                   └─→ syncStatus_()                // 回写 Shoot_Status
+//
+// 设计理由：
+//   - 与参考工程 ShootTask 架构一致（H_SG_Gimbal 参考工程）
+//   - 发射机构与云台关节控制解耦，避免互相阻塞
+//   - 未来加摩擦轮（DJI 3508）时只需扩展 Class_ShootFSM，任务接口不变
+//
+// 保留内容：
+//   - LK4005 电机实例创建、CAN 注册、On(1) 仍在 GimbalInit()
+//   - LK4005_Data 反馈同步仍在 GimbalUpdate() Step 6.6
+//   - lk4005_motor 指针仍由 GimbalInit.cpp 提供给 ShootFSM.cpp 使用
+//
+// 已移除：
+//   - static BSP::CTRL::DialController dial_controller（迁到 ShootFSM 内部）
+//   - static void updateDialControl()（迁到 ShootFSM::Control()）
+//   - GimbalUpdate() Step 0.6 对 updateDialControl() 的调用
+
 
 // ========================================================================
 // Watch ↔ Joint 同步辅助
@@ -263,22 +307,22 @@ void GimbalInit()
 {
     // 1. 获取 CAN 总线(首次调用自动初始化: 过滤器 + 启动 + 中断)
     auto &can1 = HAL::CAN::get_can_bus_instance().get_can1();
+    auto &can2 = HAL::CAN::get_can_bus_instance().get_can2();
 
     // 2. 创建电机实例(static 局部，生命周期 = 程序整个运行期)
     static BSP::MOTOR::DM::DM4310 dm4310(&can1);
     static BSP::MOTOR::DM::DM4340 dm4340(&can1);
-
-    // LK4005 电机实例（ID=1, 接 CAN1, 用于数据接收验证）
-    //   注意：LK 协议要求使能后周期性发送控制指令才能维持反馈上报
-    //   GimbalUpdate 中每周期调用 ctrl_Torque(1, 0) 维持反馈
     static BSP::MOTOR::LK::LK4005 lk4005(&can1, 1);
+    // GM3508 摩擦轮电机: motor_id=1(左), motor_id=2(右), CAN1
+    static BSP::MOTOR::DJI::GM3508<2> motor3508(&can1, 0x200, {1, 2}, 0x200);
 
     // 3. 赋值全局指针
     BSP::MOTOR::DM::dm4310_yaw_pitch = &dm4310;
     BSP::MOTOR::DM::dm4340_fold       = &dm4340;
     BSP::MOTOR::LK::lk4005_motor      = &lk4005;
+    BSP::MOTOR::DJI::motor_3508       = &motor3508;
 
-    // 4. 注册接收回调
+    // 4. 注册接收回调 — CAN1(三电机) + CAN2(3508 摩擦轮)
     can1.register_rx_callback(
         [](const HAL::CAN::Frame &frame)
         {
@@ -297,6 +341,12 @@ void GimbalInit()
             lk4005.Parse(frame);
         });
 
+    can1.register_rx_callback(
+        [](const HAL::CAN::Frame &frame)
+        {
+            motor3508.Parse(frame);
+        });
+
     // 5. 初始化 JointManager
     joint_manager.Init();
 
@@ -307,11 +357,9 @@ void GimbalInit()
     BSP::Remote::DR16::Instance().Init();
 
     // 8. 初始化 IMU(Stage03 接入传感器, USART1 DMA空闲中断接收)
-    //    HI12H3: 256000bps, 200Hz, 82字节固定帧
-    //    Init() 启动 DMA 接收，首帧到达后由 HAL_UARTEx_RxEventCallback 解析
     BSP::IMU::imu.Init();
 
-    // 9. 使能电机
+    // 9. 使能全部电机
     HAL_Delay(500);
 
     dm4310.On(1);
@@ -323,12 +371,15 @@ void GimbalInit()
     dm4340.On(1);
     HAL_Delay(10);
 
-    // 10. 使能 LK4005（发送 0x88 使能命令后电机开始上报反馈）
-    //     注意：使能后需 GimbalUpdate 周期性发送 ctrl_Torque(1, 0) 维持反馈
-    //     首次发送零力矩控制指令，触发首帧反馈上报
     lk4005.On(1);
     HAL_Delay(10);
     lk4005.ctrl_Torque(1, 0);
+    HAL_Delay(10);
+
+    // 3508 摩擦轮电机：无需使能（DJI 电机上电即反馈），仅发送电流 0 初始化
+    motor3508.ctrl_Current(1, 0);
+    motor3508.ctrl_Current(2, 0);
+    motor3508.sendCAN();
     HAL_Delay(10);
 }
 
@@ -341,11 +392,10 @@ void GimbalUpdate()
     using namespace BSP::MOTOR::DM;
 
     // ---------------------------------------------------------------
-    // Step 0: DR16 遥控器离线检测（每周期执行）
-    //   检查是否超过50ms未收到遥控器数据
-    //   离线时自动归零摇杆/开关/鼠标/键盘状态
+    // Step 0: DR16 遥控器离线检测（已移至 Step 2.55 e-stop 状态机统一处理）
+    //   避免多次 IsOffline() 导致开关值被提前重置为 UNKNOWN，
+    //   干扰 S1==DOWN && S2==DOWN 的判断
     // ---------------------------------------------------------------
-    BSP::Remote::DR16::Instance().IsOffline();
 
     // ---------------------------------------------------------------
     // Step 0.5: IMU 离线检测（每周期执行）
@@ -356,25 +406,29 @@ void GimbalUpdate()
     BSP::IMU::imu.IsOffline();
 
     // ---------------------------------------------------------------
-    // Step 0.6: LK4005 周期性控制指令（每周期执行，1kHz）
+    // Step 0.6: 发射机构控制已迁移到 ShootTask（4ms 周期, FreeRTOS 独立任务）
     //
-    // 【协议要求】
-    //   LK-TECH 电机使能后需周期性发送控制指令(0xA1 力矩控制)才能维持反馈上报。
-    //   若超过 ~200ms 未发送任何控制指令，电机将停止上报反馈帧。
+    // 【迁移说明】
+    //   旧版：updateDialControl() 在此处每 1ms 同步调用
+    //   新版：shootTask (4ms) → Class_ShootFSM::Control() → DialController.Update()
     //
-    // 【当前阶段：数据接收验证】
-    //   - 每周期发送零力矩 ctrl_Torque(1, 0)：维持反馈上报，不输出力矩
-    //   - 后续接入 Pitch 关节控制时，替换为 PID 输出的力矩值
+    // 【GimbalUpdate 保留的发射机构相关逻辑】
+    //   - LK4005_Data 反馈同步：Step 6.6（仅读反馈, 不发命令, 不冲突）
+    //   - LK4005 电机实例创建/CAN 注册：GimbalInit() 中
     //
-    // 【数据流】
-    //   ctrl_Torque(1, 0) → CAN1 发送 → 电机回复反馈帧
-    //     → LK4005::Parse → Configure → unit_data_[0]
-    //     → Step 6.6 同步到 LK4005_Data → Watch 观察
+    // 【任务间共享资源分析】
+    //   - LK4005 电机实例：
+    //       ShootTask → ctrl_Torque() 写 CAN 邮箱（4ms 一次）
+    //       GimbalTask → getAngleRad() 读 float（32位对齐, 原子性可接受）
+    //       CAN 中断 → Parse() 更新 unit_data_
+    //     无需加锁，参考工程也是这样做的
+    //   - DR16 单例：ShootTask 读 wheel/S1/S2，GimbalTask 读摇杆，只读不冲突
+    //
+    // 【调试观察点】
+    //   Watch 添加 Shoot_Status / Dial_Status / Dial_Config / Shoot_Config
+    //   - Shoot_Status.state: 0=DISABLE, 3=AUTO（safety_ok 时应自动进 AUTO）
+    //   - Dial_Status.target_angle: 拨轮触发时应增大 0.698 rad（40°）
     // ---------------------------------------------------------------
-    if (BSP::MOTOR::LK::lk4005_motor != nullptr)
-    {
-        BSP::MOTOR::LK::lk4005_motor->ctrl_Torque(1, 0);
-    }
 
     // ---------------------------------------------------------------
     // Step 1: Watch config → Joint(允许在线修改 offset/limit/calib)
@@ -389,33 +443,70 @@ void GimbalUpdate()
     joint_manager.Update(dm4310_yaw_pitch, dm4340_fold);
 
     // ---------------------------------------------------------------
+    // Step 2.1: DM 电机离线重使能
+    //
+    // 【问题根因】
+    //   DM 电机在 GimbalInit 中 On() 使能后，如果看门狗超时时间内
+    //   未收到 ctrl_Mit 控制命令（FreeRTOS 启动延迟约50-70ms），
+    //   电机会自动失能。失能后 ctrl_Mit 到达也不回复 → online=0 死锁。
+    //
+    // 【解决方案】
+    //   检测到 DM 电机离线时，每 200ms 重新发送 On() 命令重新使能。
+    //   重使能后电机回复一帧 → online 恢复 → ctrl_Mit 维持在线。
+    //   200ms 间隔避免频繁发送 On() 冲击总线。
+    //
+    // 【急停保护】
+    //   急停时跳过重使能：Step 2.55 已显式 Off() 电机，不应再 On()。
+    // ---------------------------------------------------------------
+    if (!Remote_State.estop_active)
+    {
+        static uint32_t last_reenable_tick = 0;
+        uint32_t now = HAL_GetTick();
+        if (now - last_reenable_tick >= 200)
+        {
+            last_reenable_tick = now;
+            if (dm4310_yaw_pitch != nullptr)
+            {
+                if (!dm4310_yaw_pitch->isConnected(1)) dm4310_yaw_pitch->On(1);
+                if (!dm4310_yaw_pitch->isConnected(2)) dm4310_yaw_pitch->On(2);
+            }
+            if (dm4340_fold != nullptr)
+            {
+                if (!dm4340_fold->isConnected(1)) dm4340_fold->On(1);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Step 2.55: 遥控器状态机（急停 + S1 边沿检测 → Planner 命令）
     //
     // 【需求】
     //   - S1==DOWN(2) && S2==DOWN(2) → 急停：所有电机失能防止疯转
-    //   - S1==UP(1)    → 收起（边沿触发，发一次 CONTRACT）
-    //   - S1==MIDDLE(3) → 展开（边沿触发，发一次 EXPAND）
+    //   - S1==UP(1)    → 展开（边沿触发，发一次 EXPAND）
+    //   - S1==MIDDLE(3) → 收起（边沿触发，发一次 CONTRACT）
     //
     // 【急停状态机】
     //   进入急停(0→1)：
     //     ① 保存 Controller_Data.{yaw,pitch,fold}.enabled → saved_*_en
     //     ② 置 enabled = 0（Step 3 syncDataToController 会同步到 ctrl.Disable）
-    //     ③ 发 ABORT 给 Planner（中止动作 + snap target 到 feedback）
-    //   急停保持：不做事（电机已失能，Planner 已 ABORT）
-    //   退出急停(1→0)：S1 或 S2 任一离开 DOWN 即退出
-    //     ① 恢复 enabled 从 saved_*_en
-    //     ② 发 RESET 给 Planner（从 ABORT 回到 IDLE）
-    //     ③ 跳过本周期 S1 边沿检测（防止 S1 从 DOWN 变化误触发）
+    //     ③ 显式 Off() 所有 DM 电机（物理退出闭环控制）
+    //     ④ 发 ABORT 给 Planner（中止动作 + snap target 到 feedback）
+    //   急停保持：不做事（电机已 Off() + Controller 已失能，Step 2.1 已 guard）
+    //   退出急停(1→0)：S1 或 S2 任一离开 DOWN 且遥控器在线
+    //     ① 显式 On() 重新使能 DM 电机（物理进入闭环）
+    //     ② 恢复 enabled 从 saved_*_en
+    //     ③ 发 RESET 给 Planner（从 ABORT 回到 IDLE）
+    //     ④ 跳过本周期 S1 边沿检测（防止 S1 从 DOWN 变化误触发）
     //
     // 【S1 边沿检测】（仅非急停时）
     //   检测 S1 档位变化：
-    //     其他 → UP(1)     → cmd = CONTRACT
-    //     其他 → MIDDLE(3)  → cmd = EXPAND
+    //     其他 → UP(1)     → cmd = EXPAND
+    //     其他 → MIDDLE(3)  → cmd = CONTRACT
     //   保持在同一档位不重复发（Planner cmd 是单次触发型）
     //
     // 【DR16 离线行为】
-    //   离线时 s1/s2 = UNKNOWN(0)，不满足 DOWN&&DOWN，不触发急停
-    //   符合"离线时保持当前位置"的安全策略
+    //   离线时 s1/s2 = UNKNOWN(0)，不满足条件①（DOWN&&DOWN）
+    //   但 remote_offline==1 满足条件② → 进入急停 → 所有电机 Off() 失能
     //
     // 【调试观察点】Watch 中展开 Remote_State：
     //   estop_active       : 急停标志(1=急停中)
@@ -466,6 +557,18 @@ void GimbalUpdate()
                 Controller_Data.pitch.enabled = 0;
                 Controller_Data.fold.enabled  = 0;
 
+                // 显式 Off() DM 电机：物理退出闭环控制，防止电机继续发力
+                //   Step 2.1 已 guarded 不会反向 On()
+                if (dm4310_yaw_pitch != nullptr)
+                {
+                    dm4310_yaw_pitch->Off(1);  // Yaw 电机物理失能
+                    dm4310_yaw_pitch->Off(2);  // Pitch 电机物理失能
+                }
+                if (dm4340_fold != nullptr)
+                {
+                    dm4340_fold->Off(1);        // Fold 电机物理失能
+                }
+
                 // 发 ABORT 给 Planner（中止动作 + snap target 到 feedback）
                 Transform_Config.cmd = static_cast<uint8_t>(
                     BSP::PLANNER::TransformCmd::ABORT);
@@ -484,6 +587,18 @@ void GimbalUpdate()
                 // 退出急停（1→0）：
                 //   条件：S1/S2 不都是 DOWN 且遥控器在线
                 Remote_State.estop_active = 0;
+
+                // 重新使能 DM 电机：物理进入闭环控制
+                //   On() 后需在下一周期 Step 4 收到首个 ctrl_Mit 才能回复反馈
+                if (dm4310_yaw_pitch != nullptr)
+                {
+                    dm4310_yaw_pitch->On(1);  // Yaw 电机重新使能
+                    dm4310_yaw_pitch->On(2);  // Pitch 电机重新使能
+                }
+                if (dm4340_fold != nullptr)
+                {
+                    dm4340_fold->On(1);        // Fold 电机重新使能
+                }
 
                 // 恢复急停前的 enabled 状态
                 Controller_Data.yaw.enabled   = Remote_State.saved_yaw_en;
@@ -508,25 +623,62 @@ void GimbalUpdate()
 
                 if (cur_s1 != Remote_State.last_s1)
                 {
-                    if (cur_s1 == static_cast<uint8_t>(Switch::UP))
+                    // Planner 处于 ABORT 时，先发 RESET 恢复到 IDLE
+                    // 不更新 last_s1，下一周期重新检测边沿发送实际命令
+                    if (Transform_Status.state ==
+                        static_cast<uint8_t>(BSP::PLANNER::TransformState::ABORT))
                     {
-                        // S1 → 上档(1)：收起命令
                         Transform_Config.cmd = static_cast<uint8_t>(
-                            BSP::PLANNER::TransformCmd::CONTRACT);
+                            BSP::PLANNER::TransformCmd::RESET);
                         Remote_State.planner_cmd_sent = static_cast<uint8_t>(
-                            BSP::PLANNER::TransformCmd::CONTRACT);
+                            BSP::PLANNER::TransformCmd::RESET);
+                        // 不更新 last_s1：下周期 ABORT→IDLE 后重发 EXPAND/CONTRACT
                     }
-                    else if (cur_s1 == static_cast<uint8_t>(Switch::MIDDLE))
+                    else if (cur_s1 == static_cast<uint8_t>(Switch::UP) ||
+                             cur_s1 == static_cast<uint8_t>(Switch::MIDDLE))
                     {
-                        // S1 → 中档(3)：展开命令
-                        Transform_Config.cmd = static_cast<uint8_t>(
-                            BSP::PLANNER::TransformCmd::EXPAND);
-                        Remote_State.planner_cmd_sent = static_cast<uint8_t>(
-                            BSP::PLANNER::TransformCmd::EXPAND);
+                        // S1 → UP(1) 或 MIDDLE(3)：准备发送变形命令
+                        // 【关键】先检查并修复 yaw 控制模式，确保变形期间 yaw 正常控制
+
+                        // 检查当前是否处于跟随模式（yaw 速度环单环）
+                        auto chassis_mode = BoardComm::ChassisModeManager::Instance().GetCurrentState();
+                        bool in_follow_mode = (chassis_mode == BoardComm::ChassisMode::CHASSIS_FOLLOW);
+
+                        if (in_follow_mode && gimbal_controller.yaw.cascade_mode == 0)
+                        {
+                            // 在跟随模式下，yaw 处于速度环单环（cascade_mode=0）
+                            // 变形需要 yaw 进入串级模式，否则 yaw_online 检查失败 → ABORT
+                            // 强制切换到串级模式（从 IMU 当前位置开始）
+                            gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
+                            Controller_Data.yaw.cascade_mode = 1;
+                            Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
+                            FollowMode_Data.control_mode = 0;  // 标记退出速度环模式
+                        }
+
+                        // 发送变形命令
+                        if (cur_s1 == static_cast<uint8_t>(Switch::UP))
+                        {
+                            // S1 → 上档(1)：展开命令
+                            Transform_Config.cmd = static_cast<uint8_t>(
+                                BSP::PLANNER::TransformCmd::EXPAND);
+                            Remote_State.planner_cmd_sent = static_cast<uint8_t>(
+                                BSP::PLANNER::TransformCmd::EXPAND);
+                        }
+                        else
+                        {
+                            // S1 → 中档(3)：收起命令
+                            Transform_Config.cmd = static_cast<uint8_t>(
+                                BSP::PLANNER::TransformCmd::CONTRACT);
+                            Remote_State.planner_cmd_sent = static_cast<uint8_t>(
+                                BSP::PLANNER::TransformCmd::CONTRACT);
+                        }
+                        Remote_State.last_s1 = cur_s1;
                     }
-                    // S1 → DOWN(2) 或 UNKNOWN(0)：不发命令
-                    //   S1=DOWN 单独不发命令（急停需要 S2 同时 DOWN）
-                    Remote_State.last_s1 = cur_s1;
+                    else
+                    {
+                        // S1 → DOWN(2) 或 UNKNOWN(0)：不发命令
+                        Remote_State.last_s1 = cur_s1;
+                    }
                 }
             }
         }
@@ -656,11 +808,11 @@ void GimbalUpdate()
             {
                 // IMU 闭环：实测 IMU Pitch 限位（deg → rad）
                 //   展开状态下实测值（2026-07-14）：
-                //     上限：33 deg  → 0.576 rad（枪口抬起）
-                //     下限：-29 deg → -0.506 rad（枪口压下）
+                //     上限：28 deg  → 0.576 rad（枪口抬起）
+                //     下限：-25 deg → -0.506 rad（枪口压下）
                 //   TODO: 根据 Fold 状态动态切换限位（Morphology Manager 阶段）
-                const float pitch_imu_limit_max = 33.0f  * (3.14159265358979f / 180.0f);  // ≈ 0.576 rad
-                const float pitch_imu_limit_min = -29.0f * (3.14159265358979f / 180.0f);  // ≈ -0.506 rad
+                const float pitch_imu_limit_max = 33.0f  * (3.14159265358979f / 180.0f);  
+                const float pitch_imu_limit_min = -25.0f * (3.14159265358979f / 180.0f);  
                 
                 if (new_target > pitch_imu_limit_max) new_target = pitch_imu_limit_max;
                 if (new_target < pitch_imu_limit_min) new_target = pitch_imu_limit_min;
@@ -684,98 +836,189 @@ void GimbalUpdate()
     }
 
     // ---------------------------------------------------------------
-    // Step 2.7: 遥控器左摇杆X轴 → Yaw 目标角度(速度积分模式)
+    // Step 2.7: Yaw轴控制（模式自适应：跟随模式速度环单环 vs 其他模式串级PID）
     //
-    // 【原理】
-    //   与 Step 2.6 Pitch 相同的速度积分模式：
-    //   ch2 × max_speed → 角速度 → 积分到 target_angle
-    //   归中时 v=0 → target 保持 → 停止运动
+    // 【核心改进】根治底盘跟随模式下的yaw轴反转现象
+    //   - 跟随模式(S2==MIDDLE): 速度环单环控制（IMU速度反馈）
+    //     * 摇杆直接映射到速度目标（不积分）
+    //     * 松手→速度=0→电机自由停止，不抵抗底盘跟随
+    //     * 根治反转：底盘超调反向修正时，yaw轴不抵抗
     //
-    // 【关键区别】Yaw 是连续旋转关节：
-    //   - 不做限位钳位（可无限圈旋转）
-    //   - Controller.hpp Compute() 中 continuous=1，已做 wrapToPi 最短路径处理
-    //   - target_angle 可以超出 [-π, π]（PID 内部自动归一化误差）
-    //   - 持续拨动摇杆，Yaw 会持续旋转多圈
+    //   - 其他模式(S2==UP/DOWN): 串级PID（保持原有逻辑）
+    //     * 摇杆速度积分到角度目标
+    //     * IMU位置闭环，保持绝对航向
     //
     // 【数据流】
-    //   DR16.ch2 (-1~1)
-    //     ↓ 死区过滤(±0.05)
-    //     ↓ × max_yaw_speed (3.0 rad/s)  → target_velocity (rad/s)
-    //     ↓ × dt (0.001s, 1kHz)          → delta_angle (rad)
-    //     ↓ 累加到 Controller_Data.yaw.target_angle
-    //     ↓ 无限位钳位（连续旋转关节）
-    //     ↓ Step 3 syncDataToController → PID.target_angle
-    //     ↓ Step 4 串级 PID → Motor.ctrl_Mit
+    //   DR16.ch2 → 死区过滤 → 模式判断
+    //     ├─ 跟随模式: ch2*max_speed → 速度目标 → 速度环PID → 力矩
+    //     └─ 其他模式: ch2*max_speed*dt → 角度积分 → 串级PID → 力矩
     //
-    // 【方向映射】
-    //   ch2 > 0 (摇杆向右) → target_angle 增大 → Yaw 顺时针旋转
-    //   ch2 < 0 (摇杆向左) → target_angle 减小 → Yaw 逆时针旋转
-    //
-    // 【安全性】
-    //   - 急停时跳过积分（电机已失能）
-    //   - Planner TRANSITION 时跳过（让 Planner 控制）
-    //   - DR16 离线时 ch2=0 → target 保持 → PID 维持当前位置
-    //   - Yaw 连续旋转：Compute() 中 wrapToPi 保证误差始终走最短路径
-    //     即使 target 累积到很大值，PID 误差仍在 [-π, π]，不会疯车
+    // 【平滑切换】
+    //   模式切换时：
+    //     跟随→其他: cascade_mode 0→1, target从IMU当前位置开始
+    //     其他→跟随: cascade_mode 1→0, 速度从IMU当前速度开始
+    //   清空PID状态，避免冲击
     //
     // 【调试观察点】
-    //   - DR16_Data.ch2                        左摇杆X轴原始值
-    //   - Controller_Data.yaw.target_angle      积分后目标（可超 [-π,π]）
-    //   - Controller_Data.yaw.feedback_angle    归一化反馈（[-π,π]）
-    //   - Controller_Data.yaw.error             最短路径误差（应在 [-π,π]）
-    //   - Controller_Data.yaw.torque_output     输出力矩
+    //   FollowMode_Data.control_mode     : 0=串级PID, 1=速度环单环
+    //   FollowMode_Data.target_velocity  : 速度环目标
+    //   FollowMode_Data.imu_velocity     : IMU角速度反馈
+    //   FollowMode_Data.follow_vel_kp/ki/kd: 跟随模式PID参数
     // ---------------------------------------------------------------
     {
-        // 急停时跳过摇杆积分（电机已失能，不应改 target）
-        // Planner TRANSITION 时跳过（让 Planner 控制 target）
+        // 急停时跳过（电机已失能，不应改target）
         if (Remote_State.estop_active ||
             BSP::PLANNER::isTransitionState(
                 static_cast<BSP::PLANNER::TransformState>(Transform_Status.state)))
         {
-            // 跳过本周期摇杆积分
+            // 跳过本周期
         }
         else
         {
             auto &dr16 = BSP::Remote::DR16::Instance();
 
+            // ========== 1. 获取底盘模式 ==========
+            auto chassis_mode = BoardComm::ChassisModeManager::Instance().GetCurrentState();
+            bool is_follow_mode = (chassis_mode == BoardComm::ChassisMode::CHASSIS_FOLLOW);
+
+            // ========== 2. 计算IMU角速度反馈 ==========
+            float imu_yaw_vel = 0.0f;
+            if (gimbal_controller.imu_online) {
+                // IMU陀螺仪输出（deg/s → rad/s）
+                // 注意：方向不取负（已确认）
+                imu_yaw_vel = -BSP::IMU::imu.getGyroZ() * 0.0174532f;
+                FollowMode_Data.imu_velocity = imu_yaw_vel;  // 写入Watch可观察
+            }
+
+            // ========== 3. 模式切换平滑处理 ==========
+            static uint8_t last_follow_mode = 0;
+            if (is_follow_mode != last_follow_mode) {
+                if (is_follow_mode) {
+                    // 进入跟随：串级→单级，速度从IMU当前速度开始
+                    gimbal_controller.yaw.SwitchToVelocityMode(imu_yaw_vel);
+                    FollowMode_Data.control_mode = 1;  // 标记速度环模式
+                    // 同步到参数结构体，避免 Step 3 覆盖
+                    Controller_Data.yaw.cascade_mode = 0;
+                } else {
+                    // 退出跟随：单级→串级，角度从IMU当前位置开始
+                    gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
+                    FollowMode_Data.control_mode = 0;  // 标记串级PID模式
+                    // 【关键】同步到参数结构体，避免 Step 3 把 cascade_mode=0 同步回去
+                    Controller_Data.yaw.cascade_mode = 1;
+                    Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
+                }
+                last_follow_mode = is_follow_mode;
+            }
+
+            // ========== 4. 摇杆输入处理 ==========
             // 左摇杆 X 轴(ch2)，范围 [-1.0, 1.0]，向右为正
             float ch2 = (float)dr16.GetCh2();
 
             // 死区过滤：消除摇杆归中时的噪声(约 ±0.03~0.05)
-            //   归中时强制速度为 0，保证"归中即停止"
             const float dead_zone = 0.05f;
-            if (ch2 > -dead_zone && ch2 < dead_zone)
-            {
+            if (ch2 > -dead_zone && ch2 < dead_zone) {
                 ch2 = 0.0f;
             }
 
             // 速度映射：ch2 × max_yaw_speed → 目标角速度(rad/s)
-            //   max_yaw_speed = 5.0 rad/s：满幅拨杆 1 秒转动 5 rad ≈ 29°
-            //   Yaw 连续旋转，速度可比 Pitch 更快
-            const float max_yaw_speed = 3.0f;
-            float target_velocity     = ch2 * max_yaw_speed;
+            const float max_yaw_speed = 2.8f;  // rad/s
+            float target_velocity = ch2 * max_yaw_speed;
 
-            // 积分步长：GimbalUpdate 1kHz → dt = 0.001s
-            const float dt = 0.001f;
-
-            // 仅当 yaw 关节在线时才积分(防止离线时 target 漂移)
+            // ========== 5. 控制计算（模式自适应） ==========
+            // 仅当 yaw 关节在线时才控制
             if (joint_manager.yaw.isOnline())
             {
-                // 速度积分：target_angle += velocity × dt
-                //   Yaw 是连续旋转关节，不做限位钳位
-                //   target 可无限累积（PID 内部 wrapToPi 处理最短路径误差）
-                Controller_Data.yaw.target_angle += target_velocity * dt;
+                if (is_follow_mode) {
+                    // ===== 跟随模式：速度环单环 =====
+                    // 写入Watch观察
+                    FollowMode_Data.target_velocity = target_velocity;
+
+                    // 速度环计算（IMU反馈）
+                    Kpid_t follow_kpid = {
+                        FollowMode_Data.follow_vel_kp,
+                        FollowMode_Data.follow_vel_ki,
+                        FollowMode_Data.follow_vel_kd
+                    };
+                    float torque = gimbal_controller.yaw.ComputeVelocity(
+                        target_velocity,
+                        imu_yaw_vel,
+                        follow_kpid
+                    );
+
+                    // 输出到电机
+                    dm4310_yaw_pitch->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f,
+                                                torque * joint_manager.yaw.getConfig().direction);
+
+                } else {
+                    // ===== 其他模式：串级PID（保持原有逻辑）=====
+                    // 速度积分：target_angle += velocity × dt
+                    const float dt = 0.001f;
+                    Controller_Data.yaw.target_angle += target_velocity * dt;
+
+                    // 注意：串级PID计算在 gimbal_controller.Update() 中完成
+                    // 此处不调用，让后续 Step 3.5 → Step 4 流程统一处理
+                }
             }
-        }  // end else (非急停 且 非TRANSITION) — Yaw
+        }  // end else (非急停 且 非TRANSITION)
     }
+
+    // ---------------------------------------------------------------
+    // Step 2.7: 底盘模式状态机（板间通信 - 模式管理）【新增】
+    //
+    // 【需求】
+    //   根据遥控器S2开关状态，决定底盘控制模式：
+    //   - S2==MIDDLE → 跟随模式（底盘跟随云台朝向）
+    //   - S2==UP     → 小陀螺模式（预留）
+    //   - S2==DOWN   → 手动模式（wheel控制旋转）
+    //   - S1+S2==DOWN → 急停（最高优先级）
+    //   - 遥控器离线 → 强制急停
+    //
+    // 【架构】
+    //   StateMachine（ChassisModeManager）← 状态判断 + 滤波 + 离线检测
+    //     ↓ GetChassisMode()
+    //   BoardComm::Update() ← 数据打包
+    //     ↓ CAN2发送（0x205/0x206）
+    //   底盘板接收 → RemoteControl::MapToChassis()
+    //
+    // 【状态滤波】
+    //   连续10次（10ms）检测到相同状态才切换，防止开关抖动。
+    //
+    // 【调试观察点】Watch 中展开 ChassisModeDebug：
+    //   current_state       : 当前模式(0-3)
+    //   state_change_count  : 状态切换次数
+    //   filter_reject_count : 滤波拒绝次数
+    //   remote_online       : 遥控器在线状态
+    // ---------------------------------------------------------------
+    BoardComm::ChassisModeManager::Instance().Update();
 
     // ---------------------------------------------------------------
     // Step 3: Watch → GimbalController(在线调参 / 设目标 / 启停)
     //   注意：Planner 在 Step 2.5 已可能修改 pitch/fold.target_angle
     //         遥控器在 Step 2.6 已修改 pitch.target_angle
     //         此处 syncDataToController 会将最新 target 同步到 JointController
+    //
+    //   【关键】Yaw轴跟随模式时不同步参数！
+    //     - 跟随模式（FollowMode_Data.control_mode=1）：
+    //       Step 2.7已设置为速度环单环（cascade_mode=0）
+    //       若此处同步会覆盖cascade_mode回串级（cascade_mode=1）
+    //       导致Update()中仍执行串级PID → "转不动"
+    //     - 其他模式（control_mode=0）：
+    //       正常同步Yaw轴参数（串级PID）
+    //
+    //   【变形期间例外】TRANSITION 状态时必须同步 Yaw 参数
+    //     - TransformPlanner 需要锁定 yaw 角度（cascade_mode=1）
+    //     - 如果不同步，yaw 会保持速度环单环（cascade_mode=0）
+    //     - GimbalController.Update() 会跳过 yaw 串级 PID → yaw 失控
+    //     - 同时导致 yaw 离线检查失败 → 变形被 ABORT
     // ---------------------------------------------------------------
-    syncDataToController(Controller_Data.yaw,   gimbal_controller.yaw);
+    bool is_transition = BSP::PLANNER::isTransitionState(
+        static_cast<BSP::PLANNER::TransformState>(Transform_Status.state));
+
+    // Yaw轴：非跟随模式 或 变形期间 都要同步
+    if (FollowMode_Data.control_mode == 0 || is_transition) {
+        syncDataToController(Controller_Data.yaw, gimbal_controller.yaw);
+    }
+    // Pitch/Fold：始终同步
     syncDataToController(Controller_Data.pitch, gimbal_controller.pitch);
     syncDataToController(Controller_Data.fold,  gimbal_controller.fold);
 
@@ -1005,6 +1248,39 @@ void GimbalUpdate()
     }
 
     // ---------------------------------------------------------------
+    // Step 6.7: GM3508 摩擦轮数据同步（每周期执行）
+    //   从 motor_3508 读取反馈 → 回写到 Friction_Data
+    //   Watch 中展开 Friction_Data → left/right 即可验证数据接收：
+    //     验证方法：
+    //       1. Watch 添加 Friction_Data，观察 left.online / right.online 是否都 = 1
+    //       2. 若 online=1，再看 velocity_rpm 是否随电机转动变化
+    //       3. 若 online=0 持续不变，检查 CAN2 线束和 motor_id 设置
+    //     调试计数：
+    //       同时观察 CanCallback.cpp 中 can2_rx_id_0x201 / can2_rx_id_0x202
+    //       应持续增长。
+    // ---------------------------------------------------------------
+    if (BSP::MOTOR::DJI::motor_3508 != nullptr)
+    {
+        auto &m = *BSP::MOTOR::DJI::motor_3508;
+
+        // motor_id = 1（左摩擦轮）
+        Friction_Data.left.angle_rad      = m.getAngleRad(1);
+        Friction_Data.left.velocity_rpm   = m.getVelocityRpm(1);
+        Friction_Data.left.velocity_radps = m.getVelocityRad(1);
+        Friction_Data.left.torque_nm      = m.getTorque(1);
+        Friction_Data.left.temperature    = m.getTemperature(1);
+        Friction_Data.left.online         = m.isConnected(1) ? 1 : 0;
+
+        // motor_id = 2（右摩擦轮）
+        Friction_Data.right.angle_rad      = m.getAngleRad(2);
+        Friction_Data.right.velocity_rpm   = m.getVelocityRpm(2);
+        Friction_Data.right.velocity_radps = m.getVelocityRad(2);
+        Friction_Data.right.torque_nm      = m.getTorque(2);
+        Friction_Data.right.temperature    = m.getTemperature(2);
+        Friction_Data.right.online         = m.isConnected(2) ? 1 : 0;
+    }
+
+    // ---------------------------------------------------------------
     // Step 7: VOFA+ 波形发送（降频到 500Hz）
     //   调用 Variable.cpp 中的 VofaSendDebugChannels()
     //   修改通道配置：只需改 Variable.cpp，无需改此文件
@@ -1015,5 +1291,33 @@ void GimbalUpdate()
     {
         vofa_counter = 0;
         VofaSendDebugChannels();  // ← 在 Variable.cpp 中实现，方便修改通道
+    }
+
+    // ---------------------------------------------------------------
+    // Step 8: 板间通信更新（云台→底盘，4ms 周期）
+    //   更新发送数据：遥控器通道 + 云台角度
+    //   发送 CAN 帧：0x205/0x206
+    //   接收处理：0x207/0x208（在 CanCallback.cpp 中断中处理）
+    //
+    // 【数据流】
+    //   DR16 遥控器右摇杆 → BoardComm::Update() → direction.LX/LY
+    //   Joint_Data.yaw → CalcuGimbalToChassisAngle() → direction.Yaw_encoder_angle_err
+    //   direction/chassis_mode/ui_list → Data_send() → CAN2 发送
+    //
+    // 【调试观察点】
+    //   Watch 添加 BoardComm_Data：
+    //     - LX/LY：遥控器右摇杆（0-220，中值110）
+    //     - Yaw_encoder_angle_err：云台-底盘角度误差
+    //     - launch_speed：发射速度（底盘返回）
+    //     - booster_now_heat：当前热量（底盘返回）
+    // ---------------------------------------------------------------
+    {
+        static auto &board_comm = BoardComm::Gimbal_to_Chassis::Instance();
+
+        // 更新发送数据（读取遥控器 + 云台角度）
+        board_comm.Update();
+
+        // 发送 CAN 帧（0x205/0x206）
+        board_comm.Data_send();
     }
 }

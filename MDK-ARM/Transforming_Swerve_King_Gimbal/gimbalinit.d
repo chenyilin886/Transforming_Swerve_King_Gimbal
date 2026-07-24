@@ -781,6 +781,9 @@ transforming_swerve_king_gimbal/gimbalinit.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\unary_negate.h \
   ..\BSP\Motor\DM\DmMotor.hpp ..\BSP\Motor\MotorBase.hpp \
   ..\BSP\Common\StateWatch\state_watch.hpp ..\BSP\Motor\Lk\LkMotor.hpp \
-  ..\Joint\Joint.hpp ..\Algorithm\Controller.hpp ..\Algorithm\PID.hpp \
-  ..\BSP\stdxxx.hpp ..\Planner\TransformPlanner.hpp \
-  ..\BSP\Remote\DR16.hpp ..\BSP\IMU\HI12H3_IMU.hpp
+  ..\BSP\Motor\Dji\DjiMotor.hpp ..\Joint\Joint.hpp \
+  ..\Algorithm\Controller.hpp ..\Algorithm\PID.hpp ..\BSP\stdxxx.hpp \
+  ..\Planner\TransformPlanner.hpp ..\BSP\Remote\DR16.hpp \
+  ..\BSP\IMU\HI12H3_IMU.hpp ..\Application\Communication\BoardComm.hpp \
+  ..\Application\Communication\ChassisModeManager.hpp \
+  ..\BSP\..\BSP\Remote\DR16.hpp

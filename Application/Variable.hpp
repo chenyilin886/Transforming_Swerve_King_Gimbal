@@ -170,7 +170,48 @@ typedef struct
     float    limit_min;        // 关节限位下限(rad)，从 Joint 同步
     float    limit_max;        // 关节限位上限(rad)，从 Joint 同步
     uint8_t  feedback_source;  // 反馈源标识: 0=编码器, 1=IMU(Yaw 专用), Watch 观察用
+
 } Controller_Data_Unit_t;
+
+// ========================================================================
+// 底盘跟随模式专用数据（速度环单环控制）
+// ========================================================================
+/**
+ * @brief 底盘跟随模式专用数据结构
+ *
+ * 设计原因：
+ *   底盘跟随模式(S2==MIDDLE)时，Yaw轴从串级PID切换到速度环单环控制，
+ *   松手后电机自由停止，不抵抗底盘跟随的超调反向修正，根治反转现象。
+ *   独立结构体管理跟随模式参数，职责清晰，易于扩展。
+ *
+ * 数据流：
+ *   DR16.ch2 → 死区过滤 → 速度目标(target_velocity)
+ *     ↓
+ *   IMU.getGyroZ() → IMU角速度反馈(imu_velocity)
+ *     ↓
+ *   速度环PID(follow_vel_kp/ki/kd) → 力矩输出
+ *     ↓
+ *   DM4310.ctrl_Mit()
+ *
+ * Watch 调参步骤：
+ *   ① follow_vel_kp 从 5.0 起调，观察速度响应
+ *   ② follow_vel_ki 从 0.1 起调，消除稳态误差
+ *   ③ follow_vel_kd 从 0.05 起调，抑制超调
+ *
+ * 模式切换：
+ *   S2=MIDDLE → control_mode=1（速度环单环）
+ *   S2=其他   → control_mode=0（串级PID）
+ *   切换时清空PID状态，平滑过渡
+ */
+typedef struct
+{
+    float    target_velocity;  // 速度环目标(rad/s)，摇杆直接映射
+    float    imu_velocity;     // IMU角速度反馈(rad/s)，来自陀螺仪
+    float    follow_vel_kp;    // 跟随模式速度环 kp（用户在线调整）
+    float    follow_vel_ki;    // 跟随模式速度环 ki（用户在线调整）
+    float    follow_vel_kd;    // 跟随模式速度环 kd（用户在线调整）
+    uint8_t  control_mode;     // 控制模式: 0=串级PID, 1=速度环单环（跟随模式）
+} FollowMode_Data_t;
 
 // ========================================================================
 // 三关节 Controller 聚合
@@ -222,7 +263,7 @@ typedef struct
 {
     float    pitch_expand;       // 展开后 Pitch 水平位(rad), 实测 0.126987755
     float    pitch_contract;     // 收起 Pitch 角度(rad),     实测 -0.792750061
-    float    fold_expand;        // 展开 Fold 角度(rad),      实测 0.901044846
+    float    fold_expand;        // 展开 Fold 角度(rad),      实测 0.848020554
     float    fold_contract;      // 收起 Fold 角度(rad),      实测 0.0
     float    arrive_eps;         // 到位误差阈值(rad), 默认 0.02
     uint16_t arrive_timeout_ms;  // 单步超时(ms),      默认 3000
@@ -239,12 +280,16 @@ typedef struct
  *   state            : 当前状态(0=IDLE, 1=EXPAND_SIMULTANEOUS, 2=EXPANDED,
  *                      3=CONTRACT_SIMULTANEOUS, 4=CONTRACTED, 5=ABORT)
  *   step             : 当前步骤序号(0=待机/终态, 1=执行中)
+ *   yaw_target_now   : 当前下发 yaw target(rad)
+ *                      [TRANSITION: 锁定到变形开始时的IMU角度; 终态/IDLE/ABORT: Controller_Data 中的值]
  *   pitch_target_now : 当前下发的 pitch target(rad)
  *                      [TRANSITION: Planner 写入值; 终态/IDLE/ABORT: Controller_Data 中的值]
  *   fold_target_now  : 当前下发的 fold target(rad)
+ *   yaw_err          : 实时 yaw 误差(rad)   = yaw_target_now - yaw_fb
  *   pitch_err        : 实时 pitch 误差(rad) = pitch_target_now - pitch_fb
  *   fold_err         : 实时 fold 误差(rad)  = fold_target_now  - fold_fb
  *   step_elapsed_ms  : 当前步已耗时(ms), 仅 TRANSITION 状态累加
+ *   yaw_online       : yaw 在线状态(1=在线)
  *   pitch_online     : pitch 在线状态(1=在线)
  *   fold_online      : fold 在线状态(1=在线)
  *   last_error       : ABORT 原因(0=正常, 1=TIMEOUT, 2=MOTOR_OFFLINE, 3=ABORT_CMD)
@@ -253,11 +298,14 @@ typedef struct
 {
     uint8_t  state;               // 当前状态(0..7)
     uint8_t  step;                // 当前步骤序号(0/1/2)
+    float    yaw_target_now;      // 当前 yaw target(rad)
     float    pitch_target_now;    // 当前 pitch target(rad)
     float    fold_target_now;     // 当前 fold target(rad)
+    float    yaw_err;             // yaw 误差(rad)
     float    pitch_err;           // pitch 误差(rad)
     float    fold_err;            // fold 误差(rad)
     uint16_t step_elapsed_ms;     // 当前步已耗时(ms)
+    uint8_t  yaw_online;          // yaw 在线状态
     uint8_t  pitch_online;        // pitch 在线状态
     uint8_t  fold_online;         // fold 在线状态
     uint8_t  last_error;          // ABORT 原因(0/1/2/3)
@@ -504,16 +552,352 @@ typedef struct
 } LK4005_Data_t;
 
 // ========================================================================
+// LK4005 拨盘双环控制配置 / 状态（参考工程方式：位置环+速度环）
+// ========================================================================
+//
+// 设计来源：
+//   参考 H_SG_Gimbal 参考工程 ShootTask.cpp 拨盘控制：
+//     - 单击单发：wheel 上沿触发，每次目标角度 -= angle_per_shot_deg
+//     - 长按连发：wheel 持续超过 long_press_ms，按 fire_hz 持续累加角度
+//     - 双环 PID：位置环(位置式) → 速度环(位置式) → LK raw 命令
+//     - 卡弹检测：力矩饱和 + 位置误差大持续 → 反转解卡
+//
+// 与旧 Dial4005_Config_t（已移除）的区别：
+//   - 旧版：只有速度环 PID，wheel 直接映射目标速度
+//   - 新版：位置环+速度环双环，wheel 通过状态机生成目标"角度"
+//   - 新版支持单击单发+长按连发，符合操作手习惯
+//   - 新增卡弹检测，避免卡弹烧电机
+//
+// 拨盘几何：
+//   - 槽位数 slots_per_rotation: 默认 9（参考工程，单发角度 360/9 = 40°）
+//   - 单发角度 angle_per_shot_deg: 默认 40°
+//   - 拨盘方向：target_angle -= 实现正向供弹（与参考工程一致）
+
+/**
+ * @brief 拨盘双环控制配置（Watch 可调）
+ *
+ * Watch 调试建议：
+ *   ① 先调速度环(内环): vel_kp=50, vel_kd=1.0, vel_ki=0
+ *   ② 再调位置环(外环): pos_kp=8.0, pos_kd=0.3, pos_ki=0
+ *   ③ 拨轮短暂上抬一次 → 观察 target_angle 减 40°、反馈角度跟随
+ *   ④ 卡弹检测初调时 jam_detect_enable=0，速度环稳定后再开
+ *
+ * @note feature_enable=0 / enabled=0 / 急停 → 自动发送零力矩保反馈
+ */
+typedef struct
+{
+    // === 功能开关 ===
+    uint8_t  feature_enable;        // 总开关: 0=完全旁路, 1=允许拨盘控制
+    uint8_t  enabled;               // 控制使能: 0=清PID+零力矩, 1=允许拨盘控制
+    uint8_t  clear_pid;             // 单次清PID: Watch置1后清空PID, 本周期自动回写0
+
+    // === 拨盘几何 ===
+    float    slots_per_rotation;    // 拨盘槽位数, 默认 9 (单发角度 = 360/9 = 40°)
+    float    angle_per_shot_deg;    // 单发角度(度), 默认 40°, 与 slots_per_rotation 对应
+
+    // === 拨轮触发 ===
+    float    wheel_start_threshold; // 拨轮启动阈值, 默认 0.5 (wheel > 该值才触发)
+    uint32_t long_press_ms;         // 长按判定时间(ms), 默认 1000 (持续超过则切连发)
+    float    auto_fire_hz;          // 连发基础频率(Hz), 默认 8 (仅 wheel_to_hz<=0 时使用)
+    float    wheel_to_hz;           // wheel满幅映射频率(Hz), 默认 15 (>0时按wheel值线性映射)
+
+    // === 位置环(外环) PID ===
+    //   输入: 误差(rad), 输出: 速度目标(rad/s)
+    float    pos_kp;                // 位置环 P, 建议起点 8.0
+    float    pos_ki;                // 位置环 I, 建议保持 0 (拨盘是供弹, 无需消除稳态误差)
+    float    pos_kd;                // 位置环 D, 建议起点 0.3
+    float    pos_break_i;           // 位置环积分隔离阈值(rad), |误差|<此值才积分
+    float    pos_limit_i;           // 位置环积分输出限幅(rad/s)
+    float    pos_vel_limit;         // 位置环输出限幅(rad/s) = 速度目标上限, 默认 20
+
+    // === 速度环(内环) PID ===
+    //   输入: 误差(rad/s), 输出: LK raw 命令 (-2048~2048)
+    float    vel_kp;                // 速度环 P, 建议起点 50
+    float    vel_ki;                // 速度环 I, 建议保持 0
+    float    vel_kd;                // 速度环 D, 建议起点 1.0
+    float    vel_break_i;           // 速度环积分隔离阈值(rad/s)
+    float    vel_limit_i;           // 速度环积分输出限幅(raw)
+    float    raw_output_limit;      // 速度环总输出限幅(raw), 默认 500, 调好后可放宽到 1500
+
+    // === raw_override 模式(调试用) ===
+    //   绕过 PID 直接发送原始命令，用于验证 CAN 输出 / 电机方向
+    uint8_t  raw_override_enable;   // 1=使用 raw_override_cmd, 0=走正常双环流程
+    int16_t  raw_override_cmd;      // 原始命令值, 范围 [-2048, 2048]
+
+    // === 卡弹检测 ===
+    //   触发条件(同时满足且持续 jam_duration_ms):
+    //     ① |torque_cmd| > jam_torque_threshold × raw_output_limit (力矩饱和)
+    //     ② |pos_error| > jam_err_threshold (rad) (位置误差大)
+    //   解卡动作: 发送 jam_reverse_torque, 持续 jam_reverse_ms
+    uint8_t  jam_detect_enable;     // 卡弹检测开关, 默认 0 (调好速度环后再开)
+    float    jam_torque_threshold;  // 力矩饱和阈值(0~1), 默认 0.9 (90% 限幅)
+    float    jam_err_threshold;     // 位置误差阈值(rad), 默认 0.5
+    uint32_t jam_duration_ms;       // 持续触发时长(ms), 默认 300
+    uint32_t jam_reverse_ms;        // 反转解卡时长(ms), 默认 200
+    int16_t  jam_reverse_torque;    // 反转力矩(raw), 默认 +250 (正负由用户标定)
+} Dial_Config_t;
+
+/**
+ * @brief 拨盘双环控制运行状态（Watch 观察）
+ *
+ * 字段说明：
+ *   state            : 当前状态(0=DISABLE, 1=STOP, 2=SINGLE, 3=AUTO)
+ *   wheel_input      : 实际拨轮值(超过阈值时为原始值, 否则 0)
+ *   target_angle     : 目标累计角度(rad, 多圈)
+ *   feedback_angle   : 反馈累计角度(rad, 来自 LK4005.getAddAngleRad)
+ *   target_velocity  : 速度环目标(rad/s) = 位置环输出
+ *   feedback_velocity: 速度环反馈(rad/s) = LK4005 速度
+ *   error            : 位置环误差(rad)
+ *   vel_target       : 速度环目标(rad/s) (= target_velocity, 重复字段便于 Watch)
+ *   vel_error        : 速度环误差(rad/s)
+ *   pid_p/i/d        : 速度环 P/I/D 项(raw)
+ *   torque_cmd       : 最终发送的 LK raw 命令
+ *   control_source   : 0=零力矩, 1=双环PID, 2=raw_override
+ *   jam_detected     : 卡弹检测触发标志(1=正在解卡)
+ *   shot_count       : 单发累计计数(Watch 观察发弹数)
+ *   online           : LK4005 在线状态
+ */
+typedef struct
+{
+    uint8_t  state;                 // 当前状态: 0=DISABLE, 1=STOP, 2=SINGLE, 3=AUTO
+    float    wheel_input;           // 实际拨轮值, 未超阈值时为 0
+    float    target_angle;          // 目标累计角度(rad, 多圈)
+    float    feedback_angle;        // 反馈累计角度(rad, 来自 LK4005.getAddAngleRad)
+    float    target_velocity;       // 速度环目标(rad/s)
+    float    feedback_velocity;     // 速度环反馈(rad/s)
+    float    error;                 // 位置环误差(rad)
+    float    vel_target;            // 速度环目标(rad/s) (= target_velocity)
+    float    vel_error;             // 速度环误差(rad/s)
+    float    pid_p;                 // 速度环 P 项(raw)
+    float    pid_i;                 // 速度环 I 项(raw)
+    float    pid_d;                 // 速度环 D 项(raw)
+    int16_t  torque_cmd;            // 最终发送的 LK raw 命令
+    uint8_t  control_source;        // 0=零力矩, 1=双环PID, 2=raw_override
+    uint8_t  jam_detected;          // 卡弹检测触发标志
+    uint32_t shot_count;            // 单发累计计数
+    uint8_t  online;                // LK4005 在线状态
+} Dial_Status_t;
+
+// ========================================================================
+// 发射机构整体配置（ShootFSM 用，封装 Dial + 摩擦轮预留）
+// ========================================================================
+/**
+ * @brief 发射机构整体配置（Class_ShootFSM 使用，Watch 可调）
+ *
+ * 设计说明：
+ *   - 本结构是 ShootFSM 顶层状态机的配置
+ *   - 拨盘详细配置仍用 Dial_Config（保持向下兼容，Watch 配置不丢失）
+ *   - 摩擦轮配置预留，加 DJI 3508 后扩展
+ *
+ * 字段说明：
+ *   feature_enable    : 总开关，0=完全旁路发射机构（拨盘+摩擦轮全停）
+ *   shoot_enabled     : 发射使能，0=强制 DISABLE，1=允许状态机运行
+ *   target_state      : 目标状态（Watch 可写，预留：未来用开关切换 STOP/AUTO）
+ *                       当前简化策略：safety_ok 即进 AUTO，此字段暂未生效
+ *   friction_target_rpm: 摩擦轮目标转速（RPM，Watch 可调，默认 0）
+ *   friction_kp/ki/kd : 摩擦轮速度环 PID 参数（Watch 可调）
+ *   friction_break_i  : 摩擦轮速度环积分隔离阈值（RPM，Watch 可调）
+ *   friction_limit_i  : 摩擦轮速度环积分输出限幅（Watch 可调）
+ *
+ * @note Dial_Config 仍作为独立全局变量，ShootFSM 通过 enabled 字段联动
+ */
+typedef struct
+{
+    // === 整体功能开关 ===
+    uint8_t  feature_enable;         // 总开关: 0=完全旁路, 1=允许发射机构控制
+    uint8_t  shoot_enabled;          // 发射使能: 0=强制DISABLE, 1=允许状态机运行
+    uint8_t  target_state;           // 目标状态(预留, 当前未生效): 0=DISABLE,1=STOP,2=STANDBY,3=AUTO
+
+    // === 摩擦轮配置（Watch 可调）===
+    float    friction_target_rpm;    // 摩擦轮目标转速(RPM), 默认 0, Watch 在线调
+    float    friction_kp;            // 摩擦轮速度环 P, Watch 可调
+    float    friction_ki;            // 摩擦轮速度环 I, Watch 可调
+    float    friction_kd;            // 摩擦轮速度环 D, Watch 可调
+    float    friction_break_i;       // 积分隔离阈值(RPM): 误差小于此值才积分, 默认 500
+    float    friction_limit_i;       // 积分输出限幅: 限制 i_accum*ki 范围, 默认 3000
+} Shoot_Config_t;
+
+/**
+ * @brief 发射机构整体状态（Class_ShootFSM 回写，Watch 观察）
+ *
+ * 字段说明：
+ *   state              : 当前发射机构状态(0=DISABLE,1=STOP,3=AUTO)
+ *   safety_ok          : 安全条件是否满足(1=可控制, 0=需失能)
+ *   friction_enable    : 摩擦轮使能(0=停, 1=转)，由右拨杆 UP 控制
+ *   friction_online_l/r: 摩擦轮在线状态(预留)
+ *   friction_vel_l/r   : 摩擦轮实际转速(预留)
+ *
+ * @note Dial_Status 仍作为独立全局变量，由 DialController 直接回写
+ */
+typedef struct
+{
+    uint8_t  state;                  // 当前状态: 0=DISABLE,1=STOP,3=AUTO
+    uint8_t  safety_ok;              // 安全条件: 1=可控制, 0=需失能
+    uint8_t  friction_enable;        // 摩擦轮使能(0=停, 1=转)
+    uint8_t  friction_online_l;      // 左摩擦轮在线(预留)
+    uint8_t  friction_online_r;      // 右摩擦轮在线(预留)
+    float    friction_vel_l;         // 左摩擦轮实际转速(RPM, 预留)
+    float    friction_vel_r;         // 右摩擦轮实际转速(RPM, 预留)
+} Shoot_Status_t;
+
+// ========================================================================
+// 摩擦轮数据（GM3508 × 2，Watch 观察电机原始反馈）
+// ========================================================================
+/**
+ * @brief 单台 GM3508 摩擦轮电机反馈数据（Watch 观察）
+ *
+ * 数据来源：BSP::MOTOR::DJI::motor_3508 全局指针，
+ *          每周期从 MotorBase 公开接口读取并填入。
+ *
+ * 字段说明：
+ *   angle_rad      : 输出端累计角度（rad, 多圈连续）— Watch 建议
+ *   velocity_rpm   : 电机端转速（RPM）— 速度环反馈，Watch 建议
+ *   velocity_radps : 输出端角速度（rad/s）— 仅供参考
+ *   torque_nm      : 输出端力矩（N·m）— 反馈电流换算，Watch 建议
+ *   temperature    : 温度（℃）
+ *   online         : 在线状态（1=在线, 0=离线）— Watch 建议
+ */
+typedef struct
+{
+    float    angle_rad;       // 输出端累计角度（rad, 多圈连续, 摩擦轮一般只看 RPM）
+    float    velocity_rpm;    // 电机端转速（RPM, 速度环反馈核心字段）
+    float    velocity_radps;  // 输出端角速度（rad/s, = RPM / 减速比 × 2π/60）
+    float    torque_nm;       // 输出端力矩（N·m, 反馈电流换算）
+    float    temperature;     // 温度（℃, 持续观察防止过热）
+    uint8_t  online;          // 在线状态（1=在线, 0=离线, 超时 100ms 判离线）
+} FrictionMotor_Data_t;
+
+/**
+ * @brief 两台 GM3508 摩擦轮电机数据聚合（Watch 观察）
+ *
+ * Watch 中添加 Friction_Data 即可展开两台电机全部反馈：
+ *   Friction_Data.left.velocity_rpm   ← motor_id=1 当前 RPM
+ *   Friction_Data.right.velocity_rpm  ← motor_id=2 当前 RPM
+ *   Friction_Data.left.online         ← motor_id=1 在线状态
+ *
+ * 电机 ID 分配：
+ *   left  : motor_id = 1（左摩擦轮）
+ *   right : motor_id = 2（右摩擦轮，与左摩擦轮反向旋转）
+ *
+ * 调试场景：
+ *   1. 上电后观察 left.online / right.online 是否都 = 1（确认 CAN2 通信正常）
+ *   2. 设置摩擦轮目标 RPM 后观察 velocity_rpm 是否跟随
+ *   3. 异常时对比 torque_nm 判断是否堵转，对比 temperature 判断是否过热
+ */
+typedef struct
+{
+    FrictionMotor_Data_t left;   // motor_id=1（左摩擦轮）
+    FrictionMotor_Data_t right;  // motor_id=2（右摩擦轮）
+} Friction_Data_t;
+
+// ========================================================================
+// 板间通信数据结构（Stage03：云台-底盘通信）
+// ========================================================================
+/**
+ * @brief 板间通信状态（Watch 可观察）
+ *
+ * 数据来源：
+ *   - tx_direction / tx_chassis_mode：发送数据（Update 填充）
+ *   - rx_refree：接收数据（底盘返回的裁判系统数据）
+ *
+ * Watch 观察项：
+ *   - tx_direction.LX/LY：遥控器右摇杆映射值（0-220）
+ *   - tx_direction.Yaw_encoder_angle_err：云台-底盘角度误差
+ *   - rx_refree.launch_speed：发射速度
+ *   - rx_refree.booster_now_heat：当前热量
+ */
+typedef struct
+{
+    // --- 发送数据（云台→底盘） ---
+    uint8_t LX;                     // 右摇杆X通道（0-220）
+    uint8_t LY;                     // 右摇杆Y通道（0-220）
+    uint8_t Rotating_vel;           // 小陀螺速度（0-220，中值110）
+    int8_t wheel;                   // 拨轮值（-127~127，中值0）
+    float Yaw_encoder_angle_err;    // 云台-底盘角度误差(rad)
+    uint8_t chassis_mode;           // 底盘模式（位域打包后）
+
+    // --- 接收数据（底盘→云台） ---
+    uint16_t booster_heat_cd;       // 电容冷却时间
+    uint16_t booster_heat_max;      // 热量上限
+    uint16_t booster_now_heat;      // 当前热量
+    float launch_speed;             // 发射速度(m/s)
+
+    // --- 通信状态 ---
+    uint8_t rx_frame1_ready;        // 帧1 接收就绪标志
+    uint32_t last_rx_time;          // 最后接收时间戳(ms)
+} BoardComm_Data_t;
+
+// ========================================================================
+// 底盘模式状态机调试数据（Stage06: 板间通信 - 模式状态机）
+// ========================================================================
+/**
+ * @brief 底盘模式状态机调试数据（Watch 观察）
+ *
+ * 职责：
+ *   观察底盘模式状态机的运行状态，帮助调试模式切换逻辑。
+ *
+ * Watch 观察点：
+ *   current_state       : 当前模式(0=MANUAL, 1=CHASSIS_FOLLOW, 2=GYROSCOPE, 3=EMERGENCY_STOP)
+ *   stable_state        : 稳定状态（滤波后）
+ *   pending_state       : 待确认状态（候选）
+ *   stable_count        : 稳定计数（连续相同次数，0-10）
+ *   state_change_count  : 状态切换次数（累计）
+ *   filter_reject_count : 滤波拒绝次数（累计）
+ *   emergency_stop_trigger : 急停触发源（0=NONE, 1=REMOTE_SWITCH, 2=REMOTE_OFFLINE, ...）
+ *   remote_online       : 遥控器在线状态（0=离线, 1=在线）
+ *   last_update_time    : 最后更新时间戳（ms）
+ *
+ * 使用方式：
+ *   在 Keil Watch 中添加 ChassisModeDebug 即可展开全部字段。
+ *
+ * 数据流：
+ *   DR16.S1/S2 → ChassisModeManager::Update()
+ *                → 模式判断 + 状态滤波
+ *                → 同步到 ChassisModeDebug（Watch 观察）
+ *
+ * @note 由 ChassisModeManager.cpp 周期更新（1kHz）
+ */
+typedef struct
+{
+    // ===== 核心状态 =====
+    uint8_t current_state;          // 当前模式（枚举值 0-3）
+    uint8_t stable_state;           // 稳定状态（滤波后）
+
+    // ===== 滤波过程 =====
+    uint8_t pending_state;          // 待确认状态（候选）
+    uint32_t stable_count;          // 稳定计数（连续相同次数，0-10）
+
+    // ===== 统计信息 =====
+    uint32_t state_change_count;    // 状态切换次数（累计）
+    uint32_t filter_reject_count;   // 滤波拒绝次数（累计）
+
+    // ===== 错误状态 =====
+    uint8_t emergency_stop_trigger; // 急停触发源（枚举值 0-4）
+    uint8_t remote_online;          // 遥控器在线状态（0/1）
+
+    // ===== 时间戳 =====
+    uint32_t last_update_time;      // 最后更新时间戳（ms）
+} ChassisModeDebug_t;
+
+// ========================================================================
 // 全局变量 extern 声明(定义在 Variable.cpp)
 // ========================================================================
 extern Joint_Data_t       Joint_Data;        // 关节状态(Stage01-02)
 extern Controller_Data_t  Controller_Data;   // 控制器状态(Stage03)
+extern FollowMode_Data_t  FollowMode_Data;   // 底盘跟随模式专用数据(速度环单环)
 extern Transform_Config_t  Transform_Config;  // 变形规划器配置(Stage05)
 extern Transform_Status_t  Transform_Status;  // 变形规划器状态(Stage05)
 extern DR16_Data_t        DR16_Data;         // 遥控器状态(Stage04)
 extern IMU_Data_t         IMU_Data;          // IMU 姿态状态(Stage03 接入传感器)
 extern Remote_State_t     Remote_State;      // 遥控器状态机(急停+展开/收起)
 extern LK4005_Data_t      LK4005_Data;       // LK4005 电机反馈状态
+extern Dial_Config_t      Dial_Config;       // 拨盘双环控制配置(Watch可调)
+extern Dial_Status_t      Dial_Status;       // 拨盘双环控制状态(Watch观察)
+extern Shoot_Config_t     Shoot_Config;      // 发射机构整体配置(Watch可调)
+extern Shoot_Status_t     Shoot_Status;      // 发射机构整体状态(Watch观察)
+extern Friction_Data_t    Friction_Data;     // 摩擦轮电机反馈(Watch观察)
+extern BoardComm_Data_t   BoardComm_Data;    // 板间通信状态(Stage03)
+extern ChassisModeDebug_t ChassisModeDebug;  // 底盘模式状态机调试数据(Stage06)
 
 // ========================================================================
 // VOFA+ 调试通道发送函数(定义在 Variable.cpp)
