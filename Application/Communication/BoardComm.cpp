@@ -29,7 +29,6 @@
 #include "../Application/Variable.hpp"
 #include "can_hal.hpp"
 #include "cmsis_os.h"
-#include <cmath>
 
 namespace BoardComm
 {
@@ -324,32 +323,26 @@ void Gimbal_to_Chassis::HandleCANMessage(uint32_t std_id, const uint8_t *data, u
 }
 
 /**
- * @brief 计算云台相对底盘角度误差
+ * @brief 计算云台相对底盘角度误差（最短路径归一化）
  *
- * @return 角度误差(rad)
+ * @return 角度误差(rad)，范围 [-π, π]
  *
  * 实现方式：
- *   当前使用 Yaw 编码器角度计算误差
- *   公式：Error = yaw_angle（直接使用 real_angle）
+ *   使用 BSP::JOINT::wrapToPi() 将编码器累积角度归一化到 [-π, π]，
+ *   确保底盘跟随时走最短路径。
+ *   修复前：编码器累积角度可能超过 ±π（如小陀螺360° → 误差360° → 底盘转360°）
+ *   修复后：归一化到 [-π, π]（如360° → 0° → 底盘不转，就近归位）
  *
- * 参考工程：
- *   使用 Tools.Zero_crossing_processing 处理角度跨越
- *   当前工程暂时使用简化版本
- *
- * 后续优化：
- *   可替换为 IMU 姿态计算（更准确）
- *   可接入底盘校准流程（自动获取 Init_Angle）
- *
- * @note offset 的调整应该在 Variable.cpp 中的 Joint_Data.yaw.config.offset 进行
+ * @note Yaw 是连续旋转关节(continuous=1)，normalized_angle 已由 Joint::Update
+ *       通过 wrapToPi(real_angle) 维护在 [-π, π]，直接使用即可。
  */
 float Gimbal_to_Chassis::CalcuGimbalToChassisAngle()
 {
-    // 读取 Yaw 关节真实角度（Joint_Data.yaw.real_angle 已减去 offset）
+    // Yaw 关节的 normalized_angle = wrapToPi(real_angle)
     // real_angle = (encoder - offset) * direction
-    // 若需调整，请修改 Variable.cpp 中的 Joint_Data.yaw.config.offset
-    float yaw_angle = Joint_Data.yaw.real_angle;
+    // 连续旋转关节(continuous=1)，normalized_angle 已被 wrap 到 [-π, π]
+    float yaw_angle = Joint_Data.yaw.normalized_angle;
 
-    // 直接返回 yaw_angle
     return yaw_angle;
 }
 
