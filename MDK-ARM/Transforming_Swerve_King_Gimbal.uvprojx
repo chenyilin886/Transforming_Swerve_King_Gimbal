@@ -743,6 +743,11 @@
               <FilePath>../Application/Communication/ChassisModeManager.cpp</FilePath>
             </File>
             <File>
+              <FileName>VisionComm.cpp</FileName>
+              <FileType>8</FileType>
+              <FilePath>../Application/Communication/VisionComm.cpp</FilePath>
+            </File>
+            <File>
               <FileName>GimbalInit.hpp</FileName>
               <FileType>5</FileType>
               <FilePath>..\Application\GimbalInit.hpp</FilePath>

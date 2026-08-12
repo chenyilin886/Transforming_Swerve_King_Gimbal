@@ -41,6 +41,24 @@
 namespace BSP::MOTOR::DM
 {
 
+extern volatile uint32_t dm_fold_feedback_parse_count;
+extern volatile uint32_t dm_fold_feedback_header_fallback_count;
+extern volatile uint32_t dm_fold_feedback_last_tick;
+extern volatile uint32_t dm_fold_feedback_max_gap_ms;
+extern volatile uint32_t dm_fold_control_tx_attempt_count;
+extern volatile uint32_t dm_fold_control_tx_success_count;
+extern volatile uint32_t dm_fold_control_tx_fail_count;
+
+// 调试计数器：用于诊断"使能时收不到数据"问题
+extern volatile uint32_t dm_parse_total_count;          // Parse函数调用总次数
+extern volatile uint32_t dm_parse_frame_id_0x00;        // 收到CAN ID=0x00的帧数
+extern volatile uint32_t dm_parse_frame_id_0x01;        // 收到CAN ID=0x01的帧数
+extern volatile uint32_t dm_parse_frame_id_0x02;        // 收到CAN ID=0x02的帧数
+extern volatile uint32_t dm_parse_frame_id_0x03;        // 收到CAN ID=0x03的帧数
+extern volatile uint32_t dm_parse_normal_match_count;   // normal_feedback_matches匹配次数
+extern volatile uint32_t dm_parse_legacy_match_count;   // legacy_feedback_matches匹配次数
+extern volatile uint32_t dm_parse_no_match_count;       // 未匹配次数
+
 /**
  * @brief 将浮点数线性映射为无符号整数
  * @param x     输入物理量
@@ -158,51 +176,31 @@ public:
     {
         for (uint8_t i = 0; i < N; ++i)
         {
-            // 匹配反馈帧 ID(电机 CAN ID = init_address + recv_idxs_[i])
             if (frame.id == init_address + recv_idxs_[i])
             {
                 const uint8_t *pData = frame.data;
-
-                // --- 手动提取各字段(不依赖位域内存布局) ---
                 feedback_[i].id  = (pData[0] >> 4) & 0x0F;
                 feedback_[i].err = pData[0] & 0x0F;
-
-                // 角度: 16bit 无符号 → rad
                 feedback_[i].angle = (pData[1] << 8) | pData[2];
-
-                // 速度: 12bit 无符号 → rad/s
                 feedback_[i].velocity = (pData[3] << 4) | (pData[4] >> 4);
-
-                // 力矩: 12bit 无符号 → N·m
                 feedback_[i].torque = ((pData[4] & 0x0F) << 8) | pData[5];
-
-                // 温度: 8bit 直接值
                 feedback_[i].T_Mos   = pData[6];
                 feedback_[i].T_Rotor = pData[7];
-
-                // --- 无符号数 → 物理量(国际单位) ---
                 this->unit_data_[i].angle       = uint_to_float(feedback_[i].angle,    params_.P_MIN,  params_.P_MAX,  16);
                 this->unit_data_[i].velocity    = uint_to_float(feedback_[i].velocity, params_.V_MIN,  params_.V_MAX,  12);
-                // 力矩反馈：根据 torque_is_output_side_ 决定是否换算
-                //   false(DM4310): 电机端力矩 → 输出端力矩（× GR）
-                //   true (DM4340): 固件 GR=40 已换算为输出端，直接使用
                 {
                     float torque_raw = uint_to_float(feedback_[i].torque, params_.T_MIN, params_.T_MAX, 12);
                     this->unit_data_[i].current = torque_is_output_side_ ? torque_raw : torque_raw * gear_ratio_;
                 }
-                this->unit_data_[i].temperature = (float)feedback_[i].T_Mos;  // MOS 管温度
-                this->unit_data_[i].accel        = 0.0f;  // DM 协议无加速度字段
-
-                // 刷新在线时间戳
+                this->unit_data_[i].temperature = (float)feedback_[i].T_Mos;
+                this->unit_data_[i].accel        = 0.0f;
                 this->updateTimestamp(i + 1);
-
-                break;  // 一帧只匹配一台电机
+                break;
             }
         }
     }
-
     // ====================================================================
-    // 电机控制命令
+    // Motor control commands
     // ====================================================================
 
     /**
@@ -254,7 +252,26 @@ public:
         frame.data[6] = ((kd_raw & 0xF) << 4) | ((tq_raw >> 8) & 0xF);
         frame.data[7] = tq_raw & 0xFF;
 
-        return can_device_->send(frame);
+        const bool is_fold =
+            N == 1U && (send_idxs_[id - 1] & 0x0FU) == 0x03U;
+        if (is_fold)
+        {
+            ++dm_fold_control_tx_attempt_count;
+        }
+
+        const bool sent = can_device_->send(frame);
+        if (is_fold)
+        {
+            if (sent)
+            {
+                ++dm_fold_control_tx_success_count;
+            }
+            else
+            {
+                ++dm_fold_control_tx_fail_count;
+            }
+        }
+        return sent;
     }
 
     /**
@@ -505,7 +522,7 @@ public:
         // 不设置此项会导致发送力矩被缩 40 倍（28 N·m → 0.7 N·m）
         torque_is_output_side_ = true;
 
-        // 反馈帧 ID: Fold=0x03
+        // 反馈载荷中的电机 ID: Fold=0x03；外层帧 ID 由 Master ID 决定
         recv_idxs_[0] = 0x03;
 
         // 命令帧 ID: Fold=0x03

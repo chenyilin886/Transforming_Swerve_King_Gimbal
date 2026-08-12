@@ -36,6 +36,7 @@
 "transforming_swerve_king_gimbal\vofa.o"
 "transforming_swerve_king_gimbal\boardcomm.o"
 "transforming_swerve_king_gimbal\chassismodemanager.o"
+"transforming_swerve_king_gimbal\visioncomm.o"
 "transforming_swerve_king_gimbal\state_watch.o"
 "transforming_swerve_king_gimbal\dr16.o"
 "transforming_swerve_king_gimbal\hi12h3_imu.o"

@@ -2,10 +2,9 @@
  * @file can_device_impl.cpp
  * @brief CAN 设备实现
  *
- * 继承说明(裸机适配)：
- *   移植自参考工程。移除了 osMutex 相关代码(ensure_tx_mutex / osMutexAcquire /
- *   osMutexRelease)。裸机环境下 CAN 发送仅从主循环调用，接收在中断中完成，
- *   不存在 TX 并发竞争，无需互斥保护。
+ * 并发说明：
+ *   GimbalTask 与 ShootTask 会并发发送 CAN1。send() 用极短临界区保护
+ *   软件队列；邮箱完成中断负责继续装填，不在任务中忙等。
  *
  * 数据流：
  *   发送：上层组装 Frame → send() → HAL_CAN_AddTxMessage → CAN 总线
@@ -17,6 +16,7 @@
 
 namespace HAL::CAN
 {
+
 
 /**
  * @brief 构造函数
@@ -37,14 +37,11 @@ void CanDevice::init()
 /**
  * @brief 启动 CAN 设备
  *
- * 先确保互斥量(裸机已移除)，然后 HAL_CAN_Start 开启外设，
- * 再根据 FIFO 编号使能对应的接收中断。
+ * HAL_CAN_Start 后补齐 TX NVIC，再根据 FIFO 编号使能收发通知。
  */
 void CanDevice::start()
 {
     HAL_CAN_Start(handle_);
-
-    // 根据_fifo_选择使能对应 FIFO 的接收中断
     if (fifo_ == CAN_FILTER_FIFO0)
     {
         HAL_CAN_ActivateNotification(handle_, CAN_IT_RX_FIFO0_MSG_PENDING);
@@ -58,19 +55,15 @@ void CanDevice::start()
 /**
  * @brief 发送一帧 CAN 数据
  * @param frame 待发送帧
- * @return true=成功加入发送邮箱, false=邮箱满或失败
+ * @return true=成功加入硬件邮箱或软件队列, false=软件队列满或 HAL 失败
  *
- * @note 裸机适配：移除了 osMutex 保护。裸机下 send() 仅从主循环调用，
- *       接收中断不会调用 send()，无并发竞争。
+ * @note STM32F407 只有 3 个 TX 邮箱。邮箱满时帧进入静态软件队列，
+ *       后续由 TX mailbox complete 中断自动续发，不在控制任务中忙等。
  */
 bool CanDevice::send(const Frame &frame)
 {
-    // 等待空闲邮箱（轮询，最多等 ~100us）
-    //   STM32F407 CAN1 仅 3 个 TX 邮箱；4 帧/周期必然有 1 帧需等待前序帧发送完成。
-    //   CAN 1Mbps 发送一帧 ≈ 100us，3 邮箱全部排空 ≈ 300us，远小于 1kHz 周期。
-    //   不 AbortTxRequest：强行中止会取消其他挂起帧，导致对应电机丢命令。
     {
-        uint32_t wait_cycles = 10000;  // ~100us @ 168MHz
+        uint32_t wait_cycles = 10000;
         while (HAL_CAN_GetTxMailboxesFreeLevel(handle_) == 0 && wait_cycles > 0)
         {
             wait_cycles--;
@@ -80,15 +73,12 @@ bool CanDevice::send(const Frame &frame)
             return false;
         }
     }
-
     CAN_TxHeaderTypeDef tx_header{};
     tx_header.DLC = frame.dlc;
     tx_header.IDE = frame.is_extended_id ? CAN_ID_EXT : CAN_ID_STD;
     tx_header.RTR = frame.is_remote_frame ? CAN_RTR_REMOTE : CAN_RTR_DATA;
     tx_header.TransmitGlobalTime = DISABLE;
     uint32_t temp_mailbox = frame.mailbox;
-
-    // 根据帧类型填充对应 ID 字段
     if (frame.is_extended_id)
     {
         tx_header.ExtId = frame.id;
@@ -99,14 +89,11 @@ bool CanDevice::send(const Frame &frame)
         tx_header.StdId = frame.id;
         tx_header.ExtId = 0;
     }
-
-    // 加入发送邮箱(非阻塞)
     if (HAL_CAN_AddTxMessage(handle_, &tx_header,
                              const_cast<uint8_t *>(frame.data), &temp_mailbox) != HAL_OK)
     {
         return false;
     }
-
     return true;
 }
 
@@ -171,7 +158,6 @@ void CanDevice::configure_filter()
     filter.FilterMode = CAN_FILTERMODE_IDMASK;
     filter.FilterScale = CAN_FILTERSCALE_32BIT;
     filter.SlaveStartFilterBank = 14;
-
     HAL_CAN_ConfigFilter(handle_, &filter);
 }
 

@@ -880,6 +880,55 @@ typedef struct
 } ChassisModeDebug_t;
 
 // ========================================================================
+// 视觉通信数据结构（Stage07: 视觉通信 — RCIA协议）
+// ========================================================================
+/**
+ * @brief 视觉通信数据（Watch 可观察）
+ *
+ * 数据来源：
+ *   - VisionComm::Manager::Parse() → 解析视觉上位机发来的 RCIA 帧（RX）
+ *   - VisionComm::Manager::Send()  → 打包 IMU 四元数等发送给视觉（TX, 不在 Watch 中）
+ *
+ * Watch 观察项：
+ *   - pitch_angle/yaw_angle：视觉发来的目标角度(deg)
+ *   - vision_ready：视觉就绪标志(0=未就绪, 1=已就绪)
+ *   - fire：开火信号(0/1)
+ *   - online：视觉在线状态(0=离线, 1=在线)
+ *   - timestamp：视觉时间戳(ms)
+ *
+ * 协议说明（RCIA, 全大端序）：
+ *   - 视觉发来的角度 = int32 / 100.0 得到度数
+ *   - angle_scale = 100.0（与 gimbal(1).cpp 一致）
+ *
+ * 使用方式：
+ *   在 Keil Watch 中添加 VisionComm_Data 即可展开全部字段。
+ *
+ * 数据流：
+ *   USART6 DMA 空闲中断 → HAL_UARTEx_RxEventCallback
+ *     → VisionComm::Manager::Parse() → 大端解码
+ *       → 写入 VisionComm_Data → Watch 观察
+ *
+ * @note 视觉通信与 VOFA 共享 USART6，自动检测切换
+ */
+typedef struct
+{
+    float    pitch_angle;     ///< Pitch 目标角度(deg)，绝对角度（= pitch_raw / 100.0）
+    float    yaw_angle;       ///< Yaw 目标角度(deg)，绝对角度（= yaw_raw / 100.0）
+    int32_t  pitch_raw;       ///< [调试] 收到的原始 pitch_i（int32 BE，未除 scale）
+    int32_t  yaw_raw;         ///< [调试] 收到的原始 yaw_i（int32 BE，未除 scale）
+    uint8_t  vision_ready;    ///< 视觉就绪标志（0/1）
+    uint8_t  fire;            ///< 开火信号（0/1）
+    uint32_t timestamp;       ///< 视觉时间戳(ms)
+    uint8_t  aim_x;           ///< 瞄准点 X（预留）
+    uint8_t  aim_y;           ///< 瞄准点 Y（预留）
+    uint8_t  online;          ///< 视觉在线状态（0=离线, 1=在线）
+    uint8_t  rx_head0;        ///< [调试] 收到的帧头字节0（应为 0x39）
+    uint8_t  rx_head1;        ///< [调试] 收到的帧头字节1（应为 0x39）
+    uint8_t  rx_tail;         ///< [调试] 收到的帧尾字节（应为 0xFF）
+    float    yaw_offset_deg;  ///< [标定] Yaw 视觉零点偏移(deg)，Watch 可调。标定方法：云台对准视觉正前方 → 读取 IMU_Data.yaw → 填入此值
+} VisionComm_Data_t;
+
+// ========================================================================
 // 全局变量 extern 声明(定义在 Variable.cpp)
 // ========================================================================
 extern Joint_Data_t       Joint_Data;        // 关节状态(Stage01-02)
@@ -898,6 +947,9 @@ extern Shoot_Status_t     Shoot_Status;      // 发射机构整体状态(Watch�
 extern Friction_Data_t    Friction_Data;     // 摩擦轮电机反馈(Watch观察)
 extern BoardComm_Data_t   BoardComm_Data;    // 板间通信状态(Stage03)
 extern ChassisModeDebug_t ChassisModeDebug;  // 底盘模式状态机调试数据(Stage06)
+extern VisionComm_Data_t  VisionComm_Data;   // 视觉通信数据(Stage07)
+
+
 
 // ========================================================================
 // VOFA+ 调试通道发送函数(定义在 Variable.cpp)

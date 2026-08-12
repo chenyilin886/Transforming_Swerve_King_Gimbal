@@ -35,6 +35,7 @@
 #include "HI12H3_IMU.hpp"
 #include "Communication/BoardComm.hpp"
 #include "Communication/ChassisModeManager.hpp"  // 底盘模式状态机
+#include "Communication/VisionComm.hpp"         // Vision communication (RCIA)
 
 // ========================================================================
 // 全局电机指针
@@ -43,6 +44,21 @@ namespace BSP::MOTOR::DM
 {
 DM4310* dm4310_yaw_pitch = nullptr;
 DM4340* dm4340_fold       = nullptr;
+volatile uint32_t dm_fold_feedback_parse_count = 0;
+volatile uint32_t dm_fold_feedback_header_fallback_count = 0;
+volatile uint32_t dm_fold_feedback_last_tick = 0;
+volatile uint32_t dm_fold_feedback_max_gap_ms = 0;
+volatile uint32_t dm_fold_control_tx_attempt_count = 0;
+volatile uint32_t dm_fold_control_tx_success_count = 0;
+volatile uint32_t dm_fold_control_tx_fail_count = 0;
+volatile uint32_t dm_parse_total_count = 0;
+volatile uint32_t dm_parse_frame_id_0x00 = 0;
+volatile uint32_t dm_parse_frame_id_0x01 = 0;
+volatile uint32_t dm_parse_frame_id_0x02 = 0;
+volatile uint32_t dm_parse_frame_id_0x03 = 0;
+volatile uint32_t dm_parse_normal_match_count = 0;
+volatile uint32_t dm_parse_legacy_match_count = 0;
+volatile uint32_t dm_parse_no_match_count = 0;
 }
 
 namespace BSP::MOTOR::LK
@@ -358,6 +374,9 @@ void GimbalInit()
 
     // 8. 初始化 IMU(Stage03 接入传感器, USART1 DMA空闲中断接收)
     BSP::IMU::imu.Init();
+
+    // Stage07 vision communication init (USART6 DMA idle RX)
+    VisionComm::Manager::Instance().Init();
 
     // 9. 使能全部电机
     HAL_Delay(500);
@@ -702,6 +721,45 @@ void GimbalUpdate()
                              Transform_Status);
 
     // ---------------------------------------------------------------
+    // Step 2.58: Vision connection state and bumpless entry guard
+    // ---------------------------------------------------------------
+    VisionComm::Manager::Instance().IsConnected();
+
+    static uint8_t vision_active = 0;
+    uint8_t vision_just_entered = 0;
+
+    if (VisionComm_Data.online && VisionComm_Data.vision_ready && !vision_active)
+    {
+        vision_active = 1;
+        vision_just_entered = 1;
+
+        if (joint_manager.pitch.isOnline() && gimbal_controller.imu_online)
+        {
+            Controller_Data.pitch.target_angle = gimbal_controller.pitch_imu_angle;
+        }
+        else if (joint_manager.pitch.isOnline())
+        {
+            Controller_Data.pitch.target_angle = joint_manager.pitch.getRealAngle();
+        }
+
+        if (joint_manager.yaw.isOnline())
+        {
+            if (FollowMode_Data.control_mode == 1)
+            {
+                gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
+                Controller_Data.yaw.cascade_mode = 1;
+                FollowMode_Data.control_mode = 0;
+            }
+            Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
+        }
+    }
+    else if ((!VisionComm_Data.online || !VisionComm_Data.vision_ready) && vision_active)
+    {
+        vision_active = 0;
+        vision_just_entered = 0;
+    }
+
+    // ---------------------------------------------------------------
     // Step 2.6: 遥控器左摇杆Y轴 → Pitch 目标角度(速度积分模式)
     //
     // 【原理】
@@ -765,7 +823,31 @@ void GimbalUpdate()
             BSP::PLANNER::isTransitionState(
                 static_cast<BSP::PLANNER::TransformState>(Transform_Status.state)))
         {
-            // 跳过本周期摇杆积分
+            // Skip this cycle.
+        }
+        else if (vision_active)
+        {
+            if (!vision_just_entered && joint_manager.pitch.isOnline())
+            {
+                float vision_pitch_rad = VisionComm_Data.pitch_angle * (3.14159265358979f / 180.0f);
+                if (gimbal_controller.imu_online)
+                {
+                    const float pitch_imu_limit_max = 33.0f  * (3.14159265358979f / 180.0f);
+                    const float pitch_imu_limit_min = -25.0f * (3.14159265358979f / 180.0f);
+                    if (vision_pitch_rad > pitch_imu_limit_max) vision_pitch_rad = pitch_imu_limit_max;
+                    if (vision_pitch_rad < pitch_imu_limit_min) vision_pitch_rad = pitch_imu_limit_min;
+                }
+                else
+                {
+                    const auto &cfg = joint_manager.pitch.getConfig();
+                    if (!cfg.continuous)
+                    {
+                        if (vision_pitch_rad > cfg.limit_max) vision_pitch_rad = cfg.limit_max;
+                        if (vision_pitch_rad < cfg.limit_min) vision_pitch_rad = cfg.limit_min;
+                    }
+                }
+                Controller_Data.pitch.target_angle = vision_pitch_rad;
+            }
         }
         else
         {
@@ -871,7 +953,16 @@ void GimbalUpdate()
             BSP::PLANNER::isTransitionState(
                 static_cast<BSP::PLANNER::TransformState>(Transform_Status.state)))
         {
-            // 跳过本周期
+            // Skip this cycle.
+        }
+        else if (vision_active)
+        {
+            if (!vision_just_entered && joint_manager.yaw.isOnline())
+            {
+                float vision_yaw_rad = -(VisionComm_Data.yaw_angle - VisionComm_Data.yaw_offset_deg)
+                                     * (3.14159265358979f / 180.0f);
+                Controller_Data.yaw.target_angle = vision_yaw_rad;
+            }
         }
         else
         {
@@ -1285,12 +1376,25 @@ void GimbalUpdate()
     //   调用 Variable.cpp 中的 VofaSendDebugChannels()
     //   修改通道配置：只需改 Variable.cpp，无需改此文件
     // ---------------------------------------------------------------
-    static uint8_t vofa_counter = 0;
-    vofa_counter++;
-    if (vofa_counter >= 2)
+    if (true)  // Temporary: always send RCIA vision frame.
     {
-        vofa_counter = 0;
-        VofaSendDebugChannels();  // ← 在 Variable.cpp 中实现，方便修改通道
+        static uint8_t vision_counter = 0;
+        vision_counter++;
+        if (vision_counter >= 5)  // 1000Hz / 5 = 200Hz
+        {
+            vision_counter = 0;
+            VisionComm::Manager::Instance().Send();
+        }
+    }
+    else
+    {
+        static uint8_t vofa_counter = 0;
+        vofa_counter++;
+        if (vofa_counter >= 2)  // 1000Hz / 2 = 500Hz
+        {
+            vofa_counter = 0;
+            VofaSendDebugChannels();
+        }
     }
 
     // ---------------------------------------------------------------

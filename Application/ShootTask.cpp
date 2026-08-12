@@ -38,6 +38,7 @@
  */
 #include "ShootTask.hpp"
 #include "ShootFSM.hpp"
+#include "FoldIsolationConfig.hpp"
 #include "cmsis_os.h"  // osDelay
 
 #ifdef __cplusplus
@@ -74,6 +75,14 @@ void shootTask(void *argument)
     //   - 不需要 1ms 高频，减轻 CPU 负载
     for (;;)
     {
+        if (AppConfig::FOLD_CAN_ISOLATION_MODE)
+        {
+            // GimbalInit sends one final zero/off command. Do not run either
+            // LK4005 or GM3508 periodic control while Fold is isolated.
+            osDelay(20);
+            continue;
+        }
+
         // ----------------------------------------------------------
         // 发射机构周期控制
         // ----------------------------------------------------------

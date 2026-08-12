@@ -198,4 +198,5 @@ transforming_swerve_king_gimbal/uartcallback.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__math\traits.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__math\trigonometric_functions.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\stdlib.h \
-  C:\Keil_v5\ARM\ARMCLANG\include\stdlib.h
+  C:\Keil_v5\ARM\ARMCLANG\include\stdlib.h \
+  ..\Application\Communication\VisionComm.hpp

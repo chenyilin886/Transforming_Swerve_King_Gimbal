@@ -24,6 +24,7 @@
 namespace HAL::CAN
 {
 
+
 /**
  * @brief CAN 硬件设备实现类
  *
@@ -61,7 +62,6 @@ private:
     uint32_t filter_bank_;             // 过滤器组号
     uint32_t fifo_;                    // 接收 FIFO 编号
     uint32_t mailbox_;                 // 发送邮箱(暂存)
-
     std::vector<RxCallback> rx_callbacks_;  // 已注册的接收回调列表
 
     /// 配置 CAN 过滤器(当前设为全通，接收所有 ID)

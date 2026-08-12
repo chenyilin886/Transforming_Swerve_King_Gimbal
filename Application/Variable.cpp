@@ -127,14 +127,14 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .yaw = {
         .target_angle    = 0.0f,
-        .kp              = 15.0f,    // 角度环 P, 建议起点 5.0
+        .kp              = 20.0f,    // 角度环 P, 15
         .ki              = 0.0f,    // 角度环 I
         .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
-        .torque_limit    = 20.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
+        .torque_limit    = 30.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
         .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
-        .vel_kp          = 13.0f,    // 速度环 P, 建议起点 0.05
+        .vel_kp          = 13.0f,    // 速度环 P, 13
         .vel_ki          = 0.0f,    // 速度环 I
         .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.001
         .vel_limit       = 10.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
@@ -164,14 +164,14 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .pitch = {
         .target_angle    = 0.0f,
-        .kp              = 20.0f,    // 角度环 P, 建议起点 5.0
+        .kp              = 12.0f,    // 角度环 P, 15
         .ki              = 0.0f,    // 角度环 I
         .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 22.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
         .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
-        .vel_kp          = 15.0f,    // 速度环 P, 建议起点 0.05
+        .vel_kp          = 10.0f,    // 速度环 P, 12
         .vel_ki          = 0.0f,    // 速度环 I
         .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.001
         .vel_limit       = 10.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
@@ -190,7 +190,7 @@ Controller_Data_t Controller_Data = {
         //   注意: gravity_enable=1 且 cascade_mode=1 时生效
         //         IMU 离线切编码器时, 若编码器零位≠枪口水平, 补偿会不准
         //         (当前编码器零位已标定为枪口水平, 可放心使用)
-        .gravity_k       = 3.5f,    // 重力补偿系数(N·m), 保守初值, Watch 在线标定
+        .gravity_k       = 6.0f,    // 重力补偿系数(N·m), 保守初值, Watch 在线标定
         .gravity_enable  = 1,        // ← 启用 Pitch 重力补偿(加摩擦轮后必需)
         .feedback_angle  = 0.0f,
         .error           = 0.0f,
@@ -523,24 +523,24 @@ Dial_Config_t Dial_Config = {
     // === 拨轮触发 ===
     .wheel_start_threshold = 0.5f,    // wheel > 0.5 触发(比旧版0.8更柔和)
     .long_press_ms         = 800,     // 持续 800ms 切换为连发
-    .auto_fire_hz          = 8.0f,    // 连发基础频率 8 Hz (仅 wheel_to_hz<=0 时使用)
+    .auto_fire_hz          = 20.0f,    // 连发基础频率 8 Hz (仅 wheel_to_hz<=0 时使用)
     .wheel_to_hz           = 0.0f,   // wheel 满幅映射到 0 Hz
 
     // === 位置环(外环) PID ===
-    .pos_kp                = 50.0f,    // P, 调好速度环后改 8.0
+    .pos_kp                = 40.0f,    // P, 调好速度环后改 8.0
     .pos_ki                = 0.0f,    // I, 保持 0
     .pos_kd                = 0.0f,    // D, 调好速度环后改 0.3
     .pos_break_i           = 0.1f,    // 位置误差<0.1rad 才积分
     .pos_limit_i           = 5.0f,    // 位置环 I 项限幅 5 rad/s
-    .pos_vel_limit         = 20.0f,   // 速度目标上限 20 rad/s
+    .pos_vel_limit         = 50.0f,   // 速度目标上限 20 rad/s
 
     // === 速度环(内环) PID ===
-    .vel_kp                = 15.0f,    // P, 起步 50
+    .vel_kp                = 13.0f,    // P, 起步 50
     .vel_ki                = 0.0f,    // I, 保持 0
     .vel_kd                = 0.0f,    // D, 起步 1.0
     .vel_break_i           = 5.0f,    // 速度误差<5rad/s 才积分
     .vel_limit_i           = 80.0f,   // 速度环 I 项限幅 80 raw
-    .raw_output_limit      = 500.0f,  // 最终 raw 命令限幅 500, 调好后可放宽到 1500
+    .raw_output_limit      = 2048.0f,  // 最终 raw 命令限幅 500, 调好后可放宽到 1500
 
     // === raw_override 模式(调试用) ===
     .raw_override_enable   = 0,       // 默认关闭, 调试时置 1 + 设置 raw_override_cmd
@@ -648,6 +648,34 @@ BoardComm_Data_t BoardComm_Data = {
     .launch_speed        = 0.0f,
     .rx_frame1_ready     = 0,
     .last_rx_time        = 0,
+};
+
+// ========================================================================
+// 视觉通信数据全局实例（Stage07: 视觉通信 — RCIA协议）
+// ========================================================================
+// 数据来源：
+//   - VisionComm::Manager::Parse() → 解析视觉上位机发来的 RCIA 帧（RX, 19字节）
+//   - 视觉发来的角度：int32 / 100.0 → 度数（angle_scale = 100.0）
+// Watch 添加 VisionComm_Data → 观察：
+//   - pitch_angle/yaw_angle：视觉目标角度(deg)
+//   - vision_ready：视觉就绪(0/1)
+//   - fire：开火信号(0/1)
+//   - online：视觉在线状态(0=离线, 1=在线)
+VisionComm_Data_t VisionComm_Data = {
+    .pitch_angle  = 0.0f,
+    .yaw_angle    = 0.0f,
+    .pitch_raw    = 0,
+    .yaw_raw      = 0,
+    .vision_ready = 0,
+    .fire         = 0,
+    .timestamp    = 0,
+    .aim_x        = 0,
+    .aim_y        = 0,
+    .online       = 0,       // 初始离线（等待视觉上位机连接）
+    .rx_head0     = 0,
+    .rx_head1     = 0,
+    .rx_tail      = 0,
+    .yaw_offset_deg = 87.0f,  // [标定] Yaw 视觉零点偏移(deg)，Watch 可调
 };
 
 // ========================================================================

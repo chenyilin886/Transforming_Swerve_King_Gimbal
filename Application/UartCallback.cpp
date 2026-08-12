@@ -32,6 +32,7 @@
 #include "Vofa.hpp"
 #include "DR16.hpp"
 #include "HI12H3_IMU.hpp"
+#include "Communication/VisionComm.hpp"  // 视觉通信（RCIA协议）
 
 /**
  * @brief UART 发送完成回调
@@ -46,8 +47,11 @@ extern "C" void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART6)
     {
-        // 清除 VOFA 忙标志，准备发送下一帧
+        // 清除 VOFA 忙标志（VOFA 模式下使用）
         Vofa_TxComplete();
+        // 清除视觉通信 TX 忙标志（视觉模式下使用）
+        // 两者互斥，同一时刻只有一个在发送，安全
+        VisionComm::Manager::Instance().TxComplete();
     }
 }
 
@@ -80,9 +84,14 @@ extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
         // 强制复位 VOFA 忙状态，防止 DMA 死锁
         Vofa_TxComplete();
+        // 强制复位视觉通信 TX 忙状态
+        VisionComm::Manager::Instance().TxComplete();
 
         // 终止当前 DMA 发送，恢复 UART 到可用状态
         HAL_UART_AbortTransmit(huart);
+
+        // 重新启动 DMA 空闲中断接收（视觉通信需要持续监听）
+        VisionComm::Manager::Instance().Init();
     }
 }
 
@@ -122,5 +131,10 @@ extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t S
     {
         // 调用 IMU 驱动解析 82 字节数据帧
         BSP::IMU::imu.Parse(huart, Size);
+    }
+    else if (huart->Instance == USART6)
+    {
+        // 调用视觉通信驱动解析 RCIA 帧（19字节）
+        VisionComm::Manager::Instance().Parse(huart, Size);
     }
 }

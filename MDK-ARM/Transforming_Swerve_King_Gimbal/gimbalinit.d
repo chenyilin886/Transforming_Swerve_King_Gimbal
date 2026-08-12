@@ -786,4 +786,5 @@ transforming_swerve_king_gimbal/gimbalinit.o: \
   ..\Planner\TransformPlanner.hpp ..\BSP\Remote\DR16.hpp \
   ..\BSP\IMU\HI12H3_IMU.hpp ..\Application\Communication\BoardComm.hpp \
   ..\Application\Communication\ChassisModeManager.hpp \
-  ..\BSP\..\BSP\Remote\DR16.hpp
+  ..\BSP\..\BSP\Remote\DR16.hpp \
+  ..\Application\Communication\VisionComm.hpp

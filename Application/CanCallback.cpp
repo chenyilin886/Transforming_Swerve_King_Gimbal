@@ -33,10 +33,17 @@
 // 调试计数器：在 Keil Watch 中观察这些变量，验证 DM 电机是否持续回复
 // ========================================================================
 // 验证方法：
-//   烧录运行后，can1_rx_id_0x01/0x02/0x03 应持续增长（不再是停在1）。
-//   若仍停在 1，说明 On() 重使能无效，需用达妙上位机检查电机看门狗超时设置。
+//   DM 默认 Master ID=0，因此 can1_rx_id_0x00 应持续增长；具体电机需看
+//   data[0] 中的 ID，Fold 对应 can1_rx_dm_fold_raw。
+//
+// 【使能/失能问题诊断】
+//   观察 can1_rx_id_0x01/0x02/0x03 在使能前后的变化：
+//   - 使能前（失能状态）：观察是否有反馈帧到达
+//   - 使能后：观察反馈帧的CAN ID是什么（0x00还是0x01/0x02/0x03）
+//   - 如果使能后计数停止增长 → CAN总线或电机固件问题
 volatile uint32_t can1_rx_total      = 0;  // CAN1 接收中断总次数
 volatile uint32_t can1_rx_last_id    = 0;  // 最后收到的帧 ID
+volatile uint32_t can1_rx_id_0x00    = 0;  // DM feedback using Master ID 0
 volatile uint32_t can1_rx_id_0x01    = 0;  // ID=0x01 帧计数(DM4310 Yaw)
 volatile uint32_t can1_rx_id_0x02    = 0;  // ID=0x02 帧计数(DM4310 Pitch)
 volatile uint32_t can1_rx_id_0x03    = 0;  // ID=0x03 帧计数(DM4340 Fold)
@@ -44,9 +51,15 @@ volatile uint32_t can1_rx_id_0x141   = 0;  // ID=0x141 帧计数(LK4005)
 volatile uint32_t can1_rx_id_0x201   = 0;  // ID=0x201 帧计数(GM3508 #1)
 volatile uint32_t can1_rx_id_0x202   = 0;  // ID=0x202 帧计数(GM3508 #2)
 volatile uint32_t can1_rx_id_other   = 0;  // 其他 ID 帧计数
+volatile uint32_t can1_rx_dm_fold_raw = 0; // data[0] 电机 ID=3 的原始 DM 帧
+volatile uint32_t can1_rx_fifo0_full = 0;
+volatile uint32_t can1_rx_fifo0_overrun = 0;
+volatile uint32_t can1_error_callback_count = 0;
+volatile uint32_t can1_last_error = HAL_CAN_ERROR_NONE;
+volatile uint32_t can1_bus_off_count = 0;
 
 // ========================================================================
-// CAN2 调试计数器：验证 GM3508 摩擦轮电机是否持续回复
+// CAN2 调试计数器：当前用于板间通信；GM3508 实例实际挂在 CAN1
 // ========================================================================
 volatile uint32_t can2_rx_total      = 0;  // CAN2 接收中断总次数
 volatile uint32_t can2_rx_id_0x201   = 0;  // ID=0x201 帧计数(GM3508 #1)
@@ -82,8 +95,15 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
             // --- 调试统计(中断上下文, 仅简单自增, 安全) ---
             can1_rx_total++;
             can1_rx_last_id = frame.id;
+            if (!frame.is_extended_id && !frame.is_remote_frame &&
+                frame.dlc == 8U && frame.id <= 0x0FU &&
+                ((frame.data[0] >> 4) & 0x0FU) == 0x03U)
+            {
+                ++can1_rx_dm_fold_raw;
+            }
             switch (frame.id)
             {
+                case 0x00:  can1_rx_id_0x00++;  break;
                 case 0x01:  can1_rx_id_0x01++;  break;
                 case 0x02:  can1_rx_id_0x02++;  break;
                 case 0x03:  can1_rx_id_0x03++;  break;
@@ -100,15 +120,46 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     }
 }
 
+extern "C" void HAL_CAN_RxFifo0FullCallback(CAN_HandleTypeDef *hcan)
+{
+    if (hcan->Instance == CAN1)
+    {
+        ++can1_rx_fifo0_full;
+    }
+}
+
+extern "C" void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan)
+{
+    if (hcan->Instance != CAN1)
+    {
+        return;
+    }
+
+    const uint32_t error = HAL_CAN_GetError(hcan);
+    ++can1_error_callback_count;
+    can1_last_error = error;
+    if ((error & HAL_CAN_ERROR_RX_FOV0) != 0U)
+    {
+        ++can1_rx_fifo0_overrun;
+    }
+    if ((error & HAL_CAN_ERROR_BOF) != 0U)
+    {
+        ++can1_bus_off_count;
+    }
+
+    // HAL accumulates ErrorCode. Counters retain the diagnosis; clear it so
+    // one old overrun is not counted again on every later error callback.
+    hcan->ErrorCode = HAL_CAN_ERROR_NONE;
+}
+
 /**
- * @brief CAN2 FIFO1 接收回调（GM3508 摩擦轮电机 + 底盘板间通信）
+ * @brief CAN2 FIFO1 接收回调（当前为底盘板间通信）
  *
  * CAN2 过滤器绑定到 FIFO1（can_bus_impl.cpp 中配置），
  * 因此使用 HAL_CAN_RxFifo1MsgPendingCallback 而非 FIFO0。
  *
- * 接收数据类型：
- *   - 0x201/0x202: GM3508 摩擦轮电机反馈
- *   - 0x207/0x208: 底盘板间通信（裁判系统数据）
+ * 接收数据类型：0x207/0x208 底盘板间通信。
+ * 0x201/0x202 分支仅保留兼容性，当前 GM3508 注册在 CAN1。
  *
  * @param hcan CAN 句柄
  * @note  同样需要 extern "C"
