@@ -443,7 +443,7 @@ protected:
  *   - 默认 PMAX=12.5 rad, VMAX=30 rad/s, TMAX=10 Nm
  *   - 减速比 10:1，电机固件内 GR=10，反馈角度/速度已换算为输出轴值
  *   - P 范围必须与电机固件 PMAX 一致，否则反馈解码和控制编码都会出错
- * CAN 配置: Yaw ID=0x01, Pitch ID=0x02(均接 CAN1)
+ * CAN 配置: Yaw ID=0x04, Pitch ID=0x02(均接 CAN1)
  */
 class DM4310 : public DMMotorBase<2>
 {
@@ -464,12 +464,12 @@ public:
         // 上层接口看到的全是输出端 SI 单位，Motor 层自动处理换算
         gear_ratio_ = 10.0f;
 
-        // 反馈帧 ID(电机 CAN ID): Yaw=0x01, Pitch=0x02
-        recv_idxs_[0] = 0x01;  // Yaw
+        // 反馈帧 ID(电机 CAN ID): Yaw=0x04, Pitch=0x02
+        recv_idxs_[0] = 0x04;  // Yaw
         recv_idxs_[1] = 0x02;  // Pitch
 
-        // 命令帧 ID(电机 Master ID): Yaw=0x01, Pitch=0x02
-        send_idxs_[0] = 0x01;  // Yaw
+        // 命令帧 ID(电机 Master ID): Yaw=0x04, Pitch=0x02
+        send_idxs_[0] = 0x04;  // Yaw
         send_idxs_[1] = 0x02;  // Pitch
     }
 };

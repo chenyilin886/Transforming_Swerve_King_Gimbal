@@ -279,6 +279,8 @@ Controller_Data_t Controller_Data = {
 //   ① kp从5.0起调，观察速度响应
 //   ② ki从0.1起调，消除稳态误差
 //   ③ kd从0.05起调，抑制超调
+Controller_Data_t Vision_Controller_Data = Controller_Data;
+
 FollowMode_Data_t FollowMode_Data = {
     .target_velocity = 0.0f,    // 速度环目标(rad/s)
     .imu_velocity    = 0.0f,    // IMU角速度反馈(rad/s)

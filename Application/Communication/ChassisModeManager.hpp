@@ -100,7 +100,8 @@ enum class ChassisMode
     MANUAL = 0,          ///< 手动模式（wheel控制旋转）
     CHASSIS_FOLLOW = 1,  ///< 跟随模式（跟随云台朝向）
     GYROSCOPE = 2,       ///< 小陀螺模式（主动旋转）
-    EMERGENCY_STOP = 3   ///< 急停（最高优先级）
+    GYRO_FIXED_TRANSLATION = 3, ///< 固定小陀螺 + 普通平移
+    EMERGENCY_STOP = 4   ///< 急停（最高优先级）
 };
 
 // ========================================================================

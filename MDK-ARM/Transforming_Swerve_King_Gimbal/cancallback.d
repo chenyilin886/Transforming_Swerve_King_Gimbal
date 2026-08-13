@@ -778,4 +778,6 @@ transforming_swerve_king_gimbal/cancallback.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\pointer_to_binary_function.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\pointer_to_unary_function.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\unary_negate.h \
-  ..\Application\Communication\BoardComm.hpp
+  ..\Application\Communication\BoardComm.hpp ..\BSP\Motor\DM\DmMotor.hpp \
+  ..\BSP\Motor\MotorBase.hpp ..\BSP\Common\StateWatch\state_watch.hpp \
+  ..\BSP\Motor\Lk\LkMotor.hpp ..\BSP\Motor\Dji\DjiMotor.hpp

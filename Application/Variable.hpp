@@ -723,7 +723,7 @@ typedef struct
  * 字段说明：
  *   state              : 当前发射机构状态(0=DISABLE,1=STOP,3=AUTO)
  *   safety_ok          : 安全条件是否满足(1=可控制, 0=需失能)
- *   friction_enable    : 摩擦轮使能(0=停, 1=转)，由右拨杆 UP 控制
+ *   friction_enable    : 摩擦轮使能(0=停, 1=转)，由 S1上 + S2上 控制
  *   friction_online_l/r: 摩擦轮在线状态(预留)
  *   friction_vel_l/r   : 摩擦轮实际转速(预留)
  *
@@ -933,6 +933,7 @@ typedef struct
 // ========================================================================
 extern Joint_Data_t       Joint_Data;        // 关节状态(Stage01-02)
 extern Controller_Data_t  Controller_Data;   // 控制器状态(Stage03)
+extern Controller_Data_t  Vision_Controller_Data; // 视觉模式独立PID参数
 extern FollowMode_Data_t  FollowMode_Data;   // 底盘跟随模式专用数据(速度环单环)
 extern Transform_Config_t  Transform_Config;  // 变形规划器配置(Stage05)
 extern Transform_Status_t  Transform_Status;  // 变形规划器状态(Stage05)

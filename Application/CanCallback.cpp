@@ -12,10 +12,10 @@
  *     → stm32f4xx_it.c: CAN1_RX0_IRQHandler()
  *       → HAL_CAN_IRQHandler(&hcan1)
  *         → HAL_CAN_RxFifo0MsgPendingCallback() [本文件重写]
- *           → can1.receive(frame)  [CanDevice::receive]
+ *           → read_can_fifo()  [direct FIFO read]
  *             → HAL_CAN_GetRxMessage 提取数据
- *             → trigger_rx_callbacks(frame)
- *               → DM4310::Parse / DM4340::Parse
+ *             → dispatch_can1_frame(frame)
+ *               → DM / LK / DJI Parse by CAN ID
  *
  * CAN2 接收：
  *   - 0x201/0x202: GM3508 摩擦轮电机反馈
@@ -28,6 +28,9 @@
 #include "main.h"
 #include "can_hal.hpp"
 #include "Communication/BoardComm.hpp"
+#include "DmMotor.hpp"
+#include "LkMotor.hpp"
+#include "DjiMotor.hpp"
 
 // ========================================================================
 // 调试计数器：在 Keil Watch 中观察这些变量，验证 DM 电机是否持续回复
@@ -44,9 +47,10 @@
 volatile uint32_t can1_rx_total      = 0;  // CAN1 接收中断总次数
 volatile uint32_t can1_rx_last_id    = 0;  // 最后收到的帧 ID
 volatile uint32_t can1_rx_id_0x00    = 0;  // DM feedback using Master ID 0
-volatile uint32_t can1_rx_id_0x01    = 0;  // ID=0x01 帧计数(DM4310 Yaw)
+volatile uint32_t can1_rx_id_0x01    = 0;  // ID=0x01 帧计数(预留/旧 Yaw)
 volatile uint32_t can1_rx_id_0x02    = 0;  // ID=0x02 帧计数(DM4310 Pitch)
 volatile uint32_t can1_rx_id_0x03    = 0;  // ID=0x03 帧计数(DM4340 Fold)
+volatile uint32_t can1_rx_id_0x04    = 0;  // ID=0x04 帧计数(DM4310 Yaw)
 volatile uint32_t can1_rx_id_0x141   = 0;  // ID=0x141 帧计数(LK4005)
 volatile uint32_t can1_rx_id_0x201   = 0;  // ID=0x201 帧计数(GM3508 #1)
 volatile uint32_t can1_rx_id_0x202   = 0;  // ID=0x202 帧计数(GM3508 #2)
@@ -66,11 +70,75 @@ volatile uint32_t can2_rx_id_0x201   = 0;  // ID=0x201 帧计数(GM3508 #1)
 volatile uint32_t can2_rx_id_0x202   = 0;  // ID=0x202 帧计数(GM3508 #2)
 volatile uint32_t can2_rx_id_other   = 0;  // 其他 ID 帧计数
 
+static bool read_can_fifo(CAN_HandleTypeDef *hcan, uint32_t fifo, HAL::CAN::Frame &frame)
+{
+    if (HAL_CAN_GetRxFifoFillLevel(hcan, fifo) == 0U)
+    {
+        return false;
+    }
+
+    CAN_RxHeaderTypeDef rx_header{};
+    if (HAL_CAN_GetRxMessage(hcan, fifo, &rx_header, frame.data) != HAL_OK)
+    {
+        return false;
+    }
+
+    frame.id = (rx_header.IDE == CAN_ID_STD) ? rx_header.StdId : rx_header.ExtId;
+    frame.dlc = rx_header.DLC;
+    frame.mailbox = 0U;
+    frame.is_extended_id = (rx_header.IDE == CAN_ID_EXT);
+    frame.is_remote_frame = (rx_header.RTR == CAN_RTR_REMOTE);
+    return true;
+}
+
+static void dispatch_can1_frame(const HAL::CAN::Frame &frame)
+{
+    if (frame.is_extended_id || frame.is_remote_frame || frame.dlc != 8U)
+    {
+        return;
+    }
+
+    switch (frame.id)
+    {
+        case 0x201:
+        case 0x202:
+            if (BSP::MOTOR::DJI::motor_3508 != nullptr)
+            {
+                BSP::MOTOR::DJI::motor_3508->Parse(frame);
+            }
+            break;
+
+        case 0x141:
+            if (BSP::MOTOR::LK::lk4005_motor != nullptr)
+            {
+                BSP::MOTOR::LK::lk4005_motor->Parse(frame);
+            }
+            break;
+
+        case 0x00:
+        case 0x01:
+        case 0x02:
+        case 0x03:
+        case 0x04:
+            if (BSP::MOTOR::DM::dm4310_yaw_pitch != nullptr)
+            {
+                BSP::MOTOR::DM::dm4310_yaw_pitch->Parse(frame);
+            }
+            if (BSP::MOTOR::DM::dm4340_fold != nullptr)
+            {
+                BSP::MOTOR::DM::dm4340_fold->Parse(frame);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
 /**
  * @brief CAN1 FIFO0 接收回调
  *
  * 当 CAN1 FIFO0 收到消息时由 HAL 触发。
- * 调用 can1.receive(frame) 提取数据并自动触发已注册的电机 Parse 回调。
+ * 直接读取 FIFO，并按 CAN ID 定向调用对应电机 Parse。
  *
  * @param hcan CAN 句柄(判断是 CAN1 还是 CAN2)
  * @note  此函数在 CAN1_RX0_IRQHandler 中断上下文中执行
@@ -82,15 +150,13 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
     if (hcan->Instance == CAN1)
     {
-        // 获取 CAN1 设备
-        static auto &can1 = HAL::CAN::get_can_bus_instance().get_can1();
 
         // 【关键修复】循环读取直到 FIFO 清空
         //   STM32F4 CAN RX FIFO 深度为 3，中断在 FMP 从 0→非零 时触发一次。
         //   三台电机同时回传时 FIFO 可能堆积多帧，只读 1 帧会导致剩余帧
         //   卡在 FIFO（FMP 3→2 不触发新中断），最终溢出丢帧。
-        HAL::CAN::Frame frame;
-        while (can1.receive(frame))
+        HAL::CAN::Frame frame{};
+        while (read_can_fifo(hcan, CAN_RX_FIFO0, frame))
         {
             // --- 调试统计(中断上下文, 仅简单自增, 安全) ---
             can1_rx_total++;
@@ -107,11 +173,14 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
                 case 0x01:  can1_rx_id_0x01++;  break;
                 case 0x02:  can1_rx_id_0x02++;  break;
                 case 0x03:  can1_rx_id_0x03++;  break;
+                case 0x04:  can1_rx_id_0x04++;  break;
                 case 0x141: can1_rx_id_0x141++; break;
                 case 0x201: can1_rx_id_0x201++; break;  // GM3508 #1
                 case 0x202: can1_rx_id_0x202++; break;  // GM3508 #2
                 default:    can1_rx_id_other++; break;
             }
+
+            dispatch_can1_frame(frame);
         }
     }
     else if (hcan->Instance == CAN2)

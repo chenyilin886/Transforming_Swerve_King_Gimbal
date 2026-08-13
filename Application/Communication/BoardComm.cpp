@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file BoardComm.cpp
  * @brief 云台-底盘板间通信实现
  *
@@ -112,14 +112,33 @@ static bool send_can_frame_retry(HAL::CAN::ICanDevice &can_dev,
 void Gimbal_to_Chassis::Update()
 {
     // ========== 1. 读取遥控器摇杆数据 ==========
-    auto right_stick = BSP::Remote::DR16::Instance().GetRemoteRight();
-    auto left_stick = BSP::Remote::DR16::Instance().GetRemoteLeft();
+    auto &dr16 = BSP::Remote::DR16::Instance();
+    using Switch = BSP::Remote::DR16::Switch;
 
-    // 映射到 [0, 220]，中值 110
-    direction.LX = channel_to_uint8(static_cast<float>(right_stick.x));
-    direction.LY = channel_to_uint8(static_cast<float>(right_stick.y));
-    // 左摇杆X轴 → 小陀螺速度（中值110=停止，与底盘端ch2对应）
-    direction.Rotating_vel = channel_to_uint8(static_cast<float>(left_stick.x));
+    auto right_stick = dr16.GetRemoteRight();
+    auto s1 = dr16.GetS1();
+    auto s2 = dr16.GetS2();
+
+    if (s1 == Switch::MIDDLE && s2 == Switch::UP)
+    {
+        direction.LX = 110;
+        direction.LY = 110;
+        direction.Rotating_vel = channel_to_uint8(static_cast<float>(right_stick.x));
+    }
+    else
+    {
+        direction.LX = channel_to_uint8(static_cast<float>(right_stick.x));
+        direction.LY = channel_to_uint8(static_cast<float>(right_stick.y));
+
+        if (s1 == Switch::UP && s2 == Switch::MIDDLE)
+        {
+            direction.Rotating_vel = channel_to_uint8(0.5f);
+        }
+        else
+        {
+            direction.Rotating_vel = 110;
+        }
+    }
 
     // ========== 2. 读取拨轮数据 ==========
     //   GetWheel() 返回 [-1.0, 1.0]
@@ -140,7 +159,7 @@ void Gimbal_to_Chassis::Update()
     chassis_mode = ChassisModeManager::Instance().GetChassisMode();
 
     // ========== 5. 填充 UI/视觉数据（预留） ==========
-    ui_list.friction_enabled = 0;  // 暂时关闭，后续接入发射状态机
+    ui_list.friction_enabled = Shoot_Status.friction_enable ? 1 : 0;
     ui_list.Vision = 0;            // 暂时关闭，后续接入视觉模块
     // 其他字段保持默认值（零初始化）
 

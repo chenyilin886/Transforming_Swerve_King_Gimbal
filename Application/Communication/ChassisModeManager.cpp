@@ -200,6 +200,14 @@ ChassisMode_t ChassisModeManager::GetChassisMode() const
             mode.Rotating_mode = 1;
             break;
 
+        case ChassisMode::GYRO_FIXED_TRANSLATION:
+            mode.stop = 0;
+            mode.Follow_mode = 0;
+            mode.Rotating_mode = 1;
+            mode.Universal_mode = 1;
+            mode.KeyBoard_mode = 0;
+            break;
+
         case ChassisMode::MANUAL:
         default:
             // MANUAL 模式：设置 Universal_mode=1
@@ -275,16 +283,30 @@ ChassisMode ChassisModeManager::calculateRawState(
         return ChassisMode::EMERGENCY_STOP;
     }
 
-    // 跟随模式
-    if (s2 == BSP::Remote::DR16::Switch::MIDDLE)
+    // S1下：云台收起，底盘只允许普通平移。
+    if (s1 == BSP::Remote::DR16::Switch::DOWN)
     {
+        return ChassisMode::MANUAL;
+    }
+
+    // S1中：手动PID；S2上进入可变速小陀螺，其余为底盘跟随。
+    if (s1 == BSP::Remote::DR16::Switch::MIDDLE)
+    {
+        if (s2 == BSP::Remote::DR16::Switch::UP)
+        {
+            return ChassisMode::GYROSCOPE;
+        }
         return ChassisMode::CHASSIS_FOLLOW;
     }
 
-    // 小陀螺模式（预留）
-    if (s2 == BSP::Remote::DR16::Switch::UP)
+    // S1上：S2中固定小陀螺且可平移，S2下/上为普通平移。
+    if (s1 == BSP::Remote::DR16::Switch::UP)
     {
-        return ChassisMode::GYROSCOPE;
+        if (s2 == BSP::Remote::DR16::Switch::MIDDLE)
+        {
+            return ChassisMode::GYRO_FIXED_TRANSLATION;
+        }
+        return ChassisMode::MANUAL;
     }
 
     // 手动模式（默认）

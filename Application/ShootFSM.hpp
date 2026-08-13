@@ -48,7 +48,7 @@
  *     AUTO    : 拨盘可触发(enabled=1)，摩擦轮由右拨杆控制
  *
  *   摩擦轮使能独立于状态机：
- *     - 右拨杆 UP 且无急停/离线 → friction_enable=1
+ *     - S1上 + S2上 且无急停/离线 → friction_enable=1
  *     - 否则 friction_enable=0（直接发 0 电流 + 清 PID）
  *
  * 与参考工程差异：
@@ -81,7 +81,7 @@ namespace BSP::FSM
  *   AUTO    ──(!safety_ok / !shoot_enabled)──→ DISABLE
  *   STOP    ──(预留)──→ AUTO
  *
- * @note 摩擦轮使能独立于此状态机，由右拨杆 UP 控制（见 updateFriction_）
+ * @note 摩擦轮使能独立于此状态机，由 S1上 + S2上 控制（见 updateFriction_）
  */
 enum class ShootState : uint8_t
 {
@@ -138,7 +138,7 @@ public:
     uint8_t    last_safety_ok;     ///< 上一周期 safety_ok(边沿检测用)
 
     // === 摩擦轮控制字段 ===
-    uint8_t    friction_enable;    ///< 摩擦轮使能(0=停, 1=转), 由右拨杆 UP 控制
+    uint8_t    friction_enable;    ///< 摩擦轮使能(0=停, 1=转), 由 S1上 + S2上 控制
 
     /**
      * @brief 默认构造
@@ -180,7 +180,7 @@ public:
      *   2. 状态机切换（DISABLE ↔ AUTO）
      *   3. 把 state 映射到 Dial_Config.enabled（联动拨盘）
      *   4. 委托拨盘控制给 dial_ctrl.Update()
-     *   5. 摩擦轮速度环 PID 控制（右拨杆 UP 使能）
+     *   5. 摩擦轮速度环 PID 控制（S1上 + S2上 使能）
      *   6. 回写 Shoot_Status 供 Watch 观察
      *
      * @note 拨盘通过 DialController 间接访问 Motor
@@ -219,7 +219,7 @@ private:
      * @brief 摩擦轮速度环 PID 控制
      *
      * 使能条件（全部满足才转）：
-     *   - 右拨杆 UP（GetS2() == Switch::UP）
+     *   - S1上 + S2上
      *   - 遥控器在线（!IsOffline()）
      *   - 无急停（!(S1==DOWN && S2==DOWN)）
      *

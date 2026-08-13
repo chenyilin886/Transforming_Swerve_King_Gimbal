@@ -64,7 +64,7 @@ void Class_ShootFSM::Control()
                      Dial_Status);
 
     // ================================================================
-    // Step 4: 摩擦轮速度环 PID 控制（右拨杆 UP 使能）
+    // Step 4: 摩擦轮速度环 PID 控制（S1上 + S2上 使能）
     // ================================================================
     //   - 读 GM3508 反馈速度
     //   - 位置式 PID 计算电流命令
@@ -180,7 +180,7 @@ void Class_ShootFSM::updateFriction_()
     // 安全条件判定：摩擦轮使能独立于 ShootFSM 状态机
     // ==================================================================
     // 使能条件（全部满足）：
-    //   1. 右拨杆 UP（GetS2() == Switch::UP）
+    //   1. S1上 + S2上
     //   2. 遥控器在线（!IsOffline()）
     //   3. 无急停（!(S1==DOWN && S2==DOWN)）
     //
@@ -191,12 +191,13 @@ void Class_ShootFSM::updateFriction_()
     auto &dr16 = BSP::Remote::DR16::Instance();
     using Switch = BSP::Remote::DR16::Switch;
 
-    const bool right_switch_up = (dr16.GetS2() == Switch::UP);
+    const bool friction_switch = (dr16.GetS1() == Switch::UP &&
+                                  dr16.GetS2() == Switch::UP);
     const bool remote_offline  = dr16.IsOffline();
     const bool remote_estop    = (dr16.GetS1() == Switch::DOWN &&
                                   dr16.GetS2() == Switch::DOWN);
 
-    friction_enable = (right_switch_up && !remote_offline && !remote_estop) ? 1 : 0;
+    friction_enable = (friction_switch && !remote_offline && !remote_estop) ? 1 : 0;
 
     // ==================================================================
     // 摩擦轮控制主逻辑
@@ -212,11 +213,11 @@ void Class_ShootFSM::updateFriction_()
     else
     {
         // --- 正常/停止：始终跑 PID ---
-        //   S2==UP: target = friction_target_rpm（Watch 设定值）
-        //   S2!=UP: target = 0（PID 主动刹停，不自由滑停）
+        //   S1上+S2上: target = friction_target_rpm（Watch 设定值）
+        //   其他挡位: target = 0（PID 主动刹停，不自由滑停）
         float target   = friction_enable ? Shoot_Config.friction_target_rpm : 0.0f;
-        float target_l = +target;
-        float target_r = -target;
+        float target_l = -target;
+        float target_r = +target;
 
         // --- 1. 读 GM3508 反馈速度（电机端 RPM）---
         float vel_l = m->getVelocityRpm(1);

@@ -654,7 +654,8 @@ void GimbalUpdate()
                         // 不更新 last_s1：下周期 ABORT→IDLE 后重发 EXPAND/CONTRACT
                     }
                     else if (cur_s1 == static_cast<uint8_t>(Switch::UP) ||
-                             cur_s1 == static_cast<uint8_t>(Switch::MIDDLE))
+                             cur_s1 == static_cast<uint8_t>(Switch::MIDDLE) ||
+                             cur_s1 == static_cast<uint8_t>(Switch::DOWN))
                     {
                         // S1 → UP(1) 或 MIDDLE(3)：准备发送变形命令
                         // 【关键】先检查并修复 yaw 控制模式，确保变形期间 yaw 正常控制
@@ -675,21 +676,19 @@ void GimbalUpdate()
                         }
 
                         // 发送变形命令
-                        if (cur_s1 == static_cast<uint8_t>(Switch::UP))
+                        if (cur_s1 == static_cast<uint8_t>(Switch::DOWN))
                         {
-                            // S1 → 上档(1)：展开命令
                             Transform_Config.cmd = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::EXPAND);
+                                BSP::PLANNER::TransformCmd::CONTRACT);
                             Remote_State.planner_cmd_sent = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::EXPAND);
+                                BSP::PLANNER::TransformCmd::CONTRACT);
                         }
                         else
                         {
-                            // S1 → 中档(3)：收起命令
                             Transform_Config.cmd = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::CONTRACT);
+                                BSP::PLANNER::TransformCmd::EXPAND);
                             Remote_State.planner_cmd_sent = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::CONTRACT);
+                                BSP::PLANNER::TransformCmd::EXPAND);
                         }
                         Remote_State.last_s1 = cur_s1;
                     }
@@ -725,10 +724,22 @@ void GimbalUpdate()
     // ---------------------------------------------------------------
     VisionComm::Manager::Instance().IsConnected();
 
+    auto &dr16_mode = BSP::Remote::DR16::Instance();
+    using RemoteSwitch = BSP::Remote::DR16::Switch;
+    RemoteSwitch s1_mode = dr16_mode.GetS1();
+    RemoteSwitch s2_mode = dr16_mode.GetS2();
+    const bool gimbal_deploy_requested =
+        (s1_mode == RemoteSwitch::MIDDLE || s1_mode == RemoteSwitch::UP);
+    const bool vision_requested =
+        (s1_mode == RemoteSwitch::UP &&
+         (s2_mode == RemoteSwitch::DOWN || s2_mode == RemoteSwitch::UP));
+    const bool vision_ready =
+        (vision_requested && VisionComm_Data.online && VisionComm_Data.vision_ready);
+
     static uint8_t vision_active = 0;
     uint8_t vision_just_entered = 0;
 
-    if (VisionComm_Data.online && VisionComm_Data.vision_ready && !vision_active)
+    if (vision_ready && !vision_active)
     {
         vision_active = 1;
         vision_just_entered = 1;
@@ -753,7 +764,7 @@ void GimbalUpdate()
             Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
         }
     }
-    else if ((!VisionComm_Data.online || !VisionComm_Data.vision_ready) && vision_active)
+    else if (!vision_ready && vision_active)
     {
         vision_active = 0;
         vision_just_entered = 0;
@@ -825,7 +836,7 @@ void GimbalUpdate()
         {
             // Skip this cycle.
         }
-        else if (vision_active)
+        else if (gimbal_deploy_requested && vision_active)
         {
             if (!vision_just_entered && joint_manager.pitch.isOnline())
             {
@@ -849,7 +860,7 @@ void GimbalUpdate()
                 Controller_Data.pitch.target_angle = vision_pitch_rad;
             }
         }
-        else
+        else if (gimbal_deploy_requested)
         {
             auto &dr16 = BSP::Remote::DR16::Instance();
 
@@ -955,7 +966,7 @@ void GimbalUpdate()
         {
             // Skip this cycle.
         }
-        else if (vision_active)
+        else if (gimbal_deploy_requested && vision_active)
         {
             if (!vision_just_entered && joint_manager.yaw.isOnline())
             {
@@ -964,7 +975,7 @@ void GimbalUpdate()
                 Controller_Data.yaw.target_angle = vision_yaw_rad;
             }
         }
-        else
+        else if (gimbal_deploy_requested)
         {
             auto &dr16 = BSP::Remote::DR16::Instance();
 
@@ -1105,12 +1116,20 @@ void GimbalUpdate()
     bool is_transition = BSP::PLANNER::isTransitionState(
         static_cast<BSP::PLANNER::TransformState>(Transform_Status.state));
 
+    Controller_Data_Unit_t yaw_sync = vision_requested ? Vision_Controller_Data.yaw : Controller_Data.yaw;
+    yaw_sync.target_angle = Controller_Data.yaw.target_angle;
+    yaw_sync.enabled = Controller_Data.yaw.enabled;
+
+    Controller_Data_Unit_t pitch_sync = vision_requested ? Vision_Controller_Data.pitch : Controller_Data.pitch;
+    pitch_sync.target_angle = Controller_Data.pitch.target_angle;
+    pitch_sync.enabled = Controller_Data.pitch.enabled;
+
     // Yaw轴：非跟随模式 或 变形期间 都要同步
     if (FollowMode_Data.control_mode == 0 || is_transition) {
-        syncDataToController(Controller_Data.yaw, gimbal_controller.yaw);
+        syncDataToController(yaw_sync, gimbal_controller.yaw);
     }
     // Pitch/Fold：始终同步
-    syncDataToController(Controller_Data.pitch, gimbal_controller.pitch);
+    syncDataToController(pitch_sync, gimbal_controller.pitch);
     syncDataToController(Controller_Data.fold,  gimbal_controller.fold);
 
     // ---------------------------------------------------------------
@@ -1202,8 +1221,18 @@ void GimbalUpdate()
     syncControllerToData(gimbal_controller.pitch, Controller_Data.pitch, joint_manager.pitch);
     syncControllerToData(gimbal_controller.fold,  Controller_Data.fold,  joint_manager.fold);
 
+    if (vision_requested)
+    {
+        syncControllerToData(gimbal_controller.yaw,   Vision_Controller_Data.yaw,   joint_manager.yaw);
+        syncControllerToData(gimbal_controller.pitch, Vision_Controller_Data.pitch, joint_manager.pitch);
+    }
+
     // Yaw + Pitch IMU 反馈源 → Watch（观察 feedback_source 判断当前闭环方式）
     syncImuToData(gimbal_controller, Controller_Data.yaw, Controller_Data.pitch);
+    if (vision_requested)
+    {
+        syncImuToData(gimbal_controller, Vision_Controller_Data.yaw, Vision_Controller_Data.pitch);
+    }
 
     // ---------------------------------------------------------------
     // Step 6: DR16 state → Watch（Stage04 遥控器数据同步）
