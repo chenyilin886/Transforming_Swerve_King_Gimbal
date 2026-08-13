@@ -986,9 +986,9 @@ void GimbalUpdate()
             // ========== 2. 计算IMU角速度反馈 ==========
             float imu_yaw_vel = 0.0f;
             if (gimbal_controller.imu_online) {
-                // IMU陀螺仪输出（deg/s → rad/s）
-                // 注意：方向不取负（已确认）
-                imu_yaw_vel = -BSP::IMU::imu.getGyroZ() * 0.0174532f;
+                // IMU陀螺仪输出（deg/s → rad/s），方向与 yaw_imu_angle 保持一致
+                imu_yaw_vel = -BSP::IMU::imu.getGyroZ() * (3.14159265358979f / 180.0f);
+                gimbal_controller.yaw_imu_velocity = imu_yaw_vel;
                 FollowMode_Data.imu_velocity = imu_yaw_vel;  // 写入Watch可观察
             }
 
@@ -1190,6 +1190,8 @@ void GimbalUpdate()
             //   × (π/180)：deg → rad
             gimbal_controller.yaw_imu_angle =
                 -BSP::IMU::imu.getAddYaw() * (3.14159265358979f / 180.0f);
+            gimbal_controller.yaw_imu_velocity =
+                -BSP::IMU::imu.getGyroZ() * (3.14159265358979f / 180.0f);
 
             // --- Pitch IMU 反馈 ---
             //   getPitch() 返回欧拉角 Pitch(deg)，范围 [-90°, 90°]
@@ -1198,7 +1200,7 @@ void GimbalUpdate()
             gimbal_controller.pitch_imu_angle =
                 BSP::IMU::imu.getPitch() * (3.14159265358979f / 180.0f);
         }
-        // IMU 离线时 yaw_imu_angle / pitch_imu_angle 不更新
+        // IMU 离线时 yaw_imu_angle / yaw_imu_velocity / pitch_imu_angle 不更新
         // （保持上一次值，但 Update 中不会使用）
     }
 
@@ -1206,7 +1208,7 @@ void GimbalUpdate()
     // Step 4: GimbalController.Update 控制循环
     //   读取 Joint.feedback / IMU → PID 计算 → Motor.ctrl_Mit(纯力矩)
     //   失能关节也发送零力矩，保持电机在线
-    //   Yaw 外环：IMU 在线用 yaw_imu_angle，离线用编码器回退
+    //   Yaw 外环/内环：IMU 在线用 yaw_imu_angle/yaw_imu_velocity，离线用编码器回退
     // ---------------------------------------------------------------
     gimbal_controller.Update(joint_manager, dm4310_yaw_pitch, dm4340_fold);
 
@@ -1405,7 +1407,7 @@ void GimbalUpdate()
     //   调用 Variable.cpp 中的 VofaSendDebugChannels()
     //   修改通道配置：只需改 Variable.cpp，无需改此文件
     // ---------------------------------------------------------------
-    if (true)  // Temporary: always send RCIA vision frame.
+    if (VisionComm::Manager::Instance().IsConnected())  // Vision online: send RCIA frame; otherwise send VOFA.
     {
         static uint8_t vision_counter = 0;
         vision_counter++;

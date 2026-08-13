@@ -498,6 +498,7 @@ public:
      * 当 imu_online=0 时，Update() 中 Yaw 外环反馈回退到编码器
      */
     float yaw_imu_angle;
+    float yaw_imu_velocity;  // IMU yaw angular velocity feedback, rad/s.
 
     /**
      * @brief IMU 在线标志
@@ -624,6 +625,7 @@ public:
 
         // IMU 传感器闭环初始化
         yaw_imu_angle   = 0.0f;    // 由 GimbalUpdate 写入 IMU addYaw(deg→rad, 取负)
+        yaw_imu_velocity = 0.0f;   // 由 GimbalUpdate 写入 IMU gyroZ(deg/s→rad/s, 取负)
         pitch_imu_angle = 0.0f;    // 由 GimbalUpdate 写入 IMU pitch(deg→rad, 不取负)
         imu_online      = 0;        // 默认 IMU 离线，GimbalUpdate 中根据实际状态设置
         yaw_fb_source   = 0;        // 默认编码器反馈
@@ -637,7 +639,7 @@ public:
      *   单级模式: target_angle + feedback_angle              → PID → torque
      *   串级模式: target_angle + feedback_angle + velocity   → [角度环→速度环] → torque
      *       ↑                  ↑                  ↑                ↓
-     *   Watch/SM     Yaw:   IMU addYaw(在线)         Joint.getVelocity()  Motor.ctrl_Mit
+     *   Watch/SM     Yaw:   IMU addYaw(在线)         IMU gyroZ(在线)      Motor.ctrl_Mit
      *                Yaw:   getNormalizedAngle(离线回退)
      *                Pitch: IMU getPitch(在线)
      *                Pitch: getRealAngle(离线回退)
@@ -648,7 +650,7 @@ public:
      *     优势：云台世界坐标系绝对航向 → 自动抗底盘扰动
      *   - IMU 离线(imu_online=0)：外环反馈回退到编码器 getNormalizedAngle()
      *     安全：编码器闭环虽不能抗底盘扰动，但保证不会疯车
-     *   - 内环速度反馈始终用编码器 getVelocity()（与电机力矩直接关联，闭环更紧）
+     *   - 内环速度反馈：IMU 在线用 yaw_imu_velocity，IMU 离线回退编码器 getVelocity()
      *
      * Pitch IMU 传感器闭环：
      *   - IMU 在线(imu_online=1)：外环反馈 = pitch_imu_angle（IMU getPitch, deg→rad）
@@ -670,7 +672,7 @@ public:
         //   外环角度反馈：
         //     IMU 在线 → yaw_imu_angle（IMU addYaw, 取负+deg→rad, 连续累加支持多圈）
         //     IMU 离线 → jm.yaw.getNormalizedAngle()（编码器回退, [-π, π]）
-        //   内环速度反馈：始终用编码器 jm.yaw.getVelocity()
+        //   内环速度反馈：IMU 在线用 yaw_imu_velocity，离线回退 jm.yaw.getVelocity()
         //   连续旋转：continuous=1 → Compute() 中 wrapToPi 最短路径处理
         //
         //   【跟随模式特殊处理】
@@ -703,7 +705,7 @@ public:
                     yaw_fb_source = 0;  // 标记当前使用编码器反馈
                 }
 
-                float vel = jm.yaw.getVelocity();  // 内环始终用编码器速度
+                float vel = imu_online ? yaw_imu_velocity : jm.yaw.getVelocity();
                 float tgt = yaw.target_angle;
                 float torque = yaw.Compute(tgt, fb, vel);
                 dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.yaw.getConfig().direction);

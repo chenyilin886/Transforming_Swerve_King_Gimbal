@@ -127,17 +127,17 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .yaw = {
         .target_angle    = 0.0f,
-        .kp              = 20.0f,    // 角度环 P, 15
+        .kp              = 15.0f,    // 角度环 P, 15
         .ki              = 0.0f,    // 角度环 I
         .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 30.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
         .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
-        .vel_kp          = 13.0f,    // 速度环 P, 13
-        .vel_ki          = 0.0f,    // 速度环 I
-        .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.001
-        .vel_limit       = 10.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
+        .vel_kp          = 5.0f,    // 速度环 P, 13
+        .vel_ki          = 0.001f,    // 速度环 I
+        .vel_kd          = 0.8f,    // 速度环 D, 建议起点 0.001
+        .vel_limit       = 50.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
         .break_i_vel     = 1.0f,     // 速度误差<1rad/s 才积分
         .limit_i_vel     = 2.0f,     // 速度环 I 项 ≤ 2 N·m
         .enabled         = 1,        // 默认使能, 与 Pitch/Fold 一致
@@ -164,17 +164,17 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .pitch = {
         .target_angle    = 0.0f,
-        .kp              = 12.0f,    // 角度环 P, 15
+        .kp              = 16.0f,    // 角度环 P, 15
         .ki              = 0.0f,    // 角度环 I
         .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 22.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
         .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
-        .vel_kp          = 10.0f,    // 速度环 P, 12
-        .vel_ki          = 0.0f,    // 速度环 I
+        .vel_kp          = 12.0f,    // 速度环 P, 12
+        .vel_ki          = 0.1f,    // 速度环 I
         .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.001
-        .vel_limit       = 10.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
+        .vel_limit       = 30.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
         .break_i_vel     = 1.0f,     // 速度误差<1rad/s 才积分
         .limit_i_vel     = 2.0f,     // 速度环 I 项 ≤ 2 N·m
         .enabled         = 1,        // Stage03 启用 Pitch
@@ -705,23 +705,20 @@ VisionComm_Data_t VisionComm_Data = {
  */
 void VofaSendDebugChannels(void)
 {
-    // === Yaw + Pitch + Fold 目标/反馈 6 通道 ===
-    //   用于同时观察三条轴的 target/feedback 跟随情况
-    //
-    //   通道分配：
-    //     CH0: Controller_Data.yaw.target_angle    Yaw 目标(rad)
-    //     CH1: Controller_Data.yaw.feedback_angle  Yaw 反馈(rad)
-    //     CH2: Controller_Data.pitch.target_angle  Pitch 目标(rad)
-    //     CH3: Controller_Data.pitch.feedback_angle Pitch 反馈(rad)
-    //     CH4: Transform_Status.fold_target_now Fold 目标(rad)
-    //     CH5: Joint_Data.fold.normalized_angle Fold 反馈(rad)
+    // === Yaw + Pitch target/feedback channels ===
+    //   CH0: Controller_Data.yaw.target_angle       Yaw target(rad)
+    //   CH1: Controller_Data.yaw.feedback_angle     Yaw feedback(rad)
+    //   CH2: Controller_Data.pitch.target_angle     Pitch target(rad)
+    //   CH3: Controller_Data.pitch.feedback_angle   Pitch feedback(rad)
+    //   CH4: Reserved
+    //   CH5: Reserved
     APP::Vofa.Send6Floats(
-        Controller_Data.yaw.target_angle,                   // CH0: Yaw 目标
-        Controller_Data.yaw.feedback_angle,                 // CH1: Yaw 反馈
-        Controller_Data.pitch.target_angle,                 // CH2: Pitch 目标
-        Controller_Data.pitch.feedback_angle,               // CH3: Pitch 反馈
-        Transform_Status.fold_target_now,                    // CH3: Fold 目标
-        Joint_Data.fold.normalized_angle                 // CH4: Fold 反馈
+        Controller_Data.yaw.target_angle,       // CH0: Yaw target
+        Controller_Data.yaw.feedback_angle,     // CH1: Yaw feedback
+        Controller_Data.pitch.target_angle,     // CH2: Pitch target
+        Controller_Data.pitch.feedback_angle,   // CH3: Pitch feedback
+        0.0f,                                   // CH4: reserved
+        0.0f                                    // CH5: reserved
     );
 
    
