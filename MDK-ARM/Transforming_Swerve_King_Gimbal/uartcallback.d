@@ -34,6 +34,9 @@ transforming_swerve_king_gimbal/uartcallback.o: \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_tim.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_tim_ex.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_uart.h \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pcd.h \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_ll_usb.h \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pcd_ex.h \
   ..\Core\Inc\usart.h ..\Application\Vofa.hpp ..\BSP\Remote\DR16.hpp \
   ..\BSP\Common\StateWatch\state_watch.hpp \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\cstdint \
@@ -198,5 +201,4 @@ transforming_swerve_king_gimbal/uartcallback.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__math\traits.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__math\trigonometric_functions.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\stdlib.h \
-  C:\Keil_v5\ARM\ARMCLANG\include\stdlib.h \
-  ..\Application\Communication\VisionComm.hpp
+  C:\Keil_v5\ARM\ARMCLANG\include\stdlib.h

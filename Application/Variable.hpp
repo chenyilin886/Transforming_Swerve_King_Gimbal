@@ -802,7 +802,7 @@ typedef struct
  *
  * Watch 观察项：
  *   - tx_direction.LX/LY：遥控器右摇杆映射值（0-220）
- *   - tx_direction.Yaw_encoder_angle_err：云台-底盘角度误差
+ *   - tx_direction.Yaw_encoder_angle_err：Yaw 编码器原始角度(rad)，底盘端自行计算误差
  *   - rx_refree.launch_speed：发射速度
  *   - rx_refree.booster_now_heat：当前热量
  */
@@ -813,7 +813,7 @@ typedef struct
     uint8_t LY;                     // 右摇杆Y通道（0-220）
     uint8_t Rotating_vel;           // 小陀螺速度（0-220，中值110）
     int8_t wheel;                   // 拨轮值（-127~127，中值0）
-    float Yaw_encoder_angle_err;    // 云台-底盘角度误差(rad)
+    float Yaw_encoder_angle_err;    // Yaw 编码器原始角度(rad)，底盘端自行计算误差
     uint8_t chassis_mode;           // 底盘模式（位域打包后）
 
     // --- 接收数据（底盘→云台） ---
@@ -922,6 +922,16 @@ typedef struct
     uint8_t  aim_x;           ///< 瞄准点 X（预留）
     uint8_t  aim_y;           ///< 瞄准点 Y（预留）
     uint8_t  online;          ///< 视觉在线状态（0=离线, 1=在线）
+    
+    // --- 发送统计（关键调试信息）---
+    uint32_t tx_count;        ///< 成功发送次数（应持续增长）
+    uint32_t tx_skip_count;   ///< 跳过发送次数（USB忙时应很少）
+    uint32_t tx_busy;         ///< 发送忙标志（0=空闲, 1=忙）
+
+    // --- 调试开关 ---
+    uint8_t  force_send;      ///< [调试] 强制发送开关（0=正常模式, 1=强制发送）。调试USB发送功能时，在Watch中置1可绕过视觉在线检查
+
+    // --- 调试信息 ---
     uint8_t  rx_head0;        ///< [调试] 收到的帧头字节0（应为 0x39）
     uint8_t  rx_head1;        ///< [调试] 收到的帧头字节1（应为 0x39）
     uint8_t  rx_tail;         ///< [调试] 收到的帧尾字节（应为 0xFF）

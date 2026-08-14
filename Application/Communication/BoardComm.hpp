@@ -69,7 +69,7 @@ namespace BoardComm
  * 字段说明：
  *   LX/LY             : 遥控器右摇杆（X/Y轴），范围 0-220，中值 110
  *   Rotating_vel      : 小陀螺模式速度（范围 0-220，中值 110）
- *   Yaw_encoder_angle_err : 云台相对底盘的角度误差（rad）
+ *   Yaw_encoder_angle_err : yaw 编码器原始角度（rad），底盘端自行计算误差
  *   target_offset_angle    : 目标偏角（预留）
  *   wheel             : 遥控器拨轮值，范围 [-127, 127]，中值 0
  *
@@ -82,7 +82,7 @@ struct __attribute__((packed)) Direction_t
     uint8_t LX;                     // 右摇杆X通道（0-220，中值110）
     uint8_t LY;                     // 右摇杆Y通道（0-220，中值110）
     uint8_t Rotating_vel;           // 小陀螺速度（0-220，中值110）
-    float Yaw_encoder_angle_err;    // 云台-底盘角度误差（rad）
+    float Yaw_encoder_angle_err;    // yaw 编码器原始角度（rad），底盘端自行计算误差
     uint8_t target_offset_angle;    // 目标偏角（预留）
     int8_t wheel;                   // 拨轮值（-127~127，中值0）
 };
@@ -206,7 +206,7 @@ public:
      * 功能：
  *   1. 读取 DR16 遥控器右摇杆数据
  *   2. 读取 DR16 拨轮数据
- *   3. 读取 Joint_Data.yaw 角度（用于计算云台-底盘角度误差）
+ *   3. 读取 Joint_Data.yaw 角度（用于读取 yaw 编码器原始角度）
  *   4. 填充 direction / chassis_mode 结构体
      *
      * 调用时机：
@@ -283,16 +283,15 @@ public:
 
 private:
     /**
-     * @brief 计算云台相对底盘角度误差
-     * @return 角度误差(rad)
+     * @brief 获取 yaw 编码器原始角度
+     * @return yaw 编码器原始角度(rad)，底盘端自行计算相对角误差
      *
      * 实现方式：
-     *   当前使用 Yaw 编码器角度计算误差
-     *   后续可替换为 IMU 姿态（更准确）
+     *   云台端只发送 yaw 编码器原始角度；底盘端自行保存零点、方向并 wrap 成跟随误差。
      *
-     * @note 参考工程使用 Init_Angle 作为底盘初始角度
+     * @note 为保持 CAN 布局兼容，仍复用 Direction_t::Yaw_encoder_angle_err 这个 float 字段。
      */
-    float CalcuGimbalToChassisAngle();
+    float GetYawEncoderRawAngle();
 
     // --- 发送数据结构体 ---
     Direction_t direction{};        ///< 方向控制数据

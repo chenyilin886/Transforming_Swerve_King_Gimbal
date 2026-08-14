@@ -6,11 +6,11 @@
  *   1. Gimbal_to_Chassis::Update() - 更新发送数据
  *   2. Gimbal_to_Chassis::Data_send() - 发送 CAN 帧
  *   3. Gimbal_to_Chassis::HandleCANMessage() - 处理接收数据
- *   4. Gimbal_to_Chassis::CalcuGimbalToChassisAngle() - 计算云台-底盘角度误差
+ *   4. Gimbal_to_Chassis::GetYawEncoderRawAngle() - 获取 yaw 编码器原始角度
  *
  * 数据流：
  *   遥控器DR16 → Update() → direction.LX/LY
- *   Joint_Data.yaw → CalcuGimbalToChassisAngle() → direction.Yaw_encoder_angle_err
+ *   Joint_Data.yaw.encoder_angle → direction.Yaw_encoder_angle_err
  *   direction/chassis_mode/ui_list → Data_send() → CAN2 (0x205/0x206)
  *
  *   CAN2 接收 → HandleCANMessage() → rx_refree
@@ -101,7 +101,7 @@ static bool send_can_frame_retry(HAL::CAN::ICanDevice &can_dev,
  * 实现步骤：
  *   1. 读取 DR16 遥控器左右摇杆数据 → direction.LX/LY
  *   2. 读取 DR16 拨轮数据 → direction.wheel
- *   3. 计算云台-底盘角度误差 → direction.Yaw_encoder_angle_err
+ *   3. 读取 yaw 编码器原始角度 → direction.Yaw_encoder_angle_err
  *   4. 填充模式状态（从状态机获取）→ chassis_mode
  *
  * 数据源：
@@ -146,10 +146,10 @@ void Gimbal_to_Chassis::Update()
     float wheel_raw = BSP::Remote::DR16::Instance().GetWheel();
     direction.wheel = static_cast<int8_t>(wheel_raw * 127.0f);
 
-    // ========== 3. 计算云台-底盘角度误差 ==========
-    // 参考工程：使用编码器角度计算误差
-    // 当前工程：使用 Joint_Data.yaw.real_angle
-    direction.Yaw_encoder_angle_err = CalcuGimbalToChassisAngle();
+    // ========== 3. 读取 yaw 编码器原始角度 ==========
+    // 云台端只发送 yaw 编码器原始角度
+    // 底盘端自行做 zero/direction/wrap 计算跟随误差
+    direction.Yaw_encoder_angle_err = GetYawEncoderRawAngle();
 
     // ========== 4. 填充模式状态（从状态机获取）【修改】 ==========
     // 原设计：直接判断 S1/S2 开关状态（硬编码）
@@ -342,25 +342,23 @@ void Gimbal_to_Chassis::HandleCANMessage(uint32_t std_id, const uint8_t *data, u
 }
 
 /**
- * @brief 计算云台相对底盘角度误差（最短路径归一化）
+ * @brief 获取 yaw 编码器原始角度
  *
- * @return 角度误差(rad)，范围 [-π, π]
+ * @return yaw 编码器原始角度(rad)
  *
  * 实现方式：
- *   使用 BSP::JOINT::wrapToPi() 将编码器累积角度归一化到 [-π, π]，
- *   确保底盘跟随时走最短路径。
- *   修复前：编码器累积角度可能超过 ±π（如小陀螺360° → 误差360° → 底盘转360°）
- *   修复后：归一化到 [-π, π]（如360° → 0° → 底盘不转，就近归位）
+ *   云台端只发送 Motor/Joint 层同步到的 yaw 编码器原始角度。
+ *   底盘端负责保存 yaw_zero_offset、应用 yaw_direction，并用 wrapToPi()
+ *   计算最终底盘跟随误差，保证底盘侧统一管理跟随零点和方向。
  *
- * @note Yaw 是连续旋转关节(continuous=1)，normalized_angle 已由 Joint::Update
- *       通过 wrapToPi(real_angle) 维护在 [-π, π]，直接使用即可。
+ * @note 为保持 CAN 布局兼容，仍复用 Direction_t::Yaw_encoder_angle_err 这个 float 字段。
  */
-float Gimbal_to_Chassis::CalcuGimbalToChassisAngle()
+float Gimbal_to_Chassis::GetYawEncoderRawAngle()
 {
-    // Yaw 关节的 normalized_angle = wrapToPi(real_angle)
-    // real_angle = (encoder - offset) * direction
-    // 连续旋转关节(continuous=1)，normalized_angle 已被 wrap 到 [-π, π]
-    float yaw_angle = Joint_Data.yaw.normalized_angle;
+    // Send raw yaw encoder angle. The chassis computes zero offset, direction, and wrap.
+    // Do not pre-apply gimbal-side offset/direction here.
+    // Keeping the protocol float field unchanged preserves the existing CAN layout.
+    float yaw_angle = Joint_Data.yaw.encoder_angle;
 
     return yaw_angle;
 }

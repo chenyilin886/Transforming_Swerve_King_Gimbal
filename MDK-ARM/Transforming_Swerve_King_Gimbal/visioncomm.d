@@ -35,7 +35,10 @@ transforming_swerve_king_gimbal/visioncomm.o: \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_tim.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_tim_ex.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_uart.h \
-  ..\Core\Inc\usart.h ..\BSP\Common\StateWatch\state_watch.hpp \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pcd.h \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_ll_usb.h \
+  ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pcd_ex.h \
+  ..\BSP\Common\StateWatch\state_watch.hpp \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\cstdint \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__assert \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__verbose_abort \
@@ -44,5 +47,17 @@ transforming_swerve_king_gimbal/visioncomm.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__type_traits\is_constant_evaluated.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\string.h \
   C:\Keil_v5\ARM\ARMCLANG\include\string.h \
+  ..\Application\Communication\VisionCommC.h \
   ..\Application\Communication\..\Variable.hpp \
-  ..\Application\Communication\BoardComm.hpp
+  ..\Application\Communication\BoardComm.hpp \
+  ..\USB_DEVICE\App\usbd_cdc_if.h \
+  ..\Middlewares\ST\STM32_USB_Device_Library\Class\CDC\Inc\usbd_cdc.h \
+  ..\Middlewares\ST\STM32_USB_Device_Library\Core\Inc\usbd_ioreq.h \
+  ..\Middlewares\ST\STM32_USB_Device_Library\Core\Inc\usbd_def.h \
+  ..\USB_DEVICE\Target\usbd_conf.h \
+  C:\Keil_v5\ARM\ARMCLANG\include\libcxx\stdio.h \
+  C:\Keil_v5\ARM\ARMCLANG\include\stdio.h \
+  C:\Keil_v5\ARM\ARMCLANG\include\libcxx\stdlib.h \
+  C:\Keil_v5\ARM\ARMCLANG\include\stdlib.h \
+  ..\Middlewares\ST\STM32_USB_Device_Library\Core\Inc\usbd_core.h \
+  ..\Middlewares\ST\STM32_USB_Device_Library\Core\Inc\usbd_ctlreq.h

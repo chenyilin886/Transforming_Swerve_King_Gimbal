@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file GimbalInit.cpp
  * @brief 云台系统初始化与周期更新实现
  *
@@ -1407,7 +1407,10 @@ void GimbalUpdate()
     //   调用 Variable.cpp 中的 VofaSendDebugChannels()
     //   修改通道配置：只需改 Variable.cpp，无需改此文件
     // ---------------------------------------------------------------
-    if (VisionComm::Manager::Instance().IsConnected())  // Vision online: send RCIA frame; otherwise send VOFA.
+    const bool vision_online = VisionComm::Manager::Instance().IsConnected();
+    const bool force_send_enabled = (VisionComm_Data.force_send != 0);
+
+    if (vision_online || force_send_enabled)  // Vision online OR force_send: send RCIA frame; otherwise send VOFA.
     {
         static uint8_t vision_counter = 0;
         vision_counter++;

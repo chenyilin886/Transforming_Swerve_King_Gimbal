@@ -127,16 +127,16 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .yaw = {
         .target_angle    = 0.0f,
-        .kp              = 15.0f,    // 角度环 P, 15
-        .ki              = 0.0f,    // 角度环 I
-        .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
+        .kp              = 18.0f,    // 角度环 P, 15
+        .ki              = 0.00095f,    // 角度环 I
+        .kd              = 2.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 30.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
-        .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
+        .break_i         = 0.5f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
         .vel_kp          = 5.0f,    // 速度环 P, 13
-        .vel_ki          = 0.001f,    // 速度环 I
-        .vel_kd          = 0.8f,    // 速度环 D, 建议起点 0.001
+        .vel_ki          = 0.0f,    // 速度环 I
+        .vel_kd          = 2.0f,    // 速度环 D, 建议起点 0.001
         .vel_limit       = 50.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
         .break_i_vel     = 1.0f,     // 速度误差<1rad/s 才积分
         .limit_i_vel     = 2.0f,     // 速度环 I 项 ≤ 2 N·m
@@ -279,7 +279,105 @@ Controller_Data_t Controller_Data = {
 //   ① kp从5.0起调，观察速度响应
 //   ② ki从0.1起调，消除稳态误差
 //   ③ kd从0.05起调，抑制超调
-Controller_Data_t Vision_Controller_Data = Controller_Data;
+// ========================================================================
+// Vision mode independent PID parameters
+// ========================================================================
+// Watch usage:
+//   - Normal/manual mode PID:  Controller_Data.yaw / Controller_Data.pitch
+//   - Vision aiming mode PID:  Vision_Controller_Data.yaw / Vision_Controller_Data.pitch
+//
+// GimbalUpdate keeps vision target_angle/enabled following Controller_Data, but
+// PID gains, limits, integral gates and gravity compensation come from this block
+// while vision is active.
+Controller_Data_t Vision_Controller_Data = {
+    .yaw = {
+        .target_angle    = 0.0f,
+        .kp              = 18.0f,
+        .ki              = 0.00095f,
+        .kd              = 2.0f,
+        .torque_limit    = 30.0f,
+        .break_i         = 0.5f,
+        .limit_i         = 2.0f,
+        .cascade_mode    = 1,
+        .vel_kp          = 5.0f,
+        .vel_ki          = 0.0f,
+        .vel_kd          = 2.0f,
+        .vel_limit       = 50.0f,
+        .break_i_vel     = 1.0f,
+        .limit_i_vel     = 2.0f,
+        .enabled         = 1,
+        .gravity_k       = 0.0f,
+        .gravity_enable  = 0,
+        .feedback_angle  = 0.0f,
+        .error           = 0.0f,
+        .vel_target      = 0.0f,
+        .vel_feedback    = 0.0f,
+        .vel_error       = 0.0f,
+        .torque_output   = 0.0f,
+        .gravity_torque  = 0.0f,
+        .limit_min       = -3.14159f,
+        .limit_max       =  3.14159f,
+        .feedback_source = 0,
+    },
+    .pitch = {
+        .target_angle    = 0.0f,
+        .kp              = 16.0f,
+        .ki              = 0.0f,
+        .kd              = 0.0f,
+        .torque_limit    = 22.0f,
+        .break_i         = 0.1f,
+        .limit_i         = 2.0f,
+        .cascade_mode    = 1,
+        .vel_kp          = 12.0f,
+        .vel_ki          = 0.1f,
+        .vel_kd          = 0.0f,
+        .vel_limit       = 30.0f,
+        .break_i_vel     = 1.0f,
+        .limit_i_vel     = 2.0f,
+        .enabled         = 1,
+        .gravity_k       = 6.0f,
+        .gravity_enable  = 1,
+        .feedback_angle  = 0.0f,
+        .error           = 0.0f,
+        .vel_target      = 0.0f,
+        .vel_feedback    = 0.0f,
+        .vel_error       = 0.0f,
+        .torque_output   = 0.0f,
+        .gravity_torque  = 0.0f,
+        .limit_min       = -0.7927f,
+        .limit_max       =  0.6481f,
+        .feedback_source = 0,
+    },
+    .fold = {
+        .target_angle    = 0.0f,
+        .kp              = 15.0f,
+        .ki              = 0.0f,
+        .kd              = 0.0f,
+        .torque_limit    = 5.0f,
+        .break_i         = 0.1f,
+        .limit_i         = 5.0f,
+        .cascade_mode    = 1,
+        .vel_kp          = 13.0f,
+        .vel_ki          = 0.0f,
+        .vel_kd          = 0.0f,
+        .vel_limit       = 5.0f,
+        .break_i_vel     = 1.0f,
+        .limit_i_vel     = 5.0f,
+        .enabled         = 1,
+        .gravity_k       = 1.8f,
+        .gravity_enable  = 1,
+        .feedback_angle  = 0.0f,
+        .error           = 0.0f,
+        .vel_target      = 0.0f,
+        .vel_feedback    = 0.0f,
+        .vel_error       = 0.0f,
+        .torque_output   = 0.0f,
+        .gravity_torque  = 0.0f,
+        .limit_min       = 0.0f,
+        .limit_max       = 0.848020554f,
+        .feedback_source = 0,
+    },
+};
 
 FollowMode_Data_t FollowMode_Data = {
     .target_velocity = 0.0f,    // 速度环目标(rad/s)
@@ -634,7 +732,7 @@ Friction_Data_t Friction_Data = {
 //   - 接收数据：BoardComm::Gimbal_to_Chassis::HandleCANMessage() 更新
 // Watch 添加 BoardComm_Data → 观察：
 //   - LX/LY：遥控器左摇杆映射值（0-220，中值110）
-//   - Yaw_encoder_angle_err：云台-底盘角度误差
+//   - Yaw_encoder_angle_err：Yaw 编码器原始角度(rad)，底盘端自行计算误差
 //   - launch_speed：发射速度
 //   - booster_now_heat：当前热量
 BoardComm_Data_t BoardComm_Data = {
@@ -674,6 +772,15 @@ VisionComm_Data_t VisionComm_Data = {
     .aim_x        = 0,
     .aim_y        = 0,
     .online       = 0,       // 初始离线（等待视觉上位机连接）
+    
+    // --- 发送统计（初始值）---
+    .tx_count      = 0,      // 成功发送次数（应持续增长）
+    .tx_skip_count = 0,      // 跳过发送次数（USB忙时应很少）
+    .tx_busy       = 0,      // 发送忙标志（0=空闲, 1=忙）
+
+    // --- 调试开关 ---
+    .force_send    = 1,      // [调试] 强制发送开关（0=正常模式, 1=强制发送）
+
     .rx_head0     = 0,
     .rx_head1     = 0,
     .rx_tail      = 0,
