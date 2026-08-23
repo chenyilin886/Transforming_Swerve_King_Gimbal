@@ -216,8 +216,8 @@ void Class_ShootFSM::updateFriction_()
         //   S1上+S2上: target = friction_target_rpm（Watch 设定值）
         //   其他挡位: target = 0（PID 主动刹停，不自由滑停）
         float target   = friction_enable ? Shoot_Config.friction_target_rpm : 0.0f;
-        float target_l = -target;
-        float target_r = +target;
+        float target_l = +target;
+        float target_r = -target;
 
         // --- 1. 读 GM3508 反馈速度（电机端 RPM）---
         float vel_l = m->getVelocityRpm(1);
@@ -267,6 +267,8 @@ void Class_ShootFSM::syncStatus_()
     Shoot_Status.state          = (uint8_t)state;
     Shoot_Status.safety_ok      = safety_ok;
     Shoot_Status.friction_enable = friction_enable;
+    Shoot_Status.trigger_source = Dial_Status.trigger_source;
+    Shoot_Status.vision_fire    = Dial_Status.vision_fire;
 }
 
 } // namespace BSP::FSM

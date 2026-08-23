@@ -194,6 +194,27 @@ public:
                 }
                 this->unit_data_[i].temperature = (float)feedback_[i].T_Mos;
                 this->unit_data_[i].accel        = 0.0f;
+
+                // --- 多圈累计（软件 add_angle）---
+                // DM 电机编码器为单圈绝对式，固件多圈跟踪范围有限(±PMAX)。
+                // 当角度超过 ±PMAX 时会发生回绕跳变，此处检测跳变并累计圈数。
+                // 对于有限位关节(Pitch/Fold)，不会发生过零跳变，add_angle ≈ angle。
+                {
+                    const float range   = params_.P_MAX - params_.P_MIN;  // 完整范围(如 25.0 rad)
+                    const float half    = range * 0.5f;                     // 半范围阈值(如 12.5 rad)
+                    const float current = this->unit_data_[i].angle;
+                    const float delta   = current - this->unit_data_[i].last_angle;
+
+                    if (delta > half)
+                        this->unit_data_[i].add_angle += delta - range;   // 正向回绕：减去一圈
+                    else if (delta < -half)
+                        this->unit_data_[i].add_angle += delta + range;   // 反向回绕：加一圈
+                    else
+                        this->unit_data_[i].add_angle += delta;            // 正常增量
+
+                    this->unit_data_[i].last_angle = current;
+                }
+
                 this->updateTimestamp(i + 1);
                 break;
             }

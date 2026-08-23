@@ -53,7 +53,7 @@ Joint_Data_t Joint_Data = {
         .online           = 0,
         .config = {
             .offset       = 0.8825f,       // 实测标定
-            .limit_min    = -0.7927f,      // 枪口最低(实测)
+            .limit_min    = -0.9496f,      // 枪口最低(实测)
             .limit_max    =  0.6481f,       // 枪口最高(实测)
             .direction    = -1.0f,
             .continuous   = 0,
@@ -190,7 +190,7 @@ Controller_Data_t Controller_Data = {
         //   注意: gravity_enable=1 且 cascade_mode=1 时生效
         //         IMU 离线切编码器时, 若编码器零位≠枪口水平, 补偿会不准
         //         (当前编码器零位已标定为枪口水平, 可放心使用)
-        .gravity_k       = 6.0f,    // 重力补偿系数(N·m), 保守初值, Watch 在线标定
+        .gravity_k       = 7.0f,    // 重力补偿系数(N·m), 保守初值, Watch 在线标定
         .gravity_enable  = 1,        // ← 启用 Pitch 重力补偿(加摩擦轮后必需)
         .feedback_angle  = 0.0f,
         .error           = 0.0f,
@@ -199,7 +199,7 @@ Controller_Data_t Controller_Data = {
         .vel_error       = 0.0f,
         .torque_output   = 0.0f,
         .gravity_torque  = 0.0f,
-        .limit_min       = -0.7927f, // 枪口最低(实测)
+        .limit_min       = -0.9496f, // 枪口最低(实测)
         .limit_max       =  0.6481f, // 枪口最高(实测)
     },
     // --- Fold 控制器(DM4340 #1) ← Stage04 串级验证对象 ---
@@ -226,7 +226,7 @@ Controller_Data_t Controller_Data = {
         .kp              = 15.0f,    // 角度环 P, 建议起点 3.0
         .ki              = 0.0f,    // 角度环 I0
         .kd              = 0.0f,    // 角度环 D, 建议起点 0.2
-        .torque_limit    = 5.0f,     // 输出端力矩限幅(N·m), 修复后实测值
+        .torque_limit    = 8.0f,     // 输出端力矩限幅(N·m), 修复后实测值
                                       //   ← DmMotor.hpp 已修: DM4340 torque_is_output_side_=true
                                       //     固件 GR=40 已换算为输出端, 不再除 GR
                                       //   电机 TMAX=28 N·m(输出端峰值), 2 N·m 是测试安全值
@@ -237,7 +237,7 @@ Controller_Data_t Controller_Data = {
         .vel_kp          = 13.0f,    // 速度环 P, 建议起点 0.02
         .vel_ki          = 0.0f,    // 速度环 I
         .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.0005
-        .vel_limit       = 5.0f,     // 速度目标限幅 5 rad/s (DM4340 VMAX=10, 保守取半)
+        .vel_limit       = 10.0f,     // 速度目标限幅 5 rad/s (DM4340 VMAX=10, 保守取半)
         .break_i_vel     = 1.0f,     // 速度误差<1rad/s 才积分
         .limit_i_vel     = 5.0f,     // 速度环 I 项 ≤ 5 N·m
         .enabled         = 1,        // ← Stage04 启用 Fold
@@ -292,14 +292,14 @@ Controller_Data_t Controller_Data = {
 Controller_Data_t Vision_Controller_Data = {
     .yaw = {
         .target_angle    = 0.0f,
-        .kp              = 18.0f,
+        .kp              = 21.0f,//18
         .ki              = 0.00095f,
         .kd              = 2.0f,
         .torque_limit    = 30.0f,
         .break_i         = 0.5f,
         .limit_i         = 2.0f,
         .cascade_mode    = 1,
-        .vel_kp          = 5.0f,
+        .vel_kp          = 12.0f,
         .vel_ki          = 0.0f,
         .vel_kd          = 2.0f,
         .vel_limit       = 50.0f,
@@ -321,21 +321,21 @@ Controller_Data_t Vision_Controller_Data = {
     },
     .pitch = {
         .target_angle    = 0.0f,
-        .kp              = 16.0f,
-        .ki              = 0.0f,
+        .kp              = 23.0f,
+        .ki              = 0.001f,
         .kd              = 0.0f,
         .torque_limit    = 22.0f,
         .break_i         = 0.1f,
         .limit_i         = 2.0f,
         .cascade_mode    = 1,
-        .vel_kp          = 12.0f,
+        .vel_kp          = 16.0f,
         .vel_ki          = 0.1f,
         .vel_kd          = 0.0f,
         .vel_limit       = 30.0f,
         .break_i_vel     = 1.0f,
         .limit_i_vel     = 2.0f,
         .enabled         = 1,
-        .gravity_k       = 6.0f,
+        .gravity_k       = 7.0f,
         .gravity_enable  = 1,
         .feedback_angle  = 0.0f,
         .error           = 0.0f,
@@ -344,7 +344,7 @@ Controller_Data_t Vision_Controller_Data = {
         .vel_error       = 0.0f,
         .torque_output   = 0.0f,
         .gravity_torque  = 0.0f,
-        .limit_min       = -0.7927f,
+        .limit_min       = -0.9496f,
         .limit_max       =  0.6481f,
         .feedback_source = 0,
     },
@@ -623,24 +623,24 @@ Dial_Config_t Dial_Config = {
     // === 拨轮触发 ===
     .wheel_start_threshold = 0.5f,    // wheel > 0.5 触发(比旧版0.8更柔和)
     .long_press_ms         = 800,     // 持续 800ms 切换为连发
-    .auto_fire_hz          = 20.0f,    // 连发基础频率 8 Hz (仅 wheel_to_hz<=0 时使用)
+    .auto_fire_hz          = 5.0f,    // 连发基础频率 8 Hz (仅 wheel_to_hz<=0 时使用)
     .wheel_to_hz           = 0.0f,   // wheel 满幅映射到 0 Hz
 
     // === 位置环(外环) PID ===
-    .pos_kp                = 40.0f,    // P, 调好速度环后改 8.0
+    .pos_kp                = 23.0f,    // P, 调好速度环后改 8.0
     .pos_ki                = 0.0f,    // I, 保持 0
     .pos_kd                = 0.0f,    // D, 调好速度环后改 0.3
     .pos_break_i           = 0.1f,    // 位置误差<0.1rad 才积分
     .pos_limit_i           = 5.0f,    // 位置环 I 项限幅 5 rad/s
-    .pos_vel_limit         = 50.0f,   // 速度目标上限 20 rad/s
+    .pos_vel_limit         = 50.0f,   // 
 
     // === 速度环(内环) PID ===
-    .vel_kp                = 13.0f,    // P, 起步 50
+    .vel_kp                = 34.0f,    // P, 起步 50
     .vel_ki                = 0.0f,    // I, 保持 0
     .vel_kd                = 0.0f,    // D, 起步 1.0
     .vel_break_i           = 5.0f,    // 速度误差<5rad/s 才积分
     .vel_limit_i           = 80.0f,   // 速度环 I 项限幅 80 raw
-    .raw_output_limit      = 2048.0f,  // 最终 raw 命令限幅 500, 调好后可放宽到 1500
+    .raw_output_limit      = 2048.0f, 
 
     // === raw_override 模式(调试用) ===
     .raw_override_enable   = 0,       // 默认关闭, 调试时置 1 + 设置 raw_override_cmd
@@ -670,6 +670,8 @@ Dial_Status_t Dial_Status = {
     .pid_d              = 0.0f,
     .torque_cmd         = 0,
     .control_source     = 0,         // 0=零力矩/未控制
+    .trigger_source     = 0,
+    .vision_fire        = 0,
     .jam_detected       = 0,
     .shot_count         = 0,
     .online             = 0,         // 0=LK4005 初始按离线处理
@@ -705,6 +707,8 @@ Shoot_Status_t Shoot_Status = {
     .state              = 0,         // DISABLE
     .safety_ok          = 0,
     .friction_enable    = 0,
+    .trigger_source     = 0,
+    .vision_fire        = 0,
     .friction_online_l  = 0,
     .friction_online_r  = 0,
     .friction_vel_l     = 0.0f,
@@ -750,6 +754,27 @@ BoardComm_Data_t BoardComm_Data = {
     .last_rx_time        = 0,
 };
 
+// Gyro fixed-translation speed tuning block.
+// Profile: slow hold -> fast rise -> fast hold -> fast fall.
+// Direction sign chooses the side of 110; speed is clamped in BoardComm.cpp.
+volatile GyroFixedSpeed_Config_t GyroFixedSpeed_Config = {
+    .enable       = 1,
+    .direction    = 1,
+    .slow_abs     = 0.25f,
+    .fast_abs     = 0.7f,
+    .slow_hold_ms = 700.0f,
+    .fast_hold_ms = 800.0f,
+    .rise_ms      = 110.0f,
+    .fall_ms      = 90.0f,
+    .active       = 0,
+    .segment      = 0,
+    .start_tick   = 0,
+    .elapsed_ms   = 0,
+    .cycle_pos_ms = 0.0f,
+    .speed_norm   = 0.0f,
+    .rotating_vel = 110,
+};
+
 // ========================================================================
 // 视觉通信数据全局实例（Stage07: 视觉通信 — RCIA协议）
 // ========================================================================
@@ -784,7 +809,7 @@ VisionComm_Data_t VisionComm_Data = {
     .rx_head0     = 0,
     .rx_head1     = 0,
     .rx_tail      = 0,
-    .yaw_offset_deg = 87.0f,  // [标定] Yaw 视觉零点偏移(deg)，Watch 可调
+    .yaw_offset_deg = 80.3f,  // [标定] Yaw 视觉零点偏移(deg)，Watch 可调
 };
 
 // ========================================================================
@@ -793,15 +818,7 @@ VisionComm_Data_t VisionComm_Data = {
 /**
  * @brief VOFA+ 6 通道发送函数
  *
- * 数据来源：Controller_Data.yaw（Yaw 串级 PID 调参观测）
- *
- * 当前通道分配（Stage04 Yaw 串级 PID 调参观测）：
- *   CH0: yaw.target_angle    目标角度（rad）       外环输入
- *   CH1: yaw.feedback_angle  反馈角度（rad）       外环反馈（normalized_angle）
- *   CH2: yaw.error           角度环误差（rad）     外环误差（最短路径）
- *   CH3: yaw.torque_output   输出力矩（N·m）       内环输出
- *   CH4: yaw.vel_target      速度环目标（rad/s）   外环输出=内环输入
- *   CH5: yaw.vel_feedback    速度环反馈（rad/s）   内环反馈
+
  *
  * 修改通道配置示例：
  *   - 观察 Pitch：改用 Controller_Data.pitch.target_angle 等
@@ -812,20 +829,20 @@ VisionComm_Data_t VisionComm_Data = {
  */
 void VofaSendDebugChannels(void)
 {
-    // === Yaw + Pitch target/feedback channels ===
-    //   CH0: Controller_Data.yaw.target_angle       Yaw target(rad)
-    //   CH1: Controller_Data.yaw.feedback_angle     Yaw feedback(rad)
-    //   CH2: Controller_Data.pitch.target_angle     Pitch target(rad)
-    //   CH3: Controller_Data.pitch.feedback_angle   Pitch feedback(rad)
-    //   CH4: Reserved
-    //   CH5: Reserved
+    // === Yaw / Pitch / LK4005(拨盘) 目标值 vs 反馈值 ===
+    //   CH0(通道1): yaw.target_angle        Yaw 目标角度(rad)
+    //   CH1(通道2): yaw.feedback_angle      Yaw 反馈角度(rad)
+    //   CH2(通道3): pitch.target_angle      Pitch 目标角度(rad)
+    //   CH3(通道4): pitch.feedback_angle    Pitch 反馈角度(rad)
+    //   CH4(通道5): Dial.target_angle       LK4005 拨盘目标累计角度(rad, 多圈)
+    //   CH5(通道6): Dial.feedback_angle     LK4005 拨盘反馈累计角度(rad, 多圈)
     APP::Vofa.Send6Floats(
-        Controller_Data.yaw.target_angle,       // CH0: Yaw target
-        Controller_Data.yaw.feedback_angle,     // CH1: Yaw feedback
-        Controller_Data.pitch.target_angle,     // CH2: Pitch target
-        Controller_Data.pitch.feedback_angle,   // CH3: Pitch feedback
-        0.0f,                                   // CH4: reserved
-        0.0f                                    // CH5: reserved
+        VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
+        IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
+        VisionComm_Data.pitch_angle,            // CH2(通道3): 视觉 Pitch 目标
+        IMU_Data.pitch,                         // CH3(通道4): IMU Pitch 反馈
+        Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
+        Friction_Data.right.velocity_rpm        // CH5(通道6): 右摩擦轮转速(RPM)
     );
 
    

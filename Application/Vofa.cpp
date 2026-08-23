@@ -63,7 +63,10 @@ void Vofa_t::Send6Floats(float x1, float x2, float x3, float x4, float x5, float
 
     // 启动 DMA 发送（USART6，非阻塞）
     // 总帧长：6 个 float + 尾帧 = 28 字节
-    HAL_UART_Transmit_DMA(&huart6, tx_buffer_, kFrameSize);
+    if (HAL_UART_Transmit_DMA(&huart6, tx_buffer_, kFrameSize) != HAL_OK)
+    {
+        busy_ = false;
+    }
 }
 
 void Vofa_t::TxComplete()

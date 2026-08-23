@@ -29,6 +29,7 @@
 #include "../Application/Variable.hpp"
 #include "can_hal.hpp"
 #include "cmsis_os.h"
+#include <math.h>
 
 namespace BoardComm
 {
@@ -53,6 +54,113 @@ namespace BoardComm
 static inline uint8_t channel_to_uint8(float value)
 {
     return static_cast<uint8_t>(value * 110.0f + 110.0f);
+}
+
+static inline uint8_t channel_to_rotating_vel(float value)
+{
+    uint8_t encoded = channel_to_uint8(value);
+    return encoded == 0U ? 1U : encoded;
+}
+
+static inline float clamp_float(float value, float min_value, float max_value)
+{
+    if (value < min_value)
+    {
+        return min_value;
+    }
+    if (value > max_value)
+    {
+        return max_value;
+    }
+    return value;
+}
+
+static uint8_t compute_fixed_gyro_rotating_vel(bool active)
+{
+    constexpr float kMinAbsSpeed = 0.01f;
+    constexpr float kMinTransitionMs = 10.0f;
+
+    static bool mode_was_active = false;
+    static uint32_t mode_start_tick = 0U;
+
+    const uint32_t now = HAL_GetTick();
+
+    if (!active || GyroFixedSpeed_Config.enable == 0U)
+    {
+        mode_was_active = false;
+        GyroFixedSpeed_Config.active = 0U;
+        GyroFixedSpeed_Config.segment = 0U;
+        GyroFixedSpeed_Config.start_tick = 0U;
+        GyroFixedSpeed_Config.elapsed_ms = 0U;
+        GyroFixedSpeed_Config.cycle_pos_ms = 0.0f;
+        GyroFixedSpeed_Config.speed_norm = 0.0f;
+        GyroFixedSpeed_Config.rotating_vel = 110U;
+        return 110U;
+    }
+
+    if (!mode_was_active)
+    {
+        mode_was_active = true;
+        mode_start_tick = now;
+        GyroFixedSpeed_Config.start_tick = now;
+    }
+
+    float slow_abs = clamp_float(GyroFixedSpeed_Config.slow_abs, kMinAbsSpeed, 1.0f);
+    float fast_abs = clamp_float(GyroFixedSpeed_Config.fast_abs, kMinAbsSpeed, 1.0f);
+    if (fast_abs < slow_abs)
+    {
+        const float tmp = fast_abs;
+        fast_abs = slow_abs;
+        slow_abs = tmp;
+    }
+
+    const float slow_hold_ms = clamp_float(GyroFixedSpeed_Config.slow_hold_ms, 0.0f, 60000.0f);
+    const float fast_hold_ms = clamp_float(GyroFixedSpeed_Config.fast_hold_ms, 0.0f, 60000.0f);
+    const float rise_ms = clamp_float(GyroFixedSpeed_Config.rise_ms, kMinTransitionMs, 10000.0f);
+    const float fall_ms = clamp_float(GyroFixedSpeed_Config.fall_ms, kMinTransitionMs, 10000.0f);
+    const float cycle_ms = slow_hold_ms + rise_ms + fast_hold_ms + fall_ms;
+    const float direction_sign = (GyroFixedSpeed_Config.direction >= 0) ? 1.0f : -1.0f;
+
+    const float elapsed_ms = static_cast<float>(now - mode_start_tick);
+    const float cycle_pos_ms = fmodf(elapsed_ms, cycle_ms);
+
+    float abs_speed = slow_abs;
+    uint8_t segment = 0U;
+    if (cycle_pos_ms < slow_hold_ms)
+    {
+        segment = 0U;
+        abs_speed = slow_abs;
+    }
+    else if (cycle_pos_ms < (slow_hold_ms + rise_ms))
+    {
+        segment = 1U;
+        const float alpha = (cycle_pos_ms - slow_hold_ms) / rise_ms;
+        abs_speed = slow_abs + (fast_abs - slow_abs) * alpha;
+    }
+    else if (cycle_pos_ms < (slow_hold_ms + rise_ms + fast_hold_ms))
+    {
+        segment = 2U;
+        abs_speed = fast_abs;
+    }
+    else
+    {
+        segment = 3U;
+        const float alpha = (cycle_pos_ms - slow_hold_ms - rise_ms - fast_hold_ms) / fall_ms;
+        abs_speed = fast_abs - (fast_abs - slow_abs) * alpha;
+    }
+
+    const float signed_speed = direction_sign * abs_speed;
+    const uint8_t rotating_vel = channel_to_rotating_vel(signed_speed);
+
+    GyroFixedSpeed_Config.active = 1U;
+    GyroFixedSpeed_Config.segment = segment;
+    GyroFixedSpeed_Config.start_tick = mode_start_tick;
+    GyroFixedSpeed_Config.elapsed_ms = static_cast<uint32_t>(elapsed_ms);
+    GyroFixedSpeed_Config.cycle_pos_ms = cycle_pos_ms;
+    GyroFixedSpeed_Config.speed_norm = signed_speed;
+    GyroFixedSpeed_Config.rotating_vel = rotating_vel;
+
+    return rotating_vel;
 }
 
 // ========================================================================
@@ -123,7 +231,7 @@ void Gimbal_to_Chassis::Update()
     {
         direction.LX = 110;
         direction.LY = 110;
-        direction.Rotating_vel = channel_to_uint8(static_cast<float>(right_stick.x));
+        direction.Rotating_vel = channel_to_rotating_vel(static_cast<float>(right_stick.x));
     }
     else
     {
@@ -132,10 +240,11 @@ void Gimbal_to_Chassis::Update()
 
         if (s1 == Switch::UP && s2 == Switch::MIDDLE)
         {
-            direction.Rotating_vel = channel_to_uint8(0.5f);
+            direction.Rotating_vel = compute_fixed_gyro_rotating_vel(true);
         }
         else
         {
+            compute_fixed_gyro_rotating_vel(false);
             direction.Rotating_vel = 110;
         }
     }
@@ -143,7 +252,9 @@ void Gimbal_to_Chassis::Update()
     // ========== 2. 读取拨轮数据 ==========
     //   GetWheel() 返回 [-1.0, 1.0]
     //   映射到 int8_t [-127, 127]，中值 0
-    float wheel_raw = BSP::Remote::DR16::Instance().GetWheel();
+    float wheel_raw = (s1 == Switch::DOWN && s2 != Switch::DOWN)
+                    ? static_cast<float>(dr16.GetCh2())
+                    : static_cast<float>(dr16.GetWheel());
     direction.wheel = static_cast<int8_t>(wheel_raw * 127.0f);
 
     // ========== 3. 读取 yaw 编码器原始角度 ==========

@@ -51,11 +51,13 @@ constexpr float RAD2DEG = 180.0f / PI;
  */
 struct UnitData
 {
-    float angle;        // 角度(rad)
+    float angle;        // 角度(rad) - 单圈原始值（范围由电机 P_MIN/P_MAX 决定）
     float velocity;     // 角速度(rad/s)
     float current;      // 力矩(N·m)，DM 协议此字段表示力矩而非电流
     float temperature;  // 温度(℃)
     float accel;        // 角加速度(rad/s²)，预留(0填充)
+    float add_angle;    // 多圈累计角度(rad) - 软件累计，可超过 ±2π，用于连续旋转关节
+    float last_angle;   // 上次单圈角度(rad) - 用于检测过零跳变
 };
 
 /**
@@ -79,6 +81,20 @@ public:
     {
         if (id == 0 || id > N) return 0.0f;
         return unit_data_[id - 1].angle;
+    }
+
+    /**
+     * @brief 获取指定电机的多圈累计角度(rad)
+     *
+     * 返回软件累计的多圈角度，可超过 ±2π，适用于连续旋转关节(如 Yaw)。
+     * 对于有限位关节(Pitch/Fold)，由于不会过零跳变，add_angle ≈ angle。
+     *
+     * @param id 1-based 索引(1..N)
+     */
+    float getAddAngleRad(uint8_t id) const
+    {
+        if (id == 0 || id > N) return 0.0f;
+        return unit_data_[id - 1].add_angle;
     }
 
     /**

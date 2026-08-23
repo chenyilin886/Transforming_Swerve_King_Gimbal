@@ -462,6 +462,38 @@ void GimbalUpdate()
     joint_manager.Update(dm4310_yaw_pitch, dm4340_fold);
 
     // ---------------------------------------------------------------
+    // Step 2.05: 提前刷新 IMU 闭环反馈，供 Planner 锁定当前姿态
+    //
+    // 跟随模式下 yaw 走速度环单环，GimbalController.Update() 不会执行
+    // yaw.Compute()，因此 Controller_Data.yaw.feedback_angle 可能停留在
+    // 进入跟随前的旧值。若此时触发收起/展开，Planner 会把 yaw 锁到旧角度，
+    // 表现为 yaw 边回转边收展。
+    //
+    // 在 Planner 之前写入最新反馈，保证变形开始时锁住的是当前 yaw。
+    // ---------------------------------------------------------------
+    {
+        gimbal_controller.imu_online = BSP::IMU::imu.isOnline() ? 1 : 0;
+
+        if (gimbal_controller.imu_online)
+        {
+            gimbal_controller.yaw_imu_angle =
+                -BSP::IMU::imu.getAddYaw() * (3.14159265358979f / 180.0f);
+            gimbal_controller.yaw_imu_velocity =
+                -BSP::IMU::imu.getGyroZ() * (3.14159265358979f / 180.0f);
+            gimbal_controller.pitch_imu_angle =
+                BSP::IMU::imu.getPitch() * (3.14159265358979f / 180.0f);
+
+            Controller_Data.yaw.feedback_angle = gimbal_controller.yaw_imu_angle;
+            Controller_Data.pitch.feedback_angle = gimbal_controller.pitch_imu_angle;
+        }
+        else
+        {
+            Controller_Data.yaw.feedback_angle = joint_manager.yaw.getNormalizedAngle();
+            Controller_Data.pitch.feedback_angle = joint_manager.pitch.getRealAngle();
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Step 2.1: DM 电机离线重使能
     //
     // 【问题根因】
@@ -660,15 +692,19 @@ void GimbalUpdate()
                         // S1 → UP(1) 或 MIDDLE(3)：准备发送变形命令
                         // 【关键】先检查并修复 yaw 控制模式，确保变形期间 yaw 正常控制
 
-                        // 检查当前是否处于跟随模式（yaw 速度环单环）
+                        // 变形期间必须由 Planner 锁定 yaw 角度。
+                        // 不只看当前底盘模式：S1/S2 切换和底盘模式滤波存在时序差，
+                        // Controller_Data 也可能仍保留跟随模式的 cascade_mode=0。
                         auto chassis_mode = BoardComm::ChassisModeManager::Instance().GetCurrentState();
                         bool in_follow_mode = (chassis_mode == BoardComm::ChassisMode::CHASSIS_FOLLOW);
 
-                        if (in_follow_mode && gimbal_controller.yaw.cascade_mode == 0)
+                        if (in_follow_mode ||
+                            gimbal_controller.yaw.cascade_mode == 0 ||
+                            Controller_Data.yaw.cascade_mode == 0 ||
+                            FollowMode_Data.control_mode == 1)
                         {
-                            // 在跟随模式下，yaw 处于速度环单环（cascade_mode=0）
-                            // 变形需要 yaw 进入串级模式，否则 yaw_online 检查失败 → ABORT
-                            // 强制切换到串级模式（从 IMU 当前位置开始）
+                            // 变形需要 yaw 进入串级模式，否则 Step 2.7 因 TRANSITION 跳过，
+                            // GimbalController.Update() 又会因 cascade_mode=0 跳过 yaw 输出。
                             gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
                             Controller_Data.yaw.cascade_mode = 1;
                             Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
@@ -731,8 +767,7 @@ void GimbalUpdate()
     const bool gimbal_deploy_requested =
         (s1_mode == RemoteSwitch::MIDDLE || s1_mode == RemoteSwitch::UP);
     const bool vision_requested =
-        (s1_mode == RemoteSwitch::UP &&
-         (s2_mode == RemoteSwitch::DOWN || s2_mode == RemoteSwitch::UP));
+        (s1_mode == RemoteSwitch::UP && s2_mode == RemoteSwitch::UP);
     const bool vision_ready =
         (vision_requested && VisionComm_Data.online && VisionComm_Data.vision_ready);
 
@@ -905,7 +940,7 @@ void GimbalUpdate()
                 //     下限：-25 deg → -0.506 rad（枪口压下）
                 //   TODO: 根据 Fold 状态动态切换限位（Morphology Manager 阶段）
                 const float pitch_imu_limit_max = 33.0f  * (3.14159265358979f / 180.0f);  
-                const float pitch_imu_limit_min = -25.0f * (3.14159265358979f / 180.0f);  
+                const float pitch_imu_limit_min = -16.0f * (3.14159265358979f / 180.0f);  
                 
                 if (new_target > pitch_imu_limit_max) new_target = pitch_imu_limit_max;
                 if (new_target < pitch_imu_limit_min) new_target = pitch_imu_limit_min;
@@ -994,23 +1029,34 @@ void GimbalUpdate()
 
             // ========== 3. 模式切换平滑处理 ==========
             static uint8_t last_follow_mode = 0;
-            if (is_follow_mode != last_follow_mode) {
-                if (is_follow_mode) {
-                    // 进入跟随：串级→单级，速度从IMU当前速度开始
-                    gimbal_controller.yaw.SwitchToVelocityMode(imu_yaw_vel);
-                    FollowMode_Data.control_mode = 1;  // 标记速度环模式
-                    // 同步到参数结构体，避免 Step 3 覆盖
-                    Controller_Data.yaw.cascade_mode = 0;
-                } else {
-                    // 退出跟随：单级→串级，角度从IMU当前位置开始
-                    gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
-                    FollowMode_Data.control_mode = 0;  // 标记串级PID模式
-                    // 【关键】同步到参数结构体，避免 Step 3 把 cascade_mode=0 同步回去
-                    Controller_Data.yaw.cascade_mode = 1;
-                    Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
-                }
-                last_follow_mode = is_follow_mode;
+            uint8_t follow_now = is_follow_mode ? 1 : 0;
+            bool need_enter_follow =
+                follow_now &&
+                (last_follow_mode == 0 ||
+                 FollowMode_Data.control_mode != 1 ||
+                 gimbal_controller.yaw.cascade_mode != 0 ||
+                 Controller_Data.yaw.cascade_mode != 0);
+            bool need_exit_follow =
+                !follow_now &&
+                (last_follow_mode != 0 ||
+                 FollowMode_Data.control_mode != 0 ||
+                 gimbal_controller.yaw.cascade_mode != 1 ||
+                 Controller_Data.yaw.cascade_mode != 1);
+
+            if (need_enter_follow) {
+                // 进入/恢复跟随：串级→速度环单环，速度从 IMU 当前速度开始。
+                // 变形结束后 yaw 可能被 Planner 强制留在串级锁定，这里按实际模式补偿。
+                gimbal_controller.yaw.SwitchToVelocityMode(imu_yaw_vel);
+                FollowMode_Data.control_mode = 1;
+                Controller_Data.yaw.cascade_mode = 0;
+            } else if (need_exit_follow) {
+                // 退出/恢复非跟随：速度环单环→串级，角度从 IMU 当前位置开始。
+                gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
+                FollowMode_Data.control_mode = 0;
+                Controller_Data.yaw.cascade_mode = 1;
+                Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
             }
+            last_follow_mode = follow_now;
 
             // ========== 4. 摇杆输入处理 ==========
             // 左摇杆 X 轴(ch2)，范围 [-1.0, 1.0]，向右为正
@@ -1123,6 +1169,11 @@ void GimbalUpdate()
     Controller_Data_Unit_t pitch_sync = vision_requested ? Vision_Controller_Data.pitch : Controller_Data.pitch;
     pitch_sync.target_angle = Controller_Data.pitch.target_angle;
     pitch_sync.enabled = Controller_Data.pitch.enabled;
+
+    // Vision mode uses its own PID parameters and forces Yaw inner-loop
+    // velocity feedback back to the motor encoder. Other modes keep the
+    // current IMU-velocity inner-loop behavior.
+    gimbal_controller.yaw_inner_vel_use_encoder = vision_requested ? 1 : 0;
 
     // Yaw轴：非跟随模式 或 变形期间 都要同步
     if (FollowMode_Data.control_mode == 0 || is_transition) {
@@ -1403,14 +1454,14 @@ void GimbalUpdate()
     }
 
     // ---------------------------------------------------------------
-    // Step 7: VOFA+ 波形发送（降频到 500Hz）
-    //   调用 Variable.cpp 中的 VofaSendDebugChannels()
-    //   修改通道配置：只需改 Variable.cpp，无需改此文件
+    // Step 7: Vision USB CDC and VOFA USART6 send on independent links.
+    //   Vision uses USB CDC virtual COM; VOFA uses USART6 DMA.
+    //   Keep both producers alive so enabling vision does not silence VOFA.
     // ---------------------------------------------------------------
     const bool vision_online = VisionComm::Manager::Instance().IsConnected();
     const bool force_send_enabled = (VisionComm_Data.force_send != 0);
 
-    if (vision_online || force_send_enabled)  // Vision online OR force_send: send RCIA frame; otherwise send VOFA.
+    if (vision_online || force_send_enabled)
     {
         static uint8_t vision_counter = 0;
         vision_counter++;
@@ -1420,7 +1471,7 @@ void GimbalUpdate()
             VisionComm::Manager::Instance().Send();
         }
     }
-    else
+
     {
         static uint8_t vofa_counter = 0;
         vofa_counter++;

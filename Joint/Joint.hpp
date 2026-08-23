@@ -242,7 +242,7 @@ public:
         // Pitch: 有限位, direction=-1(抬枪编码器减小), 实测标定值
         pitch.Init(
             0.8825f,     // offset (实测)
-            -0.7927f,    // limit_min (枪口最低, 实测)
+            -0.9496f,    // limit_min (枪口最低, 实测)
              0.6481f,     // limit_max (枪口最高, 实测)
             -1.0f,       // direction
             false        // continuous
@@ -270,18 +270,18 @@ public:
     {
         if (dm4310 != nullptr)
         {
-            // Yaw (DM4310 #1)
+            // Yaw (DM4310 #1) - 使用多圈累计角度，解决小陀螺后编码器不回零问题
             yaw.Update(
-                dm4310->getAngleRad(1),
+                dm4310->getAddAngleRad(1),
                 dm4310->getVelocityRad(1),
                 dm4310->getTorque(1),
                 dm4310->getTemperature(1),
                 dm4310->isConnected(1)
             );
 
-            // Pitch (DM4310 #2)
+            // Pitch (DM4310 #2) - 有限位关节，add_angle ≈ angle
             pitch.Update(
-                dm4310->getAngleRad(2),
+                dm4310->getAddAngleRad(2),
                 dm4310->getVelocityRad(2),
                 dm4310->getTorque(2),
                 dm4310->getTemperature(2),
@@ -291,9 +291,9 @@ public:
 
         if (dm4340 != nullptr)
         {
-            // Fold (DM4340 #1)
+            // Fold (DM4340 #1) - 有限位关节，add_angle ≈ angle
             fold.Update(
-                dm4340->getAngleRad(1),
+                dm4340->getAddAngleRad(1),
                 dm4340->getVelocityRad(1),
                 dm4340->getTorque(1),
                 dm4340->getTemperature(1),

@@ -9,8 +9,8 @@
  *   参考 H_SG_Gimbal 参考工程 ShootTask.cpp 的拨盘控制：
  *     - 位置环(位置式 PID) → 速度目标
  *     - 速度环(位置式 PID) → 力矩 raw 命令
- *     - 单击单发：wheel 上沿触发，每次目标角度 -= angle_per_shot
- *     - 长按连发：wheel 持续超过 long_press_ms，按 fire_hz 累加目标角度
+ *     - 单击单发：wheel 上沿触发，或视觉 fire 脉冲触发，每次目标角度 -= angle_per_shot
+ *     - 长按连发：wheel 持续超过 long_press_ms，或视觉 fire 持续为 1，按 fire_hz 累加目标角度
  *     - 卡弹检测：力矩饱和 + 位置误差持续 → 反转解卡
  *
  * 与参考工程差异：
@@ -72,8 +72,8 @@ namespace BSP::CTRL
  *
  * 状态转移：
  *   DISABLE ──(enabled=1 & safety_ok)──→ STOP
- *   STOP ──(wheel 上沿)──→ SINGLE
- *   SINGLE ──(wheel 持续 > long_press_ms)──→ AUTO
+ *   STOP ──(wheel/fire 上沿)──→ SINGLE
+ *   SINGLE ──(wheel/fire 持续 > long_press_ms)──→ AUTO
  *   SINGLE ──(wheel < threshold)──→ STOP
  *   AUTO ──(wheel < threshold)──→ STOP
  *   任意状态 ──(safety_stop / enabled=0)──→ DISABLE
@@ -83,8 +83,8 @@ enum class DialState : uint8_t
 {
     DISABLE = 0,   ///< 失能：发送零力矩，PID 清零
     STOP    = 1,   ///< 停止：target_angle 保持，PID 把拨盘拉停
-    SINGLE  = 2,   ///< 单发：wheel 上沿瞬间，target_angle -= angle_per_shot
-    AUTO    = 3,   ///< 连发：wheel 持续触发，target_angle -= hz_to_angle(fire_hz) * dt
+    SINGLE  = 2,   ///< 单发：wheel/fire 上沿瞬间，target_angle += angle_per_shot
+    AUTO    = 3,   ///< 连发：wheel/fire 持续触发，target_angle += hz_to_angle(fire_hz) * dt
 };
 
 
@@ -125,6 +125,7 @@ public:
     // === 累计目标角度 ===
     float target_angle_rad;   ///< 目标累计角度(rad, 多圈)
     float feedback_angle_rad; ///< 反馈累计角度(rad, 来自 LK4005.getAddAngleRad)
+    uint8_t target_inited;    ///< 目标是否已初始化(首次使能时贴当前反馈)
 
     // === 卡弹检测字段 ===
     uint8_t  jam_active;         ///< 卡弹解卡中标志(1=正在反转)
@@ -146,6 +147,7 @@ public:
           state(DialState::DISABLE),
           last_wheel_high(0), wheel_high_since_ms(0), last_update_ms(0),
           target_angle_rad(0), feedback_angle_rad(0),
+          target_inited(0),
           jam_active(0), jam_start_ms(0),
           jam_torque_sat_ms(0), jam_pos_err_ms(0),
           vel_target(0), vel_feedback(0),
@@ -164,6 +166,7 @@ public:
         wheel_high_since_ms = 0;
         target_angle_rad   = 0.0f;
         feedback_angle_rad = 0.0f;
+        target_inited      = 0;
         jam_active         = 0;
         jam_start_ms       = 0;
         jam_torque_sat_ms  = 0;
@@ -205,6 +208,8 @@ public:
             status.torque_cmd     = 0;
             status.online         = 0;
             status.state          = (uint8_t)DialState::DISABLE;
+            status.trigger_source = 0;
+            status.vision_fire    = 0;
             return;
         }
 
@@ -221,7 +226,18 @@ public:
         const bool remote_offline = dr16.IsOffline();
         const bool remote_estop   =
             (dr16.GetS1() == Switch::DOWN && dr16.GetS2() == Switch::DOWN);
-        const bool safety_stop = remote_offline || remote_estop;
+        const bool vision_mode_active =
+            (dr16.GetS1() == Switch::UP &&
+             (dr16.GetS2() == Switch::DOWN || dr16.GetS2() == Switch::UP));
+        const bool vision_fire_allowed =
+            (vision_mode_active &&
+             VisionComm_Data.online != 0U &&
+             Friction_Data.left.online != 0U &&
+             Friction_Data.right.online != 0U);
+        const bool vision_fire_high =
+            (vision_fire_allowed && VisionComm_Data.fire != 0U);
+        const bool safety_stop =
+            (remote_offline || remote_estop) && !vision_fire_high;
 
         // Clear_PID 单次触发命令
         if (cfg.clear_pid)
@@ -231,7 +247,7 @@ public:
             cfg.clear_pid = 0;
         }
 
-        if (!cfg.feature_enable || !cfg.enabled || safety_stop)
+        if (!cfg.feature_enable || (!cfg.enabled && !vision_fire_high) || safety_stop)
         {
             // 安全停止路径：清 PID，发送零力矩，保持 LK4005 在线反馈
             position_pid.clearPID();
@@ -239,6 +255,7 @@ public:
             state              = DialState::DISABLE;
             last_wheel_high    = 0;
             wheel_high_since_ms = 0;
+            target_inited      = 0;
             jam_active         = 0;
             jam_torque_sat_ms  = 0;
             jam_pos_err_ms     = 0;
@@ -256,9 +273,23 @@ public:
             status.control_source    = 0;
             status.state             = (uint8_t)DialState::DISABLE;
             status.jam_detected      = 0;
+            status.trigger_source    = 0;
+            status.vision_fire       = 0;
             status.shot_count        = status.shot_count;  // 保留累计
             motor->ctrl_Torque(1, 0);  // 零力矩保反馈
             return;
+        }
+
+        // 首次进入可控状态时，把目标贴到当前反馈，避免继续追上一次的累计目标。
+        if (!target_inited)
+        {
+            target_angle_rad = feedback_angle_rad;
+            position_pid.clearPID();
+            velocity_pid.clearPID();
+            vel_target = 0.0f;
+            vel_error  = 0.0f;
+            pos_error  = 0.0f;
+            target_inited = 1;
         }
 
         // ================================================================
@@ -280,26 +311,35 @@ public:
         //   wheel 范围 [-1, 1]，参考工程用 wheel > 0 触发(向下拨)
         //   本工程也用 wheel > threshold 触发，方向由 wheel_to_speed 正负决定
         //   （wheel_to_speed < 0 表示拨盘反转，对应参考工程 Dail_target_pos -= angle_per_shot）
+        // Vision fire is allowed only while the DR16 is still in vision-enabled
+        // switch positions; leaving vision mode immediately drops this path.
+        // vision fire: one high pulse = one shot; continuous high = auto fire.
         float wheel = (float)dr16.GetWheel();
         float wheel_threshold = clampFloatCfg(cfg.wheel_start_threshold, 0.0f, 0.99f);
         bool  wheel_high = (wheel > wheel_threshold);
+        const bool vision_fire_mode = vision_fire_allowed;
+        const bool trigger_high = vision_fire_mode ? vision_fire_high : wheel_high;
 
         // 状态机转移
         switch (state)
         {
             case DialState::DISABLE:
-                // 首次进入：初始化目标为当前反馈角度（bumpless transfer）
-                if (target_angle_rad == 0.0f && feedback_angle_rad != 0.0f)
-                {
-                    target_angle_rad = feedback_angle_rad;
-                }
                 state = DialState::STOP;
                 last_wheel_high = 0;
                 wheel_high_since_ms = 0;
+                if (trigger_high)
+                {
+                    state = DialState::SINGLE;
+                    wheel_high_since_ms = now_ms;
+                    float angle_per_shot_rad =
+                        cfg.angle_per_shot_deg * (PI / 180.0f);
+                    target_angle_rad += angle_per_shot_rad;
+                    status.shot_count++;
+                }
                 break;
 
             case DialState::STOP:
-                if (wheel_high && !last_wheel_high)
+                if (trigger_high && !last_wheel_high)
                 {
                     // 上沿：触发单发
                     state = DialState::SINGLE;
@@ -320,14 +360,14 @@ public:
                 break;
 
             case DialState::SINGLE:
-                if (!wheel_high)
+                if (!trigger_high)
                 {
                     // 拨轮释放 → 回到 STOP
                     // 注意：不重置 target，单发是"已提交"动作，必须走完 40°
                     state = DialState::STOP;
                     wheel_high_since_ms = 0;
                 }
-                else if (wheel_high && (now_ms - wheel_high_since_ms) >= cfg.long_press_ms)
+                else if (trigger_high && (now_ms - wheel_high_since_ms) >= cfg.long_press_ms)
                 {
                     // 长按时间到 → 切换为连发
                     state = DialState::AUTO;
@@ -335,7 +375,7 @@ public:
                 break;
 
             case DialState::AUTO:
-                if (!wheel_high)
+                if (!trigger_high)
                 {
                     // 拨轮释放 → 回到 STOP
                     // 重置目标到当前反馈：松手即停，不追连发攒下的历史 target
@@ -350,7 +390,7 @@ public:
                     //   方向：与单发一致，使用 += (供弹方向 = feedback 增大方向)
                     //   wheel 满幅映射到 wheel_to_hz 频率
                     float fire_hz = cfg.auto_fire_hz;
-                    if (cfg.wheel_to_hz > 0.0f)
+                    if (!vision_fire_mode && cfg.wheel_to_hz > 0.0f)
                     {
                         // 拨轮值越大，连发越快（线性映射）
                         float wheel_norm =
@@ -365,10 +405,13 @@ public:
                 }
                 break;
         }
-        last_wheel_high = wheel_high ? 1 : 0;
+        last_wheel_high = trigger_high ? 1 : 0;
 
         // 回写拨轮输入到 Dial_Status
-        status.wheel_input = wheel_high ? wheel : 0.0f;
+        status.wheel_input = vision_fire_mode ? 0.0f : (wheel_high ? wheel : 0.0f);
+        status.trigger_source =
+            vision_fire_high ? 2U : ((!vision_fire_mode && wheel_high) ? 1U : 0U);
+        status.vision_fire = vision_fire_mode ? VisionComm_Data.fire : 0U;
         status.state = (uint8_t)state;
 
         // ================================================================

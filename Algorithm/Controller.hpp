@@ -501,6 +501,15 @@ public:
     float yaw_imu_velocity;  // IMU yaw angular velocity feedback, rad/s.
 
     /**
+     * @brief Yaw inner velocity feedback selector.
+     *
+     * 0 = auto: use IMU yaw velocity when IMU is online, otherwise encoder velocity.
+     * 1 = force encoder velocity. Used by vision mode while keeping the outer
+     *     yaw angle loop on IMU feedback.
+     */
+    uint8_t yaw_inner_vel_use_encoder;
+
+    /**
      * @brief IMU 在线标志
      *
      * 1 = IMU 在线 → Yaw 外环使用 IMU 反馈（传感器闭环）
@@ -626,6 +635,7 @@ public:
         // IMU 传感器闭环初始化
         yaw_imu_angle   = 0.0f;    // 由 GimbalUpdate 写入 IMU addYaw(deg→rad, 取负)
         yaw_imu_velocity = 0.0f;   // 由 GimbalUpdate 写入 IMU gyroZ(deg/s→rad/s, 取负)
+        yaw_inner_vel_use_encoder = 0;  // 默认内环速度自动选择：IMU在线用IMU，离线回退编码器
         pitch_imu_angle = 0.0f;    // 由 GimbalUpdate 写入 IMU pitch(deg→rad, 不取负)
         imu_online      = 0;        // 默认 IMU 离线，GimbalUpdate 中根据实际状态设置
         yaw_fb_source   = 0;        // 默认编码器反馈
@@ -650,7 +660,9 @@ public:
      *     优势：云台世界坐标系绝对航向 → 自动抗底盘扰动
      *   - IMU 离线(imu_online=0)：外环反馈回退到编码器 getNormalizedAngle()
      *     安全：编码器闭环虽不能抗底盘扰动，但保证不会疯车
-     *   - 内环速度反馈：IMU 在线用 yaw_imu_velocity，IMU 离线回退编码器 getVelocity()
+     *   - 内环速度反馈：
+     *     yaw_inner_vel_use_encoder=0 时，IMU 在线用 yaw_imu_velocity，离线回退编码器 getVelocity()
+     *     yaw_inner_vel_use_encoder=1 时，强制用编码器 getVelocity()（视觉模式）
      *
      * Pitch IMU 传感器闭环：
      *   - IMU 在线(imu_online=1)：外环反馈 = pitch_imu_angle（IMU getPitch, deg→rad）
@@ -672,7 +684,9 @@ public:
         //   外环角度反馈：
         //     IMU 在线 → yaw_imu_angle（IMU addYaw, 取负+deg→rad, 连续累加支持多圈）
         //     IMU 离线 → jm.yaw.getNormalizedAngle()（编码器回退, [-π, π]）
-        //   内环速度反馈：IMU 在线用 yaw_imu_velocity，离线回退 jm.yaw.getVelocity()
+        //   内环速度反馈：
+        //     默认 IMU 在线用 yaw_imu_velocity，离线回退 jm.yaw.getVelocity()
+        //     视觉模式可强制使用 jm.yaw.getVelocity()
         //   连续旋转：continuous=1 → Compute() 中 wrapToPi 最短路径处理
         //
         //   【跟随模式特殊处理】
@@ -683,8 +697,20 @@ public:
         {
             // 检查是否在跟随模式（速度环单环）
             if (yaw.cascade_mode == 0) {
-                // 跟随模式：已在GimbalInit中直接控制，此处仅更新反馈源标志
-                yaw_fb_source = imu_online ? 2 : 0;  // 2=IMU速度环模式
+                // 跟随模式：已在GimbalInit中直接控制，此处同步反馈状态，
+                // 避免 Planner/Watch 读到进入速度环前的旧 yaw feedback。
+                if (jm.yaw.isOnline() && imu_online)
+                {
+                    yaw.feedback_angle = yaw_imu_angle;
+                    yaw.vel_feedback = yaw_imu_velocity;
+                    yaw_fb_source = 2;  // 2=IMU速度环模式
+                }
+                else
+                {
+                    yaw.feedback_angle = jm.yaw.getNormalizedAngle();
+                    yaw.vel_feedback = jm.yaw.getVelocity();
+                    yaw_fb_source = 0;
+                }
             } else {
                 // 串级PID模式：正常计算
                 float fb;
@@ -705,7 +731,9 @@ public:
                     yaw_fb_source = 0;  // 标记当前使用编码器反馈
                 }
 
-                float vel = imu_online ? yaw_imu_velocity : jm.yaw.getVelocity();
+                float vel = (imu_online && !yaw_inner_vel_use_encoder)
+                          ? yaw_imu_velocity
+                          : jm.yaw.getVelocity();
                 float tgt = yaw.target_angle;
                 float torque = yaw.Compute(tgt, fb, vel);
                 dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.yaw.getConfig().direction);

@@ -653,6 +653,8 @@ typedef struct
  *   pid_p/i/d        : 速度环 P/I/D 项(raw)
  *   torque_cmd       : 最终发送的 LK raw 命令
  *   control_source   : 0=零力矩, 1=双环PID, 2=raw_override
+ *   trigger_source   : 0=none, 1=wheel manual, 2=vision fire
+ *   vision_fire      : 当前视觉 fire 电平
  *   jam_detected     : 卡弹检测触发标志(1=正在解卡)
  *   shot_count       : 单发累计计数(Watch 观察发弹数)
  *   online           : LK4005 在线状态
@@ -673,6 +675,8 @@ typedef struct
     float    pid_d;                 // 速度环 D 项(raw)
     int16_t  torque_cmd;            // 最终发送的 LK raw 命令
     uint8_t  control_source;        // 0=零力矩, 1=双环PID, 2=raw_override
+    uint8_t  trigger_source;        // 0=none, 1=wheel manual, 2=vision fire
+    uint8_t  vision_fire;           // 当前视觉 fire 电平
     uint8_t  jam_detected;          // 卡弹检测触发标志
     uint32_t shot_count;            // 单发累计计数
     uint8_t  online;                // LK4005 在线状态
@@ -734,6 +738,8 @@ typedef struct
     uint8_t  state;                  // 当前状态: 0=DISABLE,1=STOP,3=AUTO
     uint8_t  safety_ok;              // 安全条件: 1=可控制, 0=需失能
     uint8_t  friction_enable;        // 摩擦轮使能(0=停, 1=转)
+    uint8_t  trigger_source;         // 0=none, 1=wheel manual, 2=vision fire
+    uint8_t  vision_fire;            // 当前视觉 fire 电平
     uint8_t  friction_online_l;      // 左摩擦轮在线(预留)
     uint8_t  friction_online_r;      // 右摩擦轮在线(预留)
     float    friction_vel_l;         // 左摩擦轮实际转速(RPM, 预留)
@@ -826,6 +832,38 @@ typedef struct
     uint8_t rx_frame1_ready;        // 帧1 接收就绪标志
     uint32_t last_rx_time;          // 最后接收时间戳(ms)
 } BoardComm_Data_t;
+
+// ========================================================================
+// Gyro fixed-translation speed config (Watch tunable)
+// ========================================================================
+/**
+ * @brief Watch tunable speed profile for S1=UP, S2=MIDDLE
+ *
+ * slow_abs / fast_abs are normalized absolute values in [0.0, 1.0].
+ * The waveform is slow hold -> fast rise -> fast hold -> fast fall.
+ * The final signed speed stays on one side of 110 by clamping in code.
+ */
+typedef struct
+{
+    // --- Tunable params ---
+    uint8_t enable;          // 1=profile speed, 0=stop gyro speed
+    int8_t  direction;       // 1 => above 110, -1 => below 110
+    float   slow_abs;        // normalized slow speed [0.0, 1.0]
+    float   fast_abs;        // normalized fast speed [0.0, 1.0]
+    float   slow_hold_ms;    // slow-speed hold duration
+    float   fast_hold_ms;    // fast-speed hold duration
+    float   rise_ms;         // slow -> fast transition duration
+    float   fall_ms;         // fast -> slow transition duration
+
+    // --- Runtime observation ---
+    uint8_t  active;         // 1 while S1=UP and S2=MIDDLE
+    uint8_t  segment;        // 0=slow hold, 1=rise, 2=fast hold, 3=fall
+    uint32_t start_tick;     // tick captured when entering this mode
+    uint32_t elapsed_ms;     // elapsed time since entering this mode
+    float    cycle_pos_ms;   // position inside current profile cycle
+    float    speed_norm;     // signed normalized speed sent to mapping
+    uint8_t  rotating_vel;   // final CAN value [0, 220]
+} GyroFixedSpeed_Config_t;
 
 // ========================================================================
 // 底盘模式状态机调试数据（Stage06: 板间通信 - 模式状态机）
@@ -957,6 +995,7 @@ extern Shoot_Config_t     Shoot_Config;      // 发射机构整体配置(Watch�
 extern Shoot_Status_t     Shoot_Status;      // 发射机构整体状态(Watch观察)
 extern Friction_Data_t    Friction_Data;     // 摩擦轮电机反馈(Watch观察)
 extern BoardComm_Data_t   BoardComm_Data;    // 板间通信状态(Stage03)
+extern volatile GyroFixedSpeed_Config_t GyroFixedSpeed_Config; // S1=UP,S2=MIDDLE gyro speed(Watch tunable)
 extern ChassisModeDebug_t ChassisModeDebug;  // 底盘模式状态机调试数据(Stage06)
 extern VisionComm_Data_t  VisionComm_Data;   // 视觉通信数据(Stage07)
 

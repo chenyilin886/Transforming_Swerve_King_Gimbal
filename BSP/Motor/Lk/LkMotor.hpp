@@ -33,7 +33,7 @@
  *     data[0]:    cmd(命令字节,标识本帧类型)
  *     data[1]:    temperature(°C)
  *     data[2-3]:  current(int16_t, little-endian, 反馈电流原始值)
- *     data[4-5]:  velocity(int16_t, little-endian, 电机端 RPM)
+ *     data[4-5]:  velocity(int16_t, little-endian, 1 dps/LSB)
  *     data[6-7]:  angle(uint16_t, little-endian, 输出端编码器计数)
  *
  *   状态1响应帧(0x9A/0x9B 响应):
@@ -87,7 +87,7 @@ struct LKParameters
 
     // --- 派生转换系数(构造时自动计算) ---
     float encoder_to_deg;           // 编码器计数 → 度(输出端)
-    float rpm_to_radps;             // 电机端 RPM → 输出端 rad/s
+    float dps_to_output_radps;      // speed feedback dps -> output-side rad/s
     float current_to_torque;        // 反馈电流原始值 → 输出端力矩(N·m)
     float feedback_to_current;      // 反馈电流原始值 → 实际电流(A)
 
@@ -106,10 +106,9 @@ struct LKParameters
         // 编码器计数 → 输出端角度(度): 360° / resolution
         encoder_to_deg = 360.0f / encoder_resolution;
 
-        // 电机端 RPM → 输出端 rad/s: (1/减速比) × (2π/60)
-        //   电机端 RPM ÷ 减速比 = 输出端 RPM
-        //   输出端 RPM × (2π/60) = 输出端 rad/s
-        rpm_to_radps = (1.0f / reduction_ratio) * (2.0f * PI / 60.0f);
+        // LK feedback speed is 1 dps/LSB. Convert motor-side dps to
+        // output-side rad/s through the reducer.
+        dps_to_output_radps = (1.0f / reduction_ratio) * DEG2RAD;
 
         // 反馈电流原始值 → 输出端力矩(N·m)
         //   力矩 = 电流 × 力矩常数 × 减速比
@@ -136,7 +135,7 @@ struct LKFeedback
     uint8_t  cmd;           // 命令字节(标识本帧类型: 0xA1=力矩反馈, 0x9A=状态1响应, ...)
     uint8_t  temperature;   // 温度(°C, 直接值)
     int16_t  current;       // 电流原始值(反馈电流, ±2048 对应 ±current_max A)
-    int16_t  velocity;      // 速度原始值(电机端 RPM)
+    int16_t  velocity;      // Speed raw value, 1 dps/LSB.
     uint16_t angle;         // 角度原始值(输出端编码器计数, 0~65535)
 };
 
@@ -495,7 +494,7 @@ protected:
      *
      * 转换公式：
      *   angle(rad)     = raw_angle × (360/65536) × (π/180)   [电机端单圈角度, 0~2π]
-     *   velocity(rad/s)= raw_velocity × (1/减速比) × (2π/60) [输出端角速度]
+     *   velocity(rad/s)= raw_velocity × (1/减速比) × (π/180) [输出端角速度]
      *   torque(N·m)    = raw_current × 力矩转换系数          [输出端力矩]
      *   temperature(°C)= raw_temperature                      [直接值]
      *
@@ -523,8 +522,8 @@ protected:
         float curr_angle = fb.angle * params_.encoder_to_deg * DEG2RAD;
         this->unit_data_[i].angle = curr_angle;
 
-        // 角速度: 电机端 RPM → 输出端 rad/s
-        this->unit_data_[i].velocity = fb.velocity * params_.rpm_to_radps;
+        // Angular velocity: motor-side dps feedback -> output-side rad/s.
+        this->unit_data_[i].velocity = fb.velocity * params_.dps_to_output_radps;
 
         // 力矩: 反馈电流原始值 → 输出端力矩(N·m)
         this->unit_data_[i].current = fb.current * params_.current_to_torque;

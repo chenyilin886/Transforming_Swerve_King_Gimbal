@@ -69,41 +69,12 @@ pitch还没有重新标定 但是pitch使用imu值 目前没有影响
 
 卡弹检测
 
- 后续要移植到我的工程中 先和我讨论实现方案 不做修改
-我的摩擦轮电机和参考工程一样 我设置一个是ID1 一个是ID2，我不使用ADRC，我使用PID控制，热量管理先不实现 分析参考工程的摩擦轮是如何实现的接在CAN1
 
-停止策略 friction_enable=0 时直接发 0 电流 + 清 PID
-
-板间通信
-### 方案 A：分步实现（推荐）
-```
-阶段 1：云台端通信模块开发
-├── 创建通信数据结构定义
-├── 创建 GimbalToChassis 类框架
-├── 创建 CommunicationTask 框架
-└── 验证云台发送功能
-
-阶段 2：底盘端通信模块开发
-├── 复制通信数据结构定义
-├── 创建 ChassisToGimbal 类框架
-├── 创建 CommunicationTask 框架
-└── 验证底盘发送功能
-
-阶段 3：联合调试
-├── 云台和底盘 CAN2 连接
-├── 验证双向通信
-└── 功能测试
-
-阶段 4：集成到主控制逻辑
-├── 底盘控制逻辑修改
-├── 裁判系统数据集成
-└── 整车联调
-```
-
-小陀螺实现要改pitch的限位
- 
- 遥控器滤波的取决
-
- imu执行频率现在是1000Hz
-
- 加不加低通滤波： IMU速度是否噪声明显
+APP::Vofa.Send6Floats(
+        VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
+        IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
+        VisionComm_Data.pitch_angle,            // CH2(通道3): 视觉 Pitch 目标
+        IMU_Data.pitch,                         // CH3(通道4): IMU Pitch 反馈
+        Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
+        Friction_Data.right.velocity_rpm        // CH5(通道6): 右摩擦轮转速(RPM)
+    );
