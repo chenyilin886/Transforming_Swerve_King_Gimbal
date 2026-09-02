@@ -15,7 +15,7 @@
  *   - 16字节数据分两帧传输（0x205/0x206 发送，0x207/0x208 接收）
  *
  * 数据流（发送）：
- *   遥控器DR16 右摇杆 / Joint_Data.yaw
+ *   遥控器DR16 左摇杆 / Joint_Data.yaw
  *     → Gimbal_to_Chassis::Update()
  *       → 填充 direction / chassis_mode 结构体
  *         → Data_send() → CAN2 发送 0x205/0x206
@@ -67,7 +67,7 @@ namespace BoardComm
  * @brief 方向控制数据
  *
  * 字段说明：
- *   LX/LY             : 遥控器右摇杆（X/Y轴），范围 0-220，中值 110
+ *   LX/LY             : 遥控器左摇杆（X/Y轴），范围 0-220，中值 110
  *   Rotating_vel      : 小陀螺模式速度（范围 0-220，中值 110）
  *   Yaw_encoder_angle_err : yaw 编码器原始角度（rad），底盘端自行计算误差
  *   target_offset_angle    : 目标偏角（预留）
@@ -79,8 +79,8 @@ namespace BoardComm
  */
 struct __attribute__((packed)) Direction_t
 {
-    uint8_t LX;                     // 右摇杆X通道（0-220，中值110）
-    uint8_t LY;                     // 右摇杆Y通道（0-220，中值110）
+    uint8_t LX;                     // 左摇杆X通道（0-220，中值110）
+    uint8_t LY;                     // 左摇杆Y通道（0-220，中值110）
     uint8_t Rotating_vel;           // 小陀螺速度（0-220，中值110）
     float Yaw_encoder_angle_err;    // yaw 编码器原始角度（rad），底盘端自行计算误差
     uint8_t target_offset_angle;    // 目标偏角（预留）
@@ -204,7 +204,7 @@ public:
      * @brief 更新发送数据（上层调用）
      *
      * 功能：
- *   1. 读取 DR16 遥控器右摇杆数据
+ *   1. 读取 DR16 遥控器左摇杆数据
  *   2. 读取 DR16 拨轮数据
  *   3. 读取 Joint_Data.yaw 角度（用于读取 yaw 编码器原始角度）
  *   4. 填充 direction / chassis_mode 结构体

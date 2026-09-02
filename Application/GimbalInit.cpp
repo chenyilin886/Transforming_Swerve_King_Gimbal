@@ -806,17 +806,17 @@ void GimbalUpdate()
     }
 
     // ---------------------------------------------------------------
-    // Step 2.6: 遥控器左摇杆Y轴 → Pitch 目标角度(速度积分模式)
+    // Step 2.6: 遥控器右摇杆Y轴 → Pitch 目标角度(速度积分模式)
     //
     // 【原理】
     //   任务要求："摇杆往上拨 pitch 往上抬，往下拨往下抬，归中时停止运动"
     //   "归中时停止运动" 决定必须采用【速度积分】而非位置映射：
-    //     - 位置映射：ch3 → target_angle，归中时 target 回到中点 → 会运动 ✗
-    //     - 速度积分：ch3 → target_velocity，target += v·dt
+    //     - 位置映射：ch1 → target_angle，归中时 target 回到中点 → 会运动 ✗
+    //     - 速度积分：ch1 → target_velocity，target += v·dt
     //                 归中时 v=0 → target 保持 → 停止运动 ✓
     //
     // 【数据流】
-    //   DR16.ch3 (-1~1)
+    //   DR16.ch1 (-1~1)
     //     ↓ 死区过滤(消除摇杆归中噪声 ±0.05)
     //     ↓ × max_speed (1.0 rad/s)  → target_velocity (rad/s)
     //     ↓ × dt (0.001s, 1kHz)       → delta_angle (rad)
@@ -832,11 +832,11 @@ void GimbalUpdate()
     //   - 复用现有串级 PID，零改动
     //
     // 【方向映射】(用户确认)
-    //   ch3 > 0 (摇杆向上) → target_angle 增大 → pitch 上抬(枪口抬高)
-    //   ch3 < 0 (摇杆向下) → target_angle 减小 → pitch 下抬
+    //   ch1 > 0 (摇杆向上) → target_angle 增大 → pitch 上抬(枪口抬高)
+    //   ch1 < 0 (摇杆向下) → target_angle 减小 → pitch 下抬
     //
     // 【离线行为】(用户确认)
-    //   DR16 离线时摇杆自动归零(ch3=0) → target_velocity=0 → target 保持
+    //   DR16 离线时摇杆自动归零(ch1=0) → target_velocity=0 → target 保持
     //   PID 维持 pitch 在最后位置，安全且符合机器人逻辑
     //
     // 【参数】(Watch 可在线调整: 见下方常量, 后续可提取到 Variable.hpp)
@@ -846,7 +846,7 @@ void GimbalUpdate()
     //
     // 【调试观察点】
     //   Watch 中添加：
-    //   - DR16_Data.ch3                       原始摇杆值
+    //   - DR16_Data.ch1                       原始摇杆值
     //   - Controller_Data.pitch.target_angle  积分后的目标角度
     //   - Controller_Data.pitch.feedback_angle 实际角度(应跟随 target)
     //   - Joint_Data.pitch.config.limit_min/max 限位值
@@ -899,22 +899,22 @@ void GimbalUpdate()
         {
             auto &dr16 = BSP::Remote::DR16::Instance();
 
-            // 左摇杆 Y 轴(ch3)，范围 [-1.0, 1.0]，向上为正
-            float ch3 = (float)dr16.GetCh3();
+            // 右摇杆 Y 轴(ch1)，范围 [-1.0, 1.0]，向上为正
+            float ch1 = (float)dr16.GetCh1();
 
         // 死区过滤：消除摇杆归中时的噪声(约 ±0.03~0.05)
         //   归中时强制速度为 0，保证"归中即停止"
         const float dead_zone  = 0.05f;
-        if (ch3 > -dead_zone && ch3 < dead_zone)
+        if (ch1 > -dead_zone && ch1 < dead_zone)
         {
-            ch3 = 0.0f;
+            ch1 = 0.0f;
         }
 
-        // 速度映射：ch3 × max_speed → 目标角速度(rad/s)
+        // 速度映射：ch1 × max_speed → 目标角速度(rad/s)
         //   max_speed = 1.0 rad/s：满幅拨杆 1 秒转动 1 rad ≈ 57°
         //   慢速起点，调参稳定后可增大到 2~3 rad/s
         const float max_speed  = 2.8f;
-        float target_velocity  = ch3 * max_speed;
+        float target_velocity  = ch1 * max_speed;
 
         // 积分步长：GimbalUpdate 1kHz → dt = 0.001s
         const float dt          = 0.001f;
@@ -977,9 +977,9 @@ void GimbalUpdate()
     //     * IMU位置闭环，保持绝对航向
     //
     // 【数据流】
-    //   DR16.ch2 → 死区过滤 → 模式判断
-    //     ├─ 跟随模式: ch2*max_speed → 速度目标 → 速度环PID → 力矩
-    //     └─ 其他模式: ch2*max_speed*dt → 角度积分 → 串级PID → 力矩
+    //   DR16.ch0 → 死区过滤 → 模式判断
+    //     ├─ 跟随模式: ch0*max_speed → 速度目标 → 速度环PID → 力矩
+    //     └─ 其他模式: ch0*max_speed*dt → 角度积分 → 串级PID → 力矩
     //
     // 【平滑切换】
     //   模式切换时：
@@ -1059,18 +1059,18 @@ void GimbalUpdate()
             last_follow_mode = follow_now;
 
             // ========== 4. 摇杆输入处理 ==========
-            // 左摇杆 X 轴(ch2)，范围 [-1.0, 1.0]，向右为正
-            float ch2 = (float)dr16.GetCh2();
+            // 右摇杆 X 轴(ch0)，范围 [-1.0, 1.0]，向右为正
+            float ch0 = (float)dr16.GetCh0();
 
             // 死区过滤：消除摇杆归中时的噪声(约 ±0.03~0.05)
             const float dead_zone = 0.05f;
-            if (ch2 > -dead_zone && ch2 < dead_zone) {
-                ch2 = 0.0f;
+            if (ch0 > -dead_zone && ch0 < dead_zone) {
+                ch0 = 0.0f;
             }
 
-            // 速度映射：ch2 × max_yaw_speed → 目标角速度(rad/s)
+            // 速度映射：ch0 × max_yaw_speed → 目标角速度(rad/s)
             const float max_yaw_speed = 2.8f;  // rad/s
-            float target_velocity = ch2 * max_yaw_speed;
+            float target_velocity = ch0 * max_yaw_speed;
 
             // ========== 5. 控制计算（模式自适应） ==========
             // 仅当 yaw 关节在线时才控制
@@ -1339,6 +1339,18 @@ void GimbalUpdate()
 
         // 离线状态（0=离线, 1=在线）
         DR16_Data.online = dr16.IsOffline() ? 0 : 1;
+
+        // 调试状态（Watch 里直接看接收是否正常）
+        DR16_Debug_Data.rx_event_count = dr16.GetRxEventCount();
+        DR16_Debug_Data.valid_frame_count = dr16.GetValidFrameCount();
+        DR16_Debug_Data.invalid_frame_count = dr16.GetInvalidFrameCount();
+        DR16_Debug_Data.last_rx_size = dr16.GetLastRxSize();
+        DR16_Debug_Data.last_rx_tick = dr16.GetLastRxTick();
+        DR16_Debug_Data.keyboard_mode =
+            (dr16.GetS1() == BSP::Remote::DR16::Switch::MIDDLE &&
+             dr16.GetS2() == BSP::Remote::DR16::Switch::MIDDLE)
+                ? 1
+                : 0;
     }
 
     // ---------------------------------------------------------------
@@ -1489,13 +1501,13 @@ void GimbalUpdate()
     //   接收处理：0x207/0x208（在 CanCallback.cpp 中断中处理）
     //
     // 【数据流】
-    //   DR16 遥控器右摇杆 → BoardComm::Update() → direction.LX/LY
+    //   DR16 遥控器左摇杆 → BoardComm::Update() → direction.LX/LY
     //   Joint_Data.yaw → CalcuGimbalToChassisAngle() → direction.Yaw_encoder_angle_err
     //   direction/chassis_mode/ui_list → Data_send() → CAN2 发送
     //
     // 【调试观察点】
     //   Watch 添加 BoardComm_Data：
-    //     - LX/LY：遥控器右摇杆（0-220，中值110）
+    //     - LX/LY：遥控器左摇杆（0-220，中值110）
     //     - Yaw_encoder_angle_err：云台-底盘角度误差
     //     - launch_speed：发射速度（底盘返回）
     //     - booster_now_heat：当前热量（底盘返回）

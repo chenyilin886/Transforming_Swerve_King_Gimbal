@@ -207,13 +207,13 @@ static bool send_can_frame_retry(HAL::CAN::ICanDevice &can_dev,
  * @brief 更新发送数据
  *
  * 实现步骤：
- *   1. 读取 DR16 遥控器左右摇杆数据 → direction.LX/LY
+ *   1. 读取 DR16 遥控器左摇杆数据 → direction.LX/LY
  *   2. 读取 DR16 拨轮数据 → direction.wheel
  *   3. 读取 yaw 编码器原始角度 → direction.Yaw_encoder_angle_err
  *   4. 填充模式状态（从状态机获取）→ chassis_mode
  *
  * 数据源：
- *   - 遥控器：BSP::Remote::DR16::Instance().GetRemoteRight()
+ *   - 遥控器：BSP::Remote::DR16::Instance().GetRemoteLeft()
  *   - 拨轮：BSP::Remote::DR16::Instance().GetWheel()
  *   - 云台角度：Joint_Data.yaw.real_angle
  */
@@ -223,7 +223,7 @@ void Gimbal_to_Chassis::Update()
     auto &dr16 = BSP::Remote::DR16::Instance();
     using Switch = BSP::Remote::DR16::Switch;
 
-    auto right_stick = dr16.GetRemoteRight();
+    auto left_stick = dr16.GetRemoteLeft();
     auto s1 = dr16.GetS1();
     auto s2 = dr16.GetS2();
 
@@ -231,12 +231,12 @@ void Gimbal_to_Chassis::Update()
     {
         direction.LX = 110;
         direction.LY = 110;
-        direction.Rotating_vel = channel_to_rotating_vel(static_cast<float>(right_stick.x));
+        direction.Rotating_vel = channel_to_rotating_vel(static_cast<float>(left_stick.x));
     }
     else
     {
-        direction.LX = channel_to_uint8(static_cast<float>(right_stick.x));
-        direction.LY = channel_to_uint8(static_cast<float>(right_stick.y));
+        direction.LX = channel_to_uint8(static_cast<float>(left_stick.x));
+        direction.LY = channel_to_uint8(static_cast<float>(left_stick.y));
 
         if (s1 == Switch::UP && s2 == Switch::MIDDLE)
         {

@@ -485,6 +485,15 @@ DR16_Data_t DR16_Data = {
     .online           = 0,     // 初始离线（0=离线, 1=在线）
 };
 
+DR16_Debug_Data_t DR16_Debug_Data = {
+    .rx_event_count = 0,
+    .valid_frame_count = 0,
+    .invalid_frame_count = 0,
+    .last_rx_size = 0,
+    .last_rx_tick = 0,
+    .keyboard_mode = 0,
+};
+
 // ========================================================================
 // IMU 数据全局实例（Stage03 接入传感器）
 // ========================================================================

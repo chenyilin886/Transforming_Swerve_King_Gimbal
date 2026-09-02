@@ -185,7 +185,7 @@ typedef struct
  *   独立结构体管理跟随模式参数，职责清晰，易于扩展。
  *
  * 数据流：
- *   DR16.ch2 → 死区过滤 → 速度目标(target_velocity)
+ *   DR16.ch0 → 死区过滤 → 速度目标(target_velocity)
  *     ↓
  *   IMU.getGyroZ() → IMU角速度反馈(imu_velocity)
  *     ↓
@@ -429,6 +429,16 @@ typedef struct
     // --- 离线状态 ---
     uint8_t online;            // 遥控器在线状态(0=离线, 1=在线)
 } DR16_Data_t;
+
+typedef struct
+{
+    uint32_t rx_event_count;   // UART3 空闲中断触发次数
+    uint32_t valid_frame_count;// 18字节有效帧次数
+    uint32_t invalid_frame_count;// 非法长度/异常帧次数
+    uint16_t last_rx_size;     // 最近一次接收长度
+    uint32_t last_rx_tick;     // 最近一次接收时刻
+    uint8_t keyboard_mode;     // 键鼠模式标志(1=中位键鼠)
+} DR16_Debug_Data_t;
 
 // ========================================================================
 // IMU 数据结构（Stage03 接入传感器）
@@ -807,7 +817,7 @@ typedef struct
  *   - rx_refree：接收数据（底盘返回的裁判系统数据）
  *
  * Watch 观察项：
- *   - tx_direction.LX/LY：遥控器右摇杆映射值（0-220）
+ *   - tx_direction.LX/LY：遥控器左摇杆映射值（0-220）
  *   - tx_direction.Yaw_encoder_angle_err：Yaw 编码器原始角度(rad)，底盘端自行计算误差
  *   - rx_refree.launch_speed：发射速度
  *   - rx_refree.booster_now_heat：当前热量
@@ -986,6 +996,7 @@ extern FollowMode_Data_t  FollowMode_Data;   // 底盘跟随模式专用数据(�
 extern Transform_Config_t  Transform_Config;  // 变形规划器配置(Stage05)
 extern Transform_Status_t  Transform_Status;  // 变形规划器状态(Stage05)
 extern DR16_Data_t        DR16_Data;         // 遥控器状态(Stage04)
+extern DR16_Debug_Data_t  DR16_Debug_Data;   // 遥控器调试状态(Stage04)
 extern IMU_Data_t         IMU_Data;          // IMU 姿态状态(Stage03 接入传感器)
 extern Remote_State_t     Remote_State;      // 遥控器状态机(急停+展开/收起)
 extern LK4005_Data_t      LK4005_Data;       // LK4005 电机反馈状态

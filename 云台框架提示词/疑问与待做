@@ -78,3 +78,6 @@ APP::Vofa.Send6Floats(
         Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
         Friction_Data.right.velocity_rpm        // CH5(通道6): 右摩擦轮转速(RPM)
     );
+
+
+    挡位预改变 S1中 S2中的时候摇杆可以控制左右小陀螺，S1中 S2上的时候固定小陀螺旋转，实现小陀螺平移

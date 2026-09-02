@@ -287,6 +287,12 @@ namespace BSP::Remote
          */
         inline double GetWheel() const { return wheel_; }
 
+        inline uint32_t GetRxEventCount() const { return rx_event_count_; }
+        inline uint32_t GetValidFrameCount() const { return valid_frame_count_; }
+        inline uint32_t GetInvalidFrameCount() const { return invalid_frame_count_; }
+        inline uint16_t GetLastRxSize() const { return last_rx_size_; }
+        inline uint32_t GetLastRxTick() const { return last_rx_tick_; }
+
     private:
         /**
          * @brief 私有构造函数（单例模式）
@@ -368,25 +374,25 @@ namespace BSP::Remote
     private:
         // ========== 数据成员 ==========
 
-        uint8_t rx_buffer_[DR16_MAX_LEN];  // DMA接收缓冲区
+        uint8_t rx_buffer_[DR16_MAX_LEN];  // DMA receive buffer
+        uint64_t data_part1_;
+        uint64_t data_part2_;
+        uint64_t data_part3_;
 
-        // 原始数据存储（64位对齐，方便位域解析）
-        uint64_t data_part1_;  // Part1：摇杆+开关
-        uint64_t data_part2_;  // Part2：鼠标
-        uint64_t data_part3_;  // Part3：键盘+拨轮
-
-        // 解析后的状态数据（便于Watch观察）
-        Vector  joystick_right_;     // 右摇杆值
-        Vector  joystick_left_;       // 左摇杆值
-        Vector  mouse_vel_;           // 鼠标速度
-        Switch  switch_right_;        // 右开关状态
-        Switch  switch_left_;         // 左开关状态
-        Mouse   mouse_;               // 鼠标按键状态
-        Keyboard keyboard_;           // 键盘按键状态
-        double  wheel_;               // 拨轮值
-
-        // 离线检测
-        WATCH_STATE::StateWatch remote_state_watch_;  // 遥控器离线检测（50ms超时）
+        Vector  joystick_right_;
+        Vector  joystick_left_;
+        Vector  mouse_vel_;
+        Switch  switch_right_;
+        Switch  switch_left_;
+        Mouse   mouse_;
+        Keyboard keyboard_;
+        double  wheel_;
+        WATCH_STATE::StateWatch remote_state_watch_;
+        volatile uint32_t rx_event_count_ = 0;
+        volatile uint32_t valid_frame_count_ = 0;
+        volatile uint32_t invalid_frame_count_ = 0;
+        volatile uint16_t last_rx_size_ = 0;
+        volatile uint32_t last_rx_tick_ = 0;
     };
 
 }  // namespace BSP::Remote

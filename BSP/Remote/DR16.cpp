@@ -176,39 +176,24 @@ namespace BSP::Remote
      */
     void DR16::Parse(UART_HandleTypeDef *huart, uint16_t Size)
     {
-        // 仅处理DR16串口且长度正确
+        ++rx_event_count_;
+        last_rx_size_ = Size;
+        last_rx_tick_ = HAL_GetTick();
+
         if (huart == &DR16_UART && Size == DR16_MAX_LEN)
         {
-            // 保存原始数据
+            ++valid_frame_count_;
             SaveData(rx_buffer_);
-
-            // 解析数据并更新状态
             UpdateStatus();
-
-            // 更新时间戳（防止误判离线）
             remote_state_watch_.UpdateLastTime();
         }
+        else
+        {
+            ++invalid_frame_count_;
+        }
 
-        // 重新启动DMA接收（等待下一包）
         HAL_UARTEx_ReceiveToIdle_DMA(&DR16_UART, rx_buffer_, DR16_MAX_LEN);
     }
-
-    /**
-     * @brief 清除UART ORE（Overrun Error）错误标志
-     * @param huart UART句柄
-     * @param pData 缓冲区指针
-     * @param Size 数据大小
-     *
-     * 当UART接收溢出（新数据覆盖未读取的旧数据）时，会产生ORE错误。
-     * 必须清除错误标志，否则UART会一直处于错误状态，无法继续接收。
-     *
-     * 处理流程：
-     *   1. 检测ORE标志
-     *   2. 清除ORE标志
-     *   3. 重新启动DMA接收
-     *
-     * @note 通常在离线检测中调用，防止离线后UART死锁
-     */
     void DR16::ClearORE(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size)
     {
         // 检测ORE（Overrun Error）标志
