@@ -265,6 +265,7 @@ typedef struct
     float    pitch_contract;     // 收起 Pitch 角度(rad),     实测 -0.792750061
     float    fold_expand;        // 展开 Fold 角度(rad),      实测 0.848020554
     float    fold_contract;      // 收起 Fold 角度(rad),      实测 0.0
+    float    fold_speed_scale;   // Fold 轨迹速度倍率(1.0=默认, 0.5=半速)
     float    arrive_eps;         // 到位误差阈值(rad), 默认 0.02
     uint16_t arrive_timeout_ms;  // 单步超时(ms),      默认 3000
     uint8_t  cmd;                // 命令: 0=NONE 1=EXPAND 2=CONTRACT 3=ABORT 4=RESET
@@ -323,9 +324,9 @@ typedef struct
  *   3. 急停时保存/恢复各关节 enabled 状态
  *
  * 数据流：
- *   DR16.S1/S2 → Remote_State(estop_active/last_s1)
+ *   DR16.S1/S2 → Remote_State(estop_active/last_s1/transform_pending_cmd)
  *                ├─ estop_active=1 → Controller_Data.{yaw,pitch,fold}.enabled=0
- *                └─ S1 边沿变化    → Transform_Config.cmd = EXPAND/CONTRACT
+ *                └─ S1 边沿变化    → transform_pending_cmd 挂起后自动发送
  *
  * Watch 观察点：
  *   estop_active       : 急停激活标志(1=急停中, 0=正常)
@@ -334,6 +335,7 @@ typedef struct
  *   last_s1            : 上一周期 S1（边沿检测用）
  *   planner_cmd_sent   : 本周期发送的 Planner 命令
  *                        (0=NONE, 1=EXPAND, 2=CONTRACT, 3=ABORT)
+ *   transform_pending_cmd : S1 变形挂起命令，等待电机在线后自动发送
  *   saved_yaw_en       : 急停前 yaw.enabled（退出急停时恢复）
  *   saved_pitch_en     : 急停前 pitch.enabled
  *   saved_fold_en      : 急停前 fold.enabled
@@ -352,9 +354,12 @@ typedef struct
     uint8_t s2;                // 当前 S2 原始值(1=UP, 2=DOWN, 3=MIDDLE) 【建议 Watch】
     uint8_t last_s1;           // 上一周期 S1（边沿检测用）
     uint8_t planner_cmd_sent;  // 本周期发送的 Planner 命令(0/1/2/3) 【建议 Watch】
+    uint8_t transform_pending_cmd; // S1 变形挂起命令(0=NONE,1=EXPAND,2=CONTRACT)
     uint8_t saved_yaw_en;      // 急停前 yaw.enabled（退出时恢复）
     uint8_t saved_pitch_en;    // 急停前 pitch.enabled
     uint8_t saved_fold_en;     // 急停前 fold.enabled
+    uint8_t keyboard_transform_pending_cmd; // 键鼠模式挂起的变形命令(0=NONE,1=EXPAND,2=CONTRACT)
+    uint8_t keyboard_friction_enable;       // 键鼠模式下R键锁存(0=停,1=转) 【建议 Watch】
 } Remote_State_t;
 
 // ========================================================================
@@ -439,6 +444,39 @@ typedef struct
     uint32_t last_rx_tick;     // 最近一次接收时刻
     uint8_t keyboard_mode;     // 键鼠模式标志(1=中位键鼠)
 } DR16_Debug_Data_t;
+
+// ========================================================================
+// 键鼠控制参数与状态（参考 User_reference 键鼠模式）
+// ========================================================================
+typedef struct
+{
+    // --- Tunable params ---
+    uint8_t enable;             // 1=允许键鼠模式控制, 0=仅接收不控制
+    float mouse_deadzone;       // 鼠标速度死区
+    float mouse_yaw_speed;      // 鼠标X -> yaw目标角速度(rad/s)
+    float mouse_pitch_speed;    // 鼠标Y -> pitch目标角速度(rad/s), 负值可反向
+    float chassis_normal_scale; // WASD普通速度归一化幅值[0,1]
+    float chassis_high_scale;   // Ctrl高速速度归一化幅值[0,1]
+    float fixed_gyro_speed;     // Shift固定小陀螺归一化转速[-1,1]
+    float mouse_rotate_gain;    // 收起态鼠标X -> 底盘旋转增益（Watch可调）
+
+    // --- Runtime observation ---
+    uint8_t active;             // 1=当前S1/S2进入键鼠模式且enable=1
+    uint8_t high_speed;         // 1=Ctrl高速
+    uint8_t fixed_gyro;         // 1=Shift固定小陀螺锁存态
+    float chassis_lx;           // 键盘映射后的LX归一化值
+    float chassis_ly;           // 键盘映射后的LY归一化值
+    float yaw_velocity;         // 鼠标映射后的yaw目标角速度(rad/s)
+    float pitch_velocity;       // 鼠标映射后的pitch目标角速度(rad/s)
+    float yaw_velocity_filt;    // yaw目标角速度滤波后值(rad/s)
+    float pitch_velocity_filt;  // pitch目标角速度滤波后值(rad/s)
+    float mouse_filter_tau;     // 鼠标速度一阶低通时间常数(s)
+    float mouse_accel_limit;    // 鼠标速度变化率限制(rad/s^2)
+    float mouse_yaw_gain;       // 鼠标X -> yaw目标角速度增益
+    float mouse_pitch_gain;     // 鼠标Y -> pitch目标角速度增益
+    float mouse_yaw_max_speed;  // yaw目标角速度上限(rad/s)
+    float mouse_pitch_max_speed;// pitch目标角速度上限(rad/s)
+} KeyboardMouse_Control_t;
 
 // ========================================================================
 // IMU 数据结构（Stage03 接入传感器）
@@ -663,7 +701,7 @@ typedef struct
  *   pid_p/i/d        : 速度环 P/I/D 项(raw)
  *   torque_cmd       : 最终发送的 LK raw 命令
  *   control_source   : 0=零力矩, 1=双环PID, 2=raw_override
- *   trigger_source   : 0=none, 1=wheel manual, 2=vision fire
+ *   trigger_source   : 0=none, 1=wheel manual, 2=vision fire, 3=mouse left
  *   vision_fire      : 当前视觉 fire 电平
  *   jam_detected     : 卡弹检测触发标志(1=正在解卡)
  *   shot_count       : 单发累计计数(Watch 观察发弹数)
@@ -685,7 +723,7 @@ typedef struct
     float    pid_d;                 // 速度环 D 项(raw)
     int16_t  torque_cmd;            // 最终发送的 LK raw 命令
     uint8_t  control_source;        // 0=零力矩, 1=双环PID, 2=raw_override
-    uint8_t  trigger_source;        // 0=none, 1=wheel manual, 2=vision fire
+    uint8_t  trigger_source;        // 0=none, 1=wheel manual, 2=vision fire, 3=mouse left
     uint8_t  vision_fire;           // 当前视觉 fire 电平
     uint8_t  jam_detected;          // 卡弹检测触发标志
     uint32_t shot_count;            // 单发累计计数
@@ -737,7 +775,7 @@ typedef struct
  * 字段说明：
  *   state              : 当前发射机构状态(0=DISABLE,1=STOP,3=AUTO)
  *   safety_ok          : 安全条件是否满足(1=可控制, 0=需失能)
- *   friction_enable    : 摩擦轮使能(0=停, 1=转)，由 S1上 + S2上 控制
+ *   friction_enable    : 摩擦轮使能(0=停, 1=转)，遥控模式由 S1上 + S2上 控制，键鼠模式由 R 键锁存控制
  *   friction_online_l/r: 摩擦轮在线状态(预留)
  *   friction_vel_l/r   : 摩擦轮实际转速(预留)
  *
@@ -748,7 +786,7 @@ typedef struct
     uint8_t  state;                  // 当前状态: 0=DISABLE,1=STOP,3=AUTO
     uint8_t  safety_ok;              // 安全条件: 1=可控制, 0=需失能
     uint8_t  friction_enable;        // 摩擦轮使能(0=停, 1=转)
-    uint8_t  trigger_source;         // 0=none, 1=wheel manual, 2=vision fire
+    uint8_t  trigger_source;         // 0=none, 1=wheel manual, 2=vision fire, 3=mouse left
     uint8_t  vision_fire;            // 当前视觉 fire 电平
     uint8_t  friction_online_l;      // 左摩擦轮在线(预留)
     uint8_t  friction_online_r;      // 右摩擦轮在线(预留)
@@ -844,35 +882,28 @@ typedef struct
 } BoardComm_Data_t;
 
 // ========================================================================
-// Gyro fixed-translation speed config (Watch tunable)
+// Gyro fixed-speed config (Watch tunable)
 // ========================================================================
 /**
- * @brief Watch tunable speed profile for S1=UP, S2=MIDDLE
+ * @brief Watch tunable fixed gyro speed for S1=UP, S2=MIDDLE
  *
- * slow_abs / fast_abs are normalized absolute values in [0.0, 1.0].
- * The waveform is slow hold -> fast rise -> fast hold -> fast fall.
- * The final signed speed stays on one side of 110 by clamping in code.
+ * `fixed_speed_norm` is the normalized magnitude in [0.0, 1.0].
+ * Final direction is controlled by `direction`:
+ *   1  -> above 110
+ *  -1  -> below 110
  */
 typedef struct
 {
-    // --- Tunable params ---
-    uint8_t enable;          // 1=profile speed, 0=stop gyro speed
-    int8_t  direction;       // 1 => above 110, -1 => below 110
-    float   slow_abs;        // normalized slow speed [0.0, 1.0]
-    float   fast_abs;        // normalized fast speed [0.0, 1.0]
-    float   slow_hold_ms;    // slow-speed hold duration
-    float   fast_hold_ms;    // fast-speed hold duration
-    float   rise_ms;         // slow -> fast transition duration
-    float   fall_ms;         // fast -> slow transition duration
+    uint8_t  enable;           // 1=use fixed gyro speed, 0=stop gyro speed
+    int8_t   direction;        // 1 => above 110, -1 => below 110
+    float    fixed_speed_norm; // normalized fixed speed [0.0, 1.0], Watch tunable
 
     // --- Runtime observation ---
-    uint8_t  active;         // 1 while S1=UP and S2=MIDDLE
-    uint8_t  segment;        // 0=slow hold, 1=rise, 2=fast hold, 3=fall
-    uint32_t start_tick;     // tick captured when entering this mode
-    uint32_t elapsed_ms;     // elapsed time since entering this mode
-    float    cycle_pos_ms;   // position inside current profile cycle
-    float    speed_norm;     // signed normalized speed sent to mapping
-    uint8_t  rotating_vel;   // final CAN value [0, 220]
+    uint8_t  active;          // 1 while S1=UP and S2=MIDDLE
+    uint32_t start_tick;      // tick captured when entering this mode
+    uint32_t elapsed_ms;      // elapsed time since entering this mode
+    float    output_norm;     // signed normalized speed sent to mapping
+    uint8_t  rotating_vel;    // final CAN value [0, 220]
 } GyroFixedSpeed_Config_t;
 
 // ========================================================================
@@ -885,7 +916,7 @@ typedef struct
  *   观察底盘模式状态机的运行状态，帮助调试模式切换逻辑。
  *
  * Watch 观察点：
- *   current_state       : 当前模式(0=MANUAL, 1=CHASSIS_FOLLOW, 2=GYROSCOPE, 3=EMERGENCY_STOP)
+ *   current_state       : 当前模式(0=MANUAL, 1=CHASSIS_FOLLOW, 2=GYROSCOPE, 3=GYRO_FIXED_TRANSLATION, 4=FOLDED_TRANSLATION, 5=EMERGENCY_STOP)
  *   stable_state        : 稳定状态（滤波后）
  *   pending_state       : 待确认状态（候选）
  *   stable_count        : 稳定计数（连续相同次数，0-10）
@@ -908,7 +939,7 @@ typedef struct
 typedef struct
 {
     // ===== 核心状态 =====
-    uint8_t current_state;          // 当前模式（枚举值 0-3）
+    uint8_t current_state;          // 当前模式（枚举值 0-5）
     uint8_t stable_state;           // 稳定状态（滤波后）
 
     // ===== 滤波过程 =====
@@ -997,6 +1028,7 @@ extern Transform_Config_t  Transform_Config;  // 变形规划器配置(Stage05)
 extern Transform_Status_t  Transform_Status;  // 变形规划器状态(Stage05)
 extern DR16_Data_t        DR16_Data;         // 遥控器状态(Stage04)
 extern DR16_Debug_Data_t  DR16_Debug_Data;   // 遥控器调试状态(Stage04)
+extern KeyboardMouse_Control_t KeyboardMouse_Control; // 键鼠控制参数/状态
 extern IMU_Data_t         IMU_Data;          // IMU 姿态状态(Stage03 接入传感器)
 extern Remote_State_t     Remote_State;      // 遥控器状态机(急停+展开/收起)
 extern LK4005_Data_t      LK4005_Data;       // LK4005 电机反馈状态
@@ -1006,7 +1038,7 @@ extern Shoot_Config_t     Shoot_Config;      // 发射机构整体配置(Watch�
 extern Shoot_Status_t     Shoot_Status;      // 发射机构整体状态(Watch观察)
 extern Friction_Data_t    Friction_Data;     // 摩擦轮电机反馈(Watch观察)
 extern BoardComm_Data_t   BoardComm_Data;    // 板间通信状态(Stage03)
-extern volatile GyroFixedSpeed_Config_t GyroFixedSpeed_Config; // S1=UP,S2=MIDDLE gyro speed(Watch tunable)
+extern volatile GyroFixedSpeed_Config_t GyroFixedSpeed_Config; // S1=UP,S2=MIDDLE fixed gyro speed(Watch tunable)
 extern ChassisModeDebug_t ChassisModeDebug;  // 底盘模式状态机调试数据(Stage06)
 extern VisionComm_Data_t  VisionComm_Data;   // 视觉通信数据(Stage07)
 

@@ -48,10 +48,10 @@ transforming_swerve_king_gimbal/boardcomm.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\string.h \
   ..\Application\Communication\ChassisModeManager.hpp \
   ..\BSP\..\BSP\Remote\DR16.hpp ..\BSP\Common\StateWatch\state_watch.hpp \
-  ..\Core\Inc\usart.h ..\BSP\..\Application\Variable.hpp \
-  ..\HAL\CAN\can_hal.hpp ..\HAL\CAN\interface\can_bus.hpp \
-  ..\HAL\CAN\interface\can_device.hpp ..\Core\Inc\can.h \
-  C:\Keil_v5\ARM\ARMCLANG\include\libcxx\functional \
+  ..\Core\Inc\usart.h ..\Planner\TransformPlanner.hpp ..\Joint\Joint.hpp \
+  ..\BSP\Motor\MotorBase.hpp ..\HAL\CAN\can_hal.hpp \
+  ..\HAL\CAN\interface\can_bus.hpp ..\HAL\CAN\interface\can_device.hpp \
+  ..\Core\Inc\can.h C:\Keil_v5\ARM\ARMCLANG\include\libcxx\functional \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__algorithm\search.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__algorithm\comp.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__type_traits\integral_constant.h \
@@ -785,6 +785,8 @@ transforming_swerve_king_gimbal/boardcomm.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\pointer_to_binary_function.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\pointer_to_unary_function.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\unary_negate.h \
+  ..\BSP\Motor\DM\DmMotor.hpp ..\Application\Variable.hpp \
+  ..\BSP\..\Application\Variable.hpp \
   ..\Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os.h \
   ..\Middlewares\Third_Party\FreeRTOS\Source\include\FreeRTOS.h \
   ..\Core\Inc\FreeRTOSConfig.h \

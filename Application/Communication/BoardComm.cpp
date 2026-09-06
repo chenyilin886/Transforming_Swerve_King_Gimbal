@@ -25,6 +25,7 @@
 
 #include "BoardComm.hpp"
 #include "ChassisModeManager.hpp"  // 底盘模式状态机
+#include "TransformPlanner.hpp"    // Transform_Status state
 #include "../BSP/Remote/DR16.hpp"
 #include "../Application/Variable.hpp"
 #include "can_hal.hpp"
@@ -75,11 +76,27 @@ static inline float clamp_float(float value, float min_value, float max_value)
     return value;
 }
 
+static inline bool is_keyboard_rotate_chassis_mode(bool keyboard_mode)
+{
+    if (!keyboard_mode)
+    {
+        return false;
+    }
+
+    const auto transform_state =
+        static_cast<BSP::PLANNER::TransformState>(Transform_Status.state);
+    if (transform_state == BSP::PLANNER::TransformState::CONTRACTED)
+    {
+        return true;
+    }
+
+    return transform_state == BSP::PLANNER::TransformState::CONTRACT_SIMULTANEOUS &&
+           fabsf(Transform_Status.fold_err) <= Transform_Config.arrive_eps;
+}
+
 static uint8_t compute_fixed_gyro_rotating_vel(bool active)
 {
     constexpr float kMinAbsSpeed = 0.01f;
-    constexpr float kMinTransitionMs = 10.0f;
-
     static bool mode_was_active = false;
     static uint32_t mode_start_tick = 0U;
 
@@ -89,11 +106,9 @@ static uint8_t compute_fixed_gyro_rotating_vel(bool active)
     {
         mode_was_active = false;
         GyroFixedSpeed_Config.active = 0U;
-        GyroFixedSpeed_Config.segment = 0U;
         GyroFixedSpeed_Config.start_tick = 0U;
         GyroFixedSpeed_Config.elapsed_ms = 0U;
-        GyroFixedSpeed_Config.cycle_pos_ms = 0.0f;
-        GyroFixedSpeed_Config.speed_norm = 0.0f;
+        GyroFixedSpeed_Config.output_norm = 0.0f;
         GyroFixedSpeed_Config.rotating_vel = 110U;
         return 110U;
     }
@@ -105,59 +120,17 @@ static uint8_t compute_fixed_gyro_rotating_vel(bool active)
         GyroFixedSpeed_Config.start_tick = now;
     }
 
-    float slow_abs = clamp_float(GyroFixedSpeed_Config.slow_abs, kMinAbsSpeed, 1.0f);
-    float fast_abs = clamp_float(GyroFixedSpeed_Config.fast_abs, kMinAbsSpeed, 1.0f);
-    if (fast_abs < slow_abs)
-    {
-        const float tmp = fast_abs;
-        fast_abs = slow_abs;
-        slow_abs = tmp;
-    }
-
-    const float slow_hold_ms = clamp_float(GyroFixedSpeed_Config.slow_hold_ms, 0.0f, 60000.0f);
-    const float fast_hold_ms = clamp_float(GyroFixedSpeed_Config.fast_hold_ms, 0.0f, 60000.0f);
-    const float rise_ms = clamp_float(GyroFixedSpeed_Config.rise_ms, kMinTransitionMs, 10000.0f);
-    const float fall_ms = clamp_float(GyroFixedSpeed_Config.fall_ms, kMinTransitionMs, 10000.0f);
-    const float cycle_ms = slow_hold_ms + rise_ms + fast_hold_ms + fall_ms;
+    const float abs_speed = clamp_float(fabsf(GyroFixedSpeed_Config.fixed_speed_norm),
+                                        kMinAbsSpeed,
+                                        1.0f);
     const float direction_sign = (GyroFixedSpeed_Config.direction >= 0) ? 1.0f : -1.0f;
-
-    const float elapsed_ms = static_cast<float>(now - mode_start_tick);
-    const float cycle_pos_ms = fmodf(elapsed_ms, cycle_ms);
-
-    float abs_speed = slow_abs;
-    uint8_t segment = 0U;
-    if (cycle_pos_ms < slow_hold_ms)
-    {
-        segment = 0U;
-        abs_speed = slow_abs;
-    }
-    else if (cycle_pos_ms < (slow_hold_ms + rise_ms))
-    {
-        segment = 1U;
-        const float alpha = (cycle_pos_ms - slow_hold_ms) / rise_ms;
-        abs_speed = slow_abs + (fast_abs - slow_abs) * alpha;
-    }
-    else if (cycle_pos_ms < (slow_hold_ms + rise_ms + fast_hold_ms))
-    {
-        segment = 2U;
-        abs_speed = fast_abs;
-    }
-    else
-    {
-        segment = 3U;
-        const float alpha = (cycle_pos_ms - slow_hold_ms - rise_ms - fast_hold_ms) / fall_ms;
-        abs_speed = fast_abs - (fast_abs - slow_abs) * alpha;
-    }
-
     const float signed_speed = direction_sign * abs_speed;
     const uint8_t rotating_vel = channel_to_rotating_vel(signed_speed);
 
     GyroFixedSpeed_Config.active = 1U;
-    GyroFixedSpeed_Config.segment = segment;
     GyroFixedSpeed_Config.start_tick = mode_start_tick;
-    GyroFixedSpeed_Config.elapsed_ms = static_cast<uint32_t>(elapsed_ms);
-    GyroFixedSpeed_Config.cycle_pos_ms = cycle_pos_ms;
-    GyroFixedSpeed_Config.speed_norm = signed_speed;
+    GyroFixedSpeed_Config.elapsed_ms = now - mode_start_tick;
+    GyroFixedSpeed_Config.output_norm = signed_speed;
     GyroFixedSpeed_Config.rotating_vel = rotating_vel;
 
     return rotating_vel;
@@ -222,21 +195,138 @@ void Gimbal_to_Chassis::Update()
     // ========== 1. 读取遥控器摇杆数据 ==========
     auto &dr16 = BSP::Remote::DR16::Instance();
     using Switch = BSP::Remote::DR16::Switch;
+    auto key = dr16.GetKeyboard();
 
     auto left_stick = dr16.GetRemoteLeft();
     auto s1 = dr16.GetS1();
     auto s2 = dr16.GetS2();
+    auto mode = ChassisModeManager::Instance().GetChassisMode();
+    auto chassis_state = ChassisModeManager::Instance().GetCurrentState();
+    const bool keyboard_mode = (mode.KeyBoard_mode != 0U);
+    const bool keyboard_rotate_chassis_mode = is_keyboard_rotate_chassis_mode(keyboard_mode);
+    static uint8_t last_keyboard_mode = 0U;
+    static uint8_t last_shift_pressed = 0U;
+    KeyboardMouse_Control.active = keyboard_mode ? 1U : 0U;
 
-    if (s1 == Switch::MIDDLE && s2 == Switch::UP)
+    if (keyboard_mode)
+    {
+        const bool shift_pressed = key.shift;
+        const float normal_scale = KeyboardMouse_Control.chassis_normal_scale;
+        const float high_scale = KeyboardMouse_Control.chassis_high_scale;
+        const float scale = key.ctrl ? high_scale : normal_scale;
+
+        float target_lx = 0.0f;
+        float target_ly = 0.0f;
+
+        if (key.w && !key.s)
+        {
+            target_ly += scale;
+        }
+        else if (key.s && !key.w)
+        {
+            target_ly -= scale;
+        }
+
+        if (key.a && !key.d)
+        {
+            target_lx -= scale;
+        }
+        else if (key.d && !key.a)
+        {
+            target_lx += scale;
+        }
+
+        KeyboardMouse_Control.high_speed = key.ctrl ? 1U : 0U;
+        KeyboardMouse_Control.chassis_lx = target_lx;
+        KeyboardMouse_Control.chassis_ly = target_ly;
+
+        direction.LX = channel_to_uint8(target_lx);
+        direction.LY = channel_to_uint8(target_ly);
+
+        if (keyboard_rotate_chassis_mode)
+        {
+            const float mouse_x = static_cast<float>(dr16.GetMouseVelocity().x);
+            const float dead_zone = KeyboardMouse_Control.mouse_deadzone;
+            float rotate_input = mouse_x;
+            if (rotate_input > -dead_zone && rotate_input < dead_zone)
+            {
+                rotate_input = 0.0f;
+            }
+
+            const float rotate_cmd =
+                clamp_float(rotate_input * KeyboardMouse_Control.mouse_rotate_gain,
+                            -1.0f,
+                            1.0f);
+            direction.Rotating_vel = channel_to_rotating_vel(rotate_cmd);
+
+            chassis_mode.Follow_mode = 0;
+            chassis_mode.Rotating_mode = 1;
+            chassis_mode.Universal_mode = 1;
+            chassis_mode.KeyBoard_mode = 1;
+        }
+        else
+        {
+            if (!last_keyboard_mode)
+            {
+                last_shift_pressed = shift_pressed ? 1U : 0U;
+            }
+            else if (shift_pressed && !last_shift_pressed)
+            {
+                KeyboardMouse_Control.fixed_gyro ^= 1U;
+            }
+
+            direction.Rotating_vel = KeyboardMouse_Control.fixed_gyro
+                ? channel_to_rotating_vel(KeyboardMouse_Control.fixed_gyro_speed)
+                : 110U;
+
+            if (KeyboardMouse_Control.fixed_gyro)
+            {
+                chassis_mode.Follow_mode = 0;
+                chassis_mode.Rotating_mode = 1;
+                chassis_mode.Universal_mode = 1;
+                chassis_mode.KeyBoard_mode = 1;
+            }
+        }
+
+        last_shift_pressed = shift_pressed ? 1U : 0U;
+    }
+    else if (chassis_state == ChassisMode::FOLDED_TRANSLATION)
+    {
+        // Folded chassis: left stick translates, CH0 rotates.
+        direction.LX = channel_to_uint8(static_cast<float>(left_stick.x));
+        direction.LY = channel_to_uint8(static_cast<float>(left_stick.y));
+        KeyboardMouse_Control.high_speed = 0U;
+        KeyboardMouse_Control.fixed_gyro = 0U;
+        KeyboardMouse_Control.chassis_lx = left_stick.x;
+        KeyboardMouse_Control.chassis_ly = left_stick.y;
+
+        float ch0 = static_cast<float>(dr16.GetCh0());
+        constexpr float kYawDeadZone = 0.05f;
+        if (ch0 > -kYawDeadZone && ch0 < kYawDeadZone)
+        {
+            ch0 = 0.0f;
+        }
+        // 收起态底盘的旋转正方向与遥控器 CH0 方向相反，需要取反。
+        direction.Rotating_vel = channel_to_rotating_vel(-ch0);
+    }
+    else if (s1 == Switch::MIDDLE && s2 == Switch::UP)
     {
         direction.LX = 110;
         direction.LY = 110;
         direction.Rotating_vel = channel_to_rotating_vel(static_cast<float>(left_stick.x));
+        KeyboardMouse_Control.high_speed = 0U;
+        KeyboardMouse_Control.fixed_gyro = 0U;
+        KeyboardMouse_Control.chassis_lx = left_stick.x;
+        KeyboardMouse_Control.chassis_ly = left_stick.y;
     }
     else
     {
         direction.LX = channel_to_uint8(static_cast<float>(left_stick.x));
         direction.LY = channel_to_uint8(static_cast<float>(left_stick.y));
+        KeyboardMouse_Control.high_speed = 0U;
+        KeyboardMouse_Control.fixed_gyro = 0U;
+        KeyboardMouse_Control.chassis_lx = left_stick.x;
+        KeyboardMouse_Control.chassis_ly = left_stick.y;
 
         if (s1 == Switch::UP && s2 == Switch::MIDDLE)
         {
@@ -252,6 +342,14 @@ void Gimbal_to_Chassis::Update()
     // ========== 2. 读取拨轮数据 ==========
     //   GetWheel() 返回 [-1.0, 1.0]
     //   映射到 int8_t [-127, 127]，中值 0
+    if (!keyboard_mode)
+    {
+        last_shift_pressed = 0U;
+        KeyboardMouse_Control.fixed_gyro = 0U;
+    }
+
+    last_keyboard_mode = keyboard_mode ? 1U : 0U;
+
     float wheel_raw = (s1 == Switch::DOWN && s2 != Switch::DOWN)
                     ? static_cast<float>(dr16.GetCh2())
                     : static_cast<float>(dr16.GetWheel());
@@ -268,9 +366,18 @@ void Gimbal_to_Chassis::Update()
     //   - 状态机负责模式判断 + 状态滤波 + 离线检测
     //   - BoardComm 只负责数据打包
     chassis_mode = ChassisModeManager::Instance().GetChassisMode();
+    if (keyboard_mode && KeyboardMouse_Control.fixed_gyro)
+    {
+        // 键鼠模式下固定小陀螺由 Shift 锁存态控制，同时保留键盘平移。
+        chassis_mode.Follow_mode = 0;
+        chassis_mode.Rotating_mode = 1;
+        chassis_mode.Universal_mode = 1;
+        chassis_mode.KeyBoard_mode = 1;
+    }
 
     // ========== 5. 填充 UI/视觉数据（预留） ==========
     ui_list.friction_enabled = Shoot_Status.friction_enable ? 1 : 0;
+    ui_list.Shift = KeyboardMouse_Control.fixed_gyro ? 1U : 0U;
     ui_list.Vision = 0;            // 暂时关闭，后续接入视觉模块
     // 其他字段保持默认值（零初始化）
 

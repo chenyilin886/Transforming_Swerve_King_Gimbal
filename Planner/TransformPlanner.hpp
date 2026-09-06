@@ -218,6 +218,9 @@ public:
         bool  pitch_online = jm.pitch.isOnline();
         bool  fold_online  = jm.fold.isOnline();
 
+        static float fold_motion_goal = 0.0f;
+        static float fold_motion_target = 0.0f;
+
         status.yaw_online   = yaw_online ? 1 : 0;
         status.pitch_online = pitch_online ? 1 : 0;
         status.fold_online  = fold_online  ? 1 : 0;
@@ -269,6 +272,8 @@ public:
                 step_elapsed_ms_ = 0;
                 // 锁定 yaw target 到当前 IMU 角度（保持静止）
                 yaw_locked_target_ = yaw_fb_imu;
+                fold_motion_goal = cfg.fold_expand;
+                fold_motion_target = fold_fb;
                 cfg.cmd = static_cast<uint8_t>(TransformCmd::NONE);
             }
             else if (cmd == TransformCmd::CONTRACT)
@@ -278,6 +283,8 @@ public:
                 step_elapsed_ms_ = 0;
                 // 锁定 yaw target 到当前 IMU 角度（保持静止）
                 yaw_locked_target_ = yaw_fb_imu;
+                fold_motion_goal = cfg.fold_contract;
+                fold_motion_target = fold_fb;
                 cfg.cmd = static_cast<uint8_t>(TransformCmd::NONE);
             }
             // 其他命令（NONE/RESET）忽略
@@ -307,8 +314,21 @@ public:
                 ctrl_pitch = true;
                 pitch_tgt  = 0.0f;                // Pitch: IMU 水平目标(枪口绝对俯仰=0)
                 ctrl_fold  = true;
-                fold_tgt   = cfg.fold_expand;     // Fold: 编码器目标值
                 step_idx   = 1;
+
+                const float fold_scale = (cfg.fold_speed_scale < 0.0f) ? 0.0f : cfg.fold_speed_scale;
+                const float fold_max_step = ctrl_data.fold.vel_limit * fold_scale * 0.001f;
+                if (fold_motion_target < fold_motion_goal)
+                {
+                    fold_motion_target += fold_max_step;
+                    if (fold_motion_target > fold_motion_goal) fold_motion_target = fold_motion_goal;
+                }
+                else if (fold_motion_target > fold_motion_goal)
+                {
+                    fold_motion_target -= fold_max_step;
+                    if (fold_motion_target < fold_motion_goal) fold_motion_target = fold_motion_goal;
+                }
+                fold_tgt = fold_motion_target;
 
                 // 离线检查（Yaw/Fold 必须在线，Pitch 离线由 Controller 层处理）
                 if (!yaw_online || !fold_online)
@@ -325,9 +345,11 @@ public:
                     return;
                 }
                 // 到位检查：只看 Fold
-                if (fabsf(fold_tgt - fold_fb) < cfg.arrive_eps)
+                if (fabsf(fold_motion_goal - fold_fb) < cfg.arrive_eps)
                 {
                     // Fold 到位 → 进入展开终态
+                    fold_motion_target = fold_motion_goal;
+                    fold_tgt = fold_motion_goal;
                     state_ = TransformState::EXPANDED;
                     step_elapsed_ms_ = 0;
                 }
@@ -346,8 +368,21 @@ public:
                 ctrl_pitch = true;
                 pitch_tgt  = 0.0f;                // Pitch: IMU 水平目标(枪口绝对俯仰=0)
                 ctrl_fold  = true;
-                fold_tgt   = cfg.fold_contract;   // Fold: 编码器目标值
                 step_idx   = 1;
+
+                const float fold_scale = (cfg.fold_speed_scale < 0.0f) ? 0.0f : cfg.fold_speed_scale;
+                const float fold_max_step = ctrl_data.fold.vel_limit * fold_scale * 0.001f;
+                if (fold_motion_target < fold_motion_goal)
+                {
+                    fold_motion_target += fold_max_step;
+                    if (fold_motion_target > fold_motion_goal) fold_motion_target = fold_motion_goal;
+                }
+                else if (fold_motion_target > fold_motion_goal)
+                {
+                    fold_motion_target -= fold_max_step;
+                    if (fold_motion_target < fold_motion_goal) fold_motion_target = fold_motion_goal;
+                }
+                fold_tgt = fold_motion_target;
 
                 // 离线检查
                 if (!yaw_online || !fold_online)
@@ -364,9 +399,11 @@ public:
                     return;
                 }
                 // 到位检查：只看 Fold
-                if (fabsf(fold_tgt - fold_fb) < cfg.arrive_eps)
+                if (fabsf(fold_motion_goal - fold_fb) < cfg.arrive_eps)
                 {
                     // Fold 到位 → 进入收起终态
+                    fold_motion_target = fold_motion_goal;
+                    fold_tgt = fold_motion_goal;
                     state_ = TransformState::CONTRACTED;
                     step_elapsed_ms_ = 0;
                 }

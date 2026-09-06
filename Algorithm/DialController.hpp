@@ -9,8 +9,8 @@
  *   参考 H_SG_Gimbal 参考工程 ShootTask.cpp 的拨盘控制：
  *     - 位置环(位置式 PID) → 速度目标
  *     - 速度环(位置式 PID) → 力矩 raw 命令
- *     - 单击单发：wheel 上沿触发，或视觉 fire 脉冲触发，每次目标角度 -= angle_per_shot
- *     - 长按连发：wheel 持续超过 long_press_ms，或视觉 fire 持续为 1，按 fire_hz 累加目标角度
+ *     - 单击单发：wheel / mouse_left 上沿触发，或视觉 fire 脉冲触发，每次目标角度 += angle_per_shot
+ *     - 长按连发：wheel / mouse_left 持续超过 long_press_ms，或视觉 fire 持续为 1，按 fire_hz 累加目标角度
  *     - 卡弹检测：力矩饱和 + 位置误差持续 → 反转解卡
  *
  * 与参考工程差异：
@@ -118,8 +118,8 @@ public:
 
     // === 状态机字段 ===
     DialState state;          ///< 当前状态
-    uint8_t   last_wheel_high;   ///< 上一周期 wheel 是否高于阈值(边沿检测用)
-    uint32_t  wheel_high_since_ms; ///< wheel 持续高于阈值的起始时间(ms)
+    uint8_t   last_trigger_high;   ///< 上一周期触发是否为高电平(边沿检测用)
+    uint32_t  trigger_high_since_ms; ///< 触发持续高电平的起始时间(ms)
     uint32_t  last_update_ms;     ///< 上次 Update 调用时间戳(ms, 用于 dt 计算)
 
     // === 累计目标角度 ===
@@ -145,7 +145,7 @@ public:
     DialController()
         : kpid_pos(0, 0, 0), kpid_vel(0, 0, 0),
           state(DialState::DISABLE),
-          last_wheel_high(0), wheel_high_since_ms(0), last_update_ms(0),
+          last_trigger_high(0), trigger_high_since_ms(0), last_update_ms(0),
           target_angle_rad(0), feedback_angle_rad(0),
           target_inited(0),
           jam_active(0), jam_start_ms(0),
@@ -162,8 +162,8 @@ public:
         position_pid.clearPID();
         velocity_pid.clearPID();
         state              = DialState::DISABLE;
-        last_wheel_high    = 0;
-        wheel_high_since_ms = 0;
+        last_trigger_high    = 0;
+        trigger_high_since_ms = 0;
         target_angle_rad   = 0.0f;
         feedback_angle_rad = 0.0f;
         target_inited      = 0;
@@ -253,8 +253,8 @@ public:
             position_pid.clearPID();
             velocity_pid.clearPID();
             state              = DialState::DISABLE;
-            last_wheel_high    = 0;
-            wheel_high_since_ms = 0;
+            last_trigger_high    = 0;
+            trigger_high_since_ms = 0;
             target_inited      = 0;
             jam_active         = 0;
             jam_torque_sat_ms  = 0;
@@ -315,22 +315,25 @@ public:
         // switch positions; leaving vision mode immediately drops this path.
         // vision fire: one high pulse = one shot; continuous high = auto fire.
         float wheel = (float)dr16.GetWheel();
+        const bool mouse_left_high = dr16.GetMouse().left;
         float wheel_threshold = clampFloatCfg(cfg.wheel_start_threshold, 0.0f, 0.99f);
         bool  wheel_high = (wheel > wheel_threshold);
         const bool vision_fire_mode = vision_fire_allowed;
-        const bool trigger_high = vision_fire_mode ? vision_fire_high : wheel_high;
+        const bool trigger_high = vision_fire_mode ? vision_fire_high : (mouse_left_high || wheel_high);
+        const uint8_t trigger_source =
+            vision_fire_high ? 2U : (mouse_left_high ? 3U : (wheel_high ? 1U : 0U));
 
         // 状态机转移
         switch (state)
         {
             case DialState::DISABLE:
                 state = DialState::STOP;
-                last_wheel_high = 0;
-                wheel_high_since_ms = 0;
+                last_trigger_high = 0;
+                trigger_high_since_ms = 0;
                 if (trigger_high)
                 {
                     state = DialState::SINGLE;
-                    wheel_high_since_ms = now_ms;
+                    trigger_high_since_ms = now_ms;
                     float angle_per_shot_rad =
                         cfg.angle_per_shot_deg * (PI / 180.0f);
                     target_angle_rad += angle_per_shot_rad;
@@ -339,11 +342,11 @@ public:
                 break;
 
             case DialState::STOP:
-                if (trigger_high && !last_wheel_high)
+                if (trigger_high && !last_trigger_high)
                 {
                     // 上沿：触发单发
                     state = DialState::SINGLE;
-                    wheel_high_since_ms = now_ms;
+                    trigger_high_since_ms = now_ms;
                     // 单发：目标角度增加 angle_per_shot_deg（一个弹槽）
                     //   方向说明:
                     //     本工程 LK4005 raw 命令为正 → 电机正转 → feedback_angle 增大
@@ -365,9 +368,9 @@ public:
                     // 拨轮释放 → 回到 STOP
                     // 注意：不重置 target，单发是"已提交"动作，必须走完 40°
                     state = DialState::STOP;
-                    wheel_high_since_ms = 0;
+                    trigger_high_since_ms = 0;
                 }
-                else if (trigger_high && (now_ms - wheel_high_since_ms) >= cfg.long_press_ms)
+                else if (trigger_high && (now_ms - trigger_high_since_ms) >= cfg.long_press_ms)
                 {
                     // 长按时间到 → 切换为连发
                     state = DialState::AUTO;
@@ -381,7 +384,7 @@ public:
                     // 重置目标到当前反馈：松手即停，不追连发攒下的历史 target
                     target_angle_rad = feedback_angle_rad;
                     state = DialState::STOP;
-                    wheel_high_since_ms = 0;
+                    trigger_high_since_ms = 0;
                 }
                 else
                 {
@@ -390,7 +393,7 @@ public:
                     //   方向：与单发一致，使用 += (供弹方向 = feedback 增大方向)
                     //   wheel 满幅映射到 wheel_to_hz 频率
                     float fire_hz = cfg.auto_fire_hz;
-                    if (!vision_fire_mode && cfg.wheel_to_hz > 0.0f)
+                    if (!vision_fire_mode && wheel_high && cfg.wheel_to_hz > 0.0f)
                     {
                         // 拨轮值越大，连发越快（线性映射）
                         float wheel_norm =
@@ -405,12 +408,11 @@ public:
                 }
                 break;
         }
-        last_wheel_high = trigger_high ? 1 : 0;
+        last_trigger_high = trigger_high ? 1 : 0;
 
         // 回写拨轮输入到 Dial_Status
-        status.wheel_input = vision_fire_mode ? 0.0f : (wheel_high ? wheel : 0.0f);
-        status.trigger_source =
-            vision_fire_high ? 2U : ((!vision_fire_mode && wheel_high) ? 1U : 0U);
+        status.wheel_input = (!vision_fire_mode && wheel_high && !mouse_left_high) ? wheel : 0.0f;
+        status.trigger_source = trigger_source;
         status.vision_fire = vision_fire_mode ? VisionComm_Data.fire : 0U;
         status.state = (uint8_t)state;
 

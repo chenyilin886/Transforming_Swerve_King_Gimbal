@@ -67,8 +67,14 @@ namespace BoardComm
 void ChassisModeManager::Update()
 {
     // ========== 0. 遥控器离线检测（最高优先级） ==========
-    if (BSP::Remote::DR16::Instance().IsOffline())
+    auto &dr16 = BSP::Remote::DR16::Instance();
+    keyboard_mode_active_ =
+        (dr16.GetS1() == BSP::Remote::DR16::Switch::MIDDLE) &&
+        (dr16.GetS2() == BSP::Remote::DR16::Switch::MIDDLE);
+
+    if (dr16.IsOffline())
     {
+        keyboard_mode_active_ = false;
         // 遥控器离线，强制急停
         if (current_state_ != ChassisMode::EMERGENCY_STOP)
         {
@@ -92,8 +98,8 @@ void ChassisModeManager::Update()
     }
 
     // ========== 1. 读取遥控器开关状态 ==========
-    auto s1 = BSP::Remote::DR16::Instance().GetS1();
-    auto s2 = BSP::Remote::DR16::Instance().GetS2();
+    auto s1 = dr16.GetS1();
+    auto s2 = dr16.GetS2();
 
     // ========== 2. 计算原始状态（无滤波） ==========
     ChassisMode raw_state = calculateRawState(s1, s2);
@@ -192,6 +198,7 @@ ChassisMode_t ChassisModeManager::GetChassisMode() const
             mode.stop = 0;
             mode.Follow_mode = 1;
             mode.Rotating_mode = 0;
+            mode.KeyBoard_mode = keyboard_mode_active_ ? 1 : 0;
             break;
 
         case ChassisMode::GYROSCOPE:
@@ -201,6 +208,14 @@ ChassisMode_t ChassisModeManager::GetChassisMode() const
             break;
 
         case ChassisMode::GYRO_FIXED_TRANSLATION:
+            mode.stop = 0;
+            mode.Follow_mode = 0;
+            mode.Rotating_mode = 1;
+            mode.Universal_mode = 1;
+            mode.KeyBoard_mode = keyboard_mode_active_ ? 1 : 0;
+            break;
+
+        case ChassisMode::FOLDED_TRANSLATION:
             mode.stop = 0;
             mode.Follow_mode = 0;
             mode.Rotating_mode = 1;
@@ -217,7 +232,7 @@ ChassisMode_t ChassisModeManager::GetChassisMode() const
             mode.Follow_mode = 0;
             mode.Rotating_mode = 0;
             mode.Universal_mode = 1;
-            mode.KeyBoard_mode = 0;
+            mode.KeyBoard_mode = keyboard_mode_active_ ? 1 : 0;
             break;
     }
 
@@ -283,13 +298,13 @@ ChassisMode ChassisModeManager::calculateRawState(
         return ChassisMode::EMERGENCY_STOP;
     }
 
-    // S1下：云台收起，底盘只允许普通平移。
+    // S1下且S2非下：云台收起，底盘进入平移+旋转。
     if (s1 == BSP::Remote::DR16::Switch::DOWN)
     {
-        return ChassisMode::MANUAL;
+        return ChassisMode::FOLDED_TRANSLATION;
     }
 
-    // S1中：手动PID；S2上进入可变速小陀螺，其余为底盘跟随。
+    // S1中：手动PID；S2上进入小陀螺，其余为底盘跟随。
     if (s1 == BSP::Remote::DR16::Switch::MIDDLE)
     {
         if (s2 == BSP::Remote::DR16::Switch::UP)
@@ -299,7 +314,7 @@ ChassisMode ChassisModeManager::calculateRawState(
         return ChassisMode::CHASSIS_FOLLOW;
     }
 
-    // S1上：S2中固定小陀螺且可平移，S2下/上为普通平移。
+    // S1上：S2中固定转速小陀螺且可平移，S2下/上为普通平移。
     if (s1 == BSP::Remote::DR16::Switch::UP)
     {
         if (s2 == BSP::Remote::DR16::Switch::MIDDLE)

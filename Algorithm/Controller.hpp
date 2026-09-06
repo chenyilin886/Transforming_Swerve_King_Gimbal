@@ -499,6 +499,8 @@ public:
      */
     float yaw_imu_angle;
     float yaw_imu_velocity;  // IMU yaw angular velocity feedback, rad/s.
+    // 1 = use IMU world-hold feedback, 0 = use encoder hold feedback.
+    uint8_t yaw_use_imu_feedback;
 
     /**
      * @brief Yaw inner velocity feedback selector.
@@ -635,6 +637,7 @@ public:
         // IMU 传感器闭环初始化
         yaw_imu_angle   = 0.0f;    // 由 GimbalUpdate 写入 IMU addYaw(deg→rad, 取负)
         yaw_imu_velocity = 0.0f;   // 由 GimbalUpdate 写入 IMU gyroZ(deg/s→rad/s, 取负)
+        yaw_use_imu_feedback = 1;  // 默认使用 IMU 闭环保持世界系航向
         yaw_inner_vel_use_encoder = 0;  // 默认内环速度自动选择：IMU在线用IMU，离线回退编码器
         pitch_imu_angle = 0.0f;    // 由 GimbalUpdate 写入 IMU pitch(deg→rad, 不取负)
         imu_online      = 0;        // 默认 IMU 离线，GimbalUpdate 中根据实际状态设置
@@ -699,7 +702,7 @@ public:
             if (yaw.cascade_mode == 0) {
                 // 跟随模式：已在GimbalInit中直接控制，此处同步反馈状态，
                 // 避免 Planner/Watch 读到进入速度环前的旧 yaw feedback。
-                if (jm.yaw.isOnline() && imu_online)
+                if (jm.yaw.isOnline() && imu_online && yaw_use_imu_feedback)
                 {
                     yaw.feedback_angle = yaw_imu_angle;
                     yaw.vel_feedback = yaw_imu_velocity;
@@ -714,7 +717,7 @@ public:
             } else {
                 // 串级PID模式：正常计算
                 float fb;
-                if (jm.yaw.isOnline() && imu_online)
+                if (jm.yaw.isOnline() && imu_online && yaw_use_imu_feedback)
                 {
                     // IMU 传感器闭环：世界坐标系绝对航向
                     //   yaw_imu_angle 由 GimbalUpdate 写入 = -addYaw × (π/180)
@@ -731,7 +734,7 @@ public:
                     yaw_fb_source = 0;  // 标记当前使用编码器反馈
                 }
 
-                float vel = (imu_online && !yaw_inner_vel_use_encoder)
+                float vel = (imu_online && yaw_use_imu_feedback && !yaw_inner_vel_use_encoder)
                           ? yaw_imu_velocity
                           : jm.yaw.getVelocity();
                 float tgt = yaw.target_angle;

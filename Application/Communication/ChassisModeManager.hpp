@@ -90,7 +90,7 @@ namespace BoardComm
  *   - 急停：裁判系统/遥控器触发，立即停止
  *
  * 优先级（从高到低）：
- *   EMERGENCY_STOP > CHASSIS_FOLLOW > GYROSCOPE > MANUAL
+ *   EMERGENCY_STOP > CHASSIS_FOLLOW > GYROSCOPE > GYRO_FIXED_TRANSLATION > FOLDED_TRANSLATION > MANUAL
  *
  * @note 枚举值与ChassisMode_t位域不直接对应
  *       需通过GetChassisMode()转换
@@ -100,8 +100,9 @@ enum class ChassisMode
     MANUAL = 0,          ///< 手动模式（wheel控制旋转）
     CHASSIS_FOLLOW = 1,  ///< 跟随模式（跟随云台朝向）
     GYROSCOPE = 2,       ///< 小陀螺模式（主动旋转）
-    GYRO_FIXED_TRANSLATION = 3, ///< 固定小陀螺 + 普通平移
-    EMERGENCY_STOP = 4   ///< 急停（最高优先级）
+    GYRO_FIXED_TRANSLATION = 3, ///< 固定转速小陀螺 + 普通平移
+    FOLDED_TRANSLATION = 4, ///< 收起态：平移 + 旋转
+    EMERGENCY_STOP = 5   ///< 急停（最高优先级）
 };
 
 // ========================================================================
@@ -234,7 +235,8 @@ private:
      *   1. S1==DOWN && S2==DOWN → EMERGENCY_STOP
      *   2. S2==MIDDLE → CHASSIS_FOLLOW
      *   3. S2==UP → GYROSCOPE
-     *   4. 其他 → MANUAL
+     *   4. S1==DOWN && S2!=DOWN → FOLDED_TRANSLATION
+     *   5. 其他 → MANUAL
      */
     ChassisMode calculateRawState(
         BSP::Remote::DR16::Switch s1,
@@ -244,6 +246,7 @@ private:
     ChassisMode current_state_ = ChassisMode::MANUAL;    ///< 当前状态（稳定）
     ChassisMode stable_state_ = ChassisMode::MANUAL;     ///< 稳定状态（滤波后）
     ChassisMode pending_state_ = ChassisMode::MANUAL;    ///< 待确认状态（候选）
+    bool keyboard_mode_active_ = false;                  ///< 键鼠模式标志（S1/S2中位）
 
     // ========== 滤波变量 ==========
     uint32_t stable_count_ = 0;                          ///< 稳定计数（连续相同次数）

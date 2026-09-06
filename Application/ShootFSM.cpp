@@ -191,13 +191,45 @@ void Class_ShootFSM::updateFriction_()
     auto &dr16 = BSP::Remote::DR16::Instance();
     using Switch = BSP::Remote::DR16::Switch;
 
+    const bool keyboard_mode = (dr16.GetS1() == Switch::MIDDLE &&
+                                dr16.GetS2() == Switch::MIDDLE &&
+                                KeyboardMouse_Control.enable != 0U);
     const bool friction_switch = (dr16.GetS1() == Switch::UP &&
                                   dr16.GetS2() == Switch::UP);
     const bool remote_offline  = dr16.IsOffline();
     const bool remote_estop    = (dr16.GetS1() == Switch::DOWN &&
                                   dr16.GetS2() == Switch::DOWN);
 
-    friction_enable = (friction_switch && !remote_offline && !remote_estop) ? 1 : 0;
+    static uint8_t last_keyboard_mode = 0;
+    static uint8_t last_key_r = 0;
+
+    if (!keyboard_mode)
+    {
+        Remote_State.keyboard_friction_enable = 0;
+        friction_enable = (friction_switch && !remote_offline && !remote_estop) ? 1 : 0;
+        last_key_r = 0;
+    }
+    else
+    {
+        auto kb = dr16.GetKeyboard();
+
+        if (keyboard_mode && !last_keyboard_mode)
+        {
+            Remote_State.keyboard_friction_enable = 0;
+            last_key_r = kb.r ? 1U : 0U;
+        }
+
+        const uint8_t cur_key_r = kb.r ? 1U : 0U;
+        if (cur_key_r && !last_key_r)
+        {
+            Remote_State.keyboard_friction_enable ^= 1U;
+        }
+
+        last_key_r = cur_key_r;
+        friction_enable = Remote_State.keyboard_friction_enable;
+    }
+
+    last_keyboard_mode = keyboard_mode ? 1U : 0U;
 
     // ==================================================================
     // 摩擦轮控制主逻辑

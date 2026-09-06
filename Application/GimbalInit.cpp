@@ -316,6 +316,49 @@ static inline void syncImuToData(const BSP::CTRL::GimbalController &gc,
     pitch.feedback_source = gc.pitch_fb_source;
 }
 
+static inline float clampFloat(float value, float min_value, float max_value)
+{
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static inline float updateMouseVelocityFilter(float target_velocity,
+                                              float &filtered_velocity,
+                                              float tau,
+                                              float accel_limit,
+                                              float dt)
+{
+    const float previous = filtered_velocity;
+    const float alpha = (tau > 0.0f) ? (dt / (tau + dt)) : 1.0f;
+
+    filtered_velocity += alpha * (target_velocity - filtered_velocity);
+
+    const float max_delta = accel_limit * dt;
+    filtered_velocity = clampFloat(filtered_velocity,
+                                   previous - max_delta,
+                                   previous + max_delta);
+    return filtered_velocity;
+}
+
+static inline bool isKeyboardRotateChassisMode(bool keyboard_mode)
+{
+    if (!keyboard_mode)
+    {
+        return false;
+    }
+
+    const auto transform_state =
+        static_cast<BSP::PLANNER::TransformState>(Transform_Status.state);
+    if (transform_state == BSP::PLANNER::TransformState::CONTRACTED)
+    {
+        return true;
+    }
+
+    return transform_state == BSP::PLANNER::TransformState::CONTRACT_SIMULTANEOUS &&
+           fabsf(Transform_Status.fold_err) <= Transform_Config.arrive_eps;
+}
+
 // ========================================================================
 // 初始化
 // ========================================================================
@@ -533,8 +576,8 @@ void GimbalUpdate()
     //
     // 【需求】
     //   - S1==DOWN(2) && S2==DOWN(2) → 急停：所有电机失能防止疯转
-    //   - S1==UP(1)    → 展开（边沿触发，发一次 EXPAND）
-    //   - S1==MIDDLE(3) → 收起（边沿触发，发一次 CONTRACT）
+    //   - S1==UP(1)    → 展开（边沿触发，挂起 EXPAND，电机在线后自动补发）
+    //   - S1==MIDDLE(3) → 收起（边沿触发，挂起 CONTRACT，电机在线后自动补发）
     //
     // 【急停状态机】
     //   进入急停(0→1)：
@@ -602,6 +645,7 @@ void GimbalUpdate()
                 Remote_State.saved_yaw_en   = Controller_Data.yaw.enabled;
                 Remote_State.saved_pitch_en = Controller_Data.pitch.enabled;
                 Remote_State.saved_fold_en  = Controller_Data.fold.enabled;
+                Remote_State.transform_pending_cmd = 0;
 
                 // 失能所有电机（Step 3 syncDataToController → ctrl.Disable）
                 Controller_Data.yaw.enabled   = 0;
@@ -655,6 +699,7 @@ void GimbalUpdate()
                 Controller_Data.yaw.enabled   = Remote_State.saved_yaw_en;
                 Controller_Data.pitch.enabled = Remote_State.saved_pitch_en;
                 Controller_Data.fold.enabled  = Remote_State.saved_fold_en;
+                Remote_State.transform_pending_cmd = 0;
 
                 // 发 RESET 给 Planner（从 ABORT 回到 IDLE）
                 Transform_Config.cmd = static_cast<uint8_t>(
@@ -669,71 +714,177 @@ void GimbalUpdate()
             }
             else
             {
-                // 正常状态：S1 边沿检测
-                uint8_t cur_s1 = static_cast<uint8_t>(s1);
-
-                if (cur_s1 != Remote_State.last_s1)
+                auto try_dispatch_transform_cmd = [&](uint8_t &pending_cmd) -> void
                 {
-                    // Planner 处于 ABORT 时，先发 RESET 恢复到 IDLE
-                    // 不更新 last_s1，下一周期重新检测边沿发送实际命令
-                    if (Transform_Status.state ==
-                        static_cast<uint8_t>(BSP::PLANNER::TransformState::ABORT))
+                    if (pending_cmd ==
+                        static_cast<uint8_t>(BSP::PLANNER::TransformCmd::NONE))
+                    {
+                        return;
+                    }
+
+                    auto cur_transform_state =
+                        static_cast<BSP::PLANNER::TransformState>(Transform_Status.state);
+                    const bool transform_busy =
+                        BSP::PLANNER::isTransitionState(cur_transform_state) ||
+                        cur_transform_state == BSP::PLANNER::TransformState::ABORT;
+                    const bool motors_ready =
+                        joint_manager.yaw.isOnline() && joint_manager.fold.isOnline();
+
+                    if (cur_transform_state == BSP::PLANNER::TransformState::ABORT)
                     {
                         Transform_Config.cmd = static_cast<uint8_t>(
                             BSP::PLANNER::TransformCmd::RESET);
                         Remote_State.planner_cmd_sent = static_cast<uint8_t>(
                             BSP::PLANNER::TransformCmd::RESET);
-                        // 不更新 last_s1：下周期 ABORT→IDLE 后重发 EXPAND/CONTRACT
+                        return;
                     }
-                    else if (cur_s1 == static_cast<uint8_t>(Switch::UP) ||
-                             cur_s1 == static_cast<uint8_t>(Switch::MIDDLE) ||
-                             cur_s1 == static_cast<uint8_t>(Switch::DOWN))
+
+                    if (transform_busy || !motors_ready)
                     {
-                        // S1 → UP(1) 或 MIDDLE(3)：准备发送变形命令
-                        // 【关键】先检查并修复 yaw 控制模式，确保变形期间 yaw 正常控制
+                        return;
+                    }
 
-                        // 变形期间必须由 Planner 锁定 yaw 角度。
-                        // 不只看当前底盘模式：S1/S2 切换和底盘模式滤波存在时序差，
-                        // Controller_Data 也可能仍保留跟随模式的 cascade_mode=0。
-                        auto chassis_mode = BoardComm::ChassisModeManager::Instance().GetCurrentState();
-                        bool in_follow_mode = (chassis_mode == BoardComm::ChassisMode::CHASSIS_FOLLOW);
+                    Transform_Config.cmd = pending_cmd;
+                    Remote_State.planner_cmd_sent = pending_cmd;
+                    pending_cmd = static_cast<uint8_t>(
+                        BSP::PLANNER::TransformCmd::NONE);
+                };
 
-                        if (in_follow_mode ||
-                            gimbal_controller.yaw.cascade_mode == 0 ||
-                            Controller_Data.yaw.cascade_mode == 0 ||
-                            FollowMode_Data.control_mode == 1)
+                auto queue_transform_cmd = [&](uint8_t &pending_cmd,
+                                              BSP::PLANNER::TransformCmd desired_cmd) -> void
+                {
+                    auto cur_transform_state =
+                        static_cast<BSP::PLANNER::TransformState>(Transform_Status.state);
+                    const bool transform_busy =
+                        BSP::PLANNER::isTransitionState(cur_transform_state) ||
+                        cur_transform_state == BSP::PLANNER::TransformState::ABORT;
+                    const bool motors_ready =
+                        joint_manager.yaw.isOnline() && joint_manager.fold.isOnline();
+
+                    if (cur_transform_state == BSP::PLANNER::TransformState::ABORT)
+                    {
+                        pending_cmd = static_cast<uint8_t>(desired_cmd);
+                        Transform_Config.cmd = static_cast<uint8_t>(
+                            BSP::PLANNER::TransformCmd::RESET);
+                        Remote_State.planner_cmd_sent = static_cast<uint8_t>(
+                            BSP::PLANNER::TransformCmd::RESET);
+                        return;
+                    }
+
+                    if (transform_busy || !motors_ready)
+                    {
+                        pending_cmd = static_cast<uint8_t>(desired_cmd);
+                        return;
+                    }
+
+                    Transform_Config.cmd = static_cast<uint8_t>(desired_cmd);
+                    Remote_State.planner_cmd_sent = static_cast<uint8_t>(desired_cmd);
+                    pending_cmd = static_cast<uint8_t>(
+                        BSP::PLANNER::TransformCmd::NONE);
+                };
+
+                const bool keyboard_mode =
+                    (dr16.GetS1() == BSP::Remote::DR16::Switch::MIDDLE) &&
+                    (dr16.GetS2() == BSP::Remote::DR16::Switch::MIDDLE) &&
+                    (KeyboardMouse_Control.enable != 0U);
+                static uint8_t last_keyboard_mode = 0;
+                static uint8_t last_key_v = 0;
+
+                if (!keyboard_mode)
+                {
+                    try_dispatch_transform_cmd(Remote_State.transform_pending_cmd);
+                }
+
+                if (keyboard_mode)
+                {
+                    auto kb = dr16.GetKeyboard();
+                    auto cur_transform_state =
+                        static_cast<BSP::PLANNER::TransformState>(Transform_Status.state);
+
+                    if (!last_keyboard_mode)
+                    {
+                        last_key_v = kb.v ? 1U : 0U;
+                        Remote_State.keyboard_transform_pending_cmd = 0;
+
+                        if (cur_transform_state != BSP::PLANNER::TransformState::EXPANDED)
                         {
-                            // 变形需要 yaw 进入串级模式，否则 Step 2.7 因 TRANSITION 跳过，
-                            // GimbalController.Update() 又会因 cascade_mode=0 跳过 yaw 输出。
-                            gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
-                            Controller_Data.yaw.cascade_mode = 1;
-                            Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
-                            FollowMode_Data.control_mode = 0;  // 标记退出速度环模式
+                            queue_transform_cmd(
+                                Remote_State.keyboard_transform_pending_cmd,
+                                BSP::PLANNER::TransformCmd::EXPAND);
                         }
+                    }
 
-                        // 发送变形命令
-                        if (cur_s1 == static_cast<uint8_t>(Switch::DOWN))
+                    uint8_t cur_key_v = kb.v ? 1U : 0U;
+
+                    if (Remote_State.keyboard_transform_pending_cmd !=
+                        static_cast<uint8_t>(BSP::PLANNER::TransformCmd::NONE))
+                    {
+                        try_dispatch_transform_cmd(
+                            Remote_State.keyboard_transform_pending_cmd);
+                    }
+
+                    if (cur_key_v && !last_key_v)
+                    {
+                        BSP::PLANNER::TransformCmd desired_cmd =
+                            (cur_transform_state == BSP::PLANNER::TransformState::EXPANDED)
+                                ? BSP::PLANNER::TransformCmd::CONTRACT
+                                : BSP::PLANNER::TransformCmd::EXPAND;
+                        queue_transform_cmd(Remote_State.keyboard_transform_pending_cmd,
+                                            desired_cmd);
+                    }
+
+                    last_key_v = cur_key_v;
+                    Remote_State.last_s1 = static_cast<uint8_t>(dr16.GetS1());
+                }
+                else
+                {
+                    // 正常状态：S1 边沿检测
+                    Remote_State.keyboard_transform_pending_cmd = 0;
+                    last_key_v = 0;
+
+                    uint8_t cur_s1 = static_cast<uint8_t>(s1);
+
+                    if (cur_s1 != Remote_State.last_s1)
+                    {
+                        if (cur_s1 == static_cast<uint8_t>(Switch::UP) ||
+                            cur_s1 == static_cast<uint8_t>(Switch::MIDDLE) ||
+                            cur_s1 == static_cast<uint8_t>(Switch::DOWN))
                         {
-                            Transform_Config.cmd = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::CONTRACT);
-                            Remote_State.planner_cmd_sent = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::CONTRACT);
+                            // S1 → UP(1) 或 MIDDLE(3)：先挂起变形命令，再在电机在线且非忙碌时补发
+                            BSP::PLANNER::TransformCmd desired_cmd =
+                                (cur_s1 == static_cast<uint8_t>(Switch::DOWN))
+                                    ? BSP::PLANNER::TransformCmd::CONTRACT
+                                    : BSP::PLANNER::TransformCmd::EXPAND;
+
+                            // 变形期间必须由 Planner 锁定 yaw 角度。
+                            // 不只看当前底盘模式：S1/S2 切换和底盘模式滤波存在时序差，
+                            // Controller_Data 也可能仍保留跟随模式的 cascade_mode=0。
+                            auto chassis_mode = BoardComm::ChassisModeManager::Instance().GetCurrentState();
+                            bool in_follow_mode = (chassis_mode == BoardComm::ChassisMode::CHASSIS_FOLLOW);
+
+                            if (in_follow_mode ||
+                                gimbal_controller.yaw.cascade_mode == 0 ||
+                                Controller_Data.yaw.cascade_mode == 0 ||
+                                FollowMode_Data.control_mode == 1)
+                            {
+                                gimbal_controller.yaw.SwitchToCascadeMode(gimbal_controller.yaw_imu_angle);
+                                Controller_Data.yaw.cascade_mode = 1;
+                                Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
+                                FollowMode_Data.control_mode = 0;
+                            }
+
+                            Remote_State.transform_pending_cmd = static_cast<uint8_t>(desired_cmd);
+                            try_dispatch_transform_cmd(Remote_State.transform_pending_cmd);
+                            Remote_State.last_s1 = cur_s1;
                         }
                         else
                         {
-                            Transform_Config.cmd = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::EXPAND);
-                            Remote_State.planner_cmd_sent = static_cast<uint8_t>(
-                                BSP::PLANNER::TransformCmd::EXPAND);
+                            // S1 → DOWN(2) 或 UNKNOWN(0)：不发命令
+                            Remote_State.last_s1 = cur_s1;
                         }
-                        Remote_State.last_s1 = cur_s1;
-                    }
-                    else
-                    {
-                        // S1 → DOWN(2) 或 UNKNOWN(0)：不发命令
-                        Remote_State.last_s1 = cur_s1;
                     }
                 }
+                last_keyboard_mode = keyboard_mode ? 1U : 0U;
             }
         }
     }
@@ -803,6 +954,47 @@ void GimbalUpdate()
     {
         vision_active = 0;
         vision_just_entered = 0;
+    }
+
+    // ---------------------------------------------------------------
+    // Step 2.59: 收起态 Yaw 安全策略
+    //   收起终态时，Yaw 不再使用 IMU 世界系自稳，而切到编码器保持。
+    //   这样底盘旋转时，Yaw 会跟着机械结构走，避免和收起机构干涉。
+    // ---------------------------------------------------------------
+    {
+        auto chassis_mode = BoardComm::ChassisModeManager::Instance().GetCurrentState();
+        auto transform_state = static_cast<BSP::PLANNER::TransformState>(Transform_Status.state);
+        const bool folded_yaw_hold =
+            (chassis_mode == BoardComm::ChassisMode::FOLDED_TRANSLATION) &&
+            (transform_state == BSP::PLANNER::TransformState::CONTRACTED);
+
+        static uint8_t last_folded_yaw_hold = 0;
+        uint8_t folded_yaw_hold_now = folded_yaw_hold ? 1U : 0U;
+
+        if (folded_yaw_hold_now != last_folded_yaw_hold)
+        {
+            if (folded_yaw_hold_now)
+            {
+                const float hold_yaw = joint_manager.yaw.getNormalizedAngle();
+                gimbal_controller.yaw_use_imu_feedback = 0;
+                gimbal_controller.yaw.SwitchToCascadeMode(hold_yaw);
+                Controller_Data.yaw.cascade_mode = 1;
+                Controller_Data.yaw.target_angle = hold_yaw;
+                FollowMode_Data.control_mode = 0;
+            }
+            else
+            {
+                gimbal_controller.yaw_use_imu_feedback = 1;
+                const float restore_yaw = gimbal_controller.imu_online
+                    ? gimbal_controller.yaw_imu_angle
+                    : joint_manager.yaw.getNormalizedAngle();
+                gimbal_controller.yaw.SwitchToCascadeMode(restore_yaw);
+                Controller_Data.yaw.cascade_mode = 1;
+                Controller_Data.yaw.target_angle = restore_yaw;
+            }
+        }
+
+        last_folded_yaw_hold = folded_yaw_hold_now;
     }
 
     // ---------------------------------------------------------------
@@ -898,68 +1090,119 @@ void GimbalUpdate()
         else if (gimbal_deploy_requested)
         {
             auto &dr16 = BSP::Remote::DR16::Instance();
+            const bool keyboard_mode =
+                (dr16.GetS1() == BSP::Remote::DR16::Switch::MIDDLE) &&
+                (dr16.GetS2() == BSP::Remote::DR16::Switch::MIDDLE) &&
+                (KeyboardMouse_Control.enable != 0U);
+            const bool keyboard_rotate_chassis_mode =
+                isKeyboardRotateChassisMode(keyboard_mode);
 
-            // 右摇杆 Y 轴(ch1)，范围 [-1.0, 1.0]，向上为正
-            float ch1 = (float)dr16.GetCh1();
-
-        // 死区过滤：消除摇杆归中时的噪声(约 ±0.03~0.05)
-        //   归中时强制速度为 0，保证"归中即停止"
-        const float dead_zone  = 0.05f;
-        if (ch1 > -dead_zone && ch1 < dead_zone)
-        {
-            ch1 = 0.0f;
-        }
-
-        // 速度映射：ch1 × max_speed → 目标角速度(rad/s)
-        //   max_speed = 1.0 rad/s：满幅拨杆 1 秒转动 1 rad ≈ 57°
-        //   慢速起点，调参稳定后可增大到 2~3 rad/s
-        const float max_speed  = 2.8f;
-        float target_velocity  = ch1 * max_speed;
-
-        // 积分步长：GimbalUpdate 1kHz → dt = 0.001s
-        const float dt          = 0.001f;
-
-        // 仅当 pitch 关节在线时才积分(防止离线时 target 漂移)
-        if (joint_manager.pitch.isOnline())
-        {
-            // 速度积分：target_angle += velocity × dt
-            float new_target = Controller_Data.pitch.target_angle + target_velocity * dt;
-
-            // 【限位钳位策略】
-            //   IMU 闭环下：target 含义是枪口绝对俯仰(rad)，不在编码器坐标系
-            //               → 用实测 IMU 限位（deg → rad）
-            //   编码器闭环下：target 含义是电机相对 Fold 的角度(rad)
-            //               → 用编码器限位（Joint.config.limit_min/max）
-            //   imu_online 标志在 Step 3.5 设置，Step 2.6 还没执行到 Step 3.5
-            //   → 用 gimbal_controller.imu_online 判断（上一周期状态，足够准确）
-            if (gimbal_controller.imu_online)
+            static uint8_t last_keyboard_mode = 0;
+            if (keyboard_mode && !last_keyboard_mode)
             {
-                // IMU 闭环：实测 IMU Pitch 限位（deg → rad）
-                //   展开状态下实测值（2026-07-14）：
-                //     上限：28 deg  → 0.576 rad（枪口抬起）
-                //     下限：-25 deg → -0.506 rad（枪口压下）
-                //   TODO: 根据 Fold 状态动态切换限位（Morphology Manager 阶段）
-                const float pitch_imu_limit_max = 33.0f  * (3.14159265358979f / 180.0f);  
-                const float pitch_imu_limit_min = -16.0f * (3.14159265358979f / 180.0f);  
-                
-                if (new_target > pitch_imu_limit_max) new_target = pitch_imu_limit_max;
-                if (new_target < pitch_imu_limit_min) new_target = pitch_imu_limit_min;
+                Controller_Data.yaw.target_angle = Controller_Data.yaw.feedback_angle;
+                Controller_Data.pitch.target_angle = Controller_Data.pitch.feedback_angle;
+                KeyboardMouse_Control.yaw_velocity = 0.0f;
+                KeyboardMouse_Control.pitch_velocity = 0.0f;
+                KeyboardMouse_Control.yaw_velocity_filt = 0.0f;
+                KeyboardMouse_Control.pitch_velocity_filt = 0.0f;
+            }
+            last_keyboard_mode = keyboard_mode ? 1U : 0U;
+
+            if (keyboard_rotate_chassis_mode)
+            {
+                KeyboardMouse_Control.pitch_velocity = 0.0f;
+                KeyboardMouse_Control.yaw_velocity = 0.0f;
+                KeyboardMouse_Control.pitch_velocity_filt = 0.0f;
+                KeyboardMouse_Control.yaw_velocity_filt = 0.0f;
+            }
+            else if (keyboard_mode)
+            {
+                float mouse_y = static_cast<float>(dr16.GetMouseVelocity().y);
+                const float dead_zone = KeyboardMouse_Control.mouse_deadzone;
+                if (mouse_y > -dead_zone && mouse_y < dead_zone)
+                {
+                    mouse_y = 0.0f;
+                }
+
+                const float raw_velocity = mouse_y * KeyboardMouse_Control.mouse_pitch_gain;
+                const float target_velocity =
+                    clampFloat(raw_velocity,
+                               -KeyboardMouse_Control.mouse_pitch_max_speed,
+                               KeyboardMouse_Control.mouse_pitch_max_speed);
+                const float dt = 0.001f;
+                const float filtered_velocity = updateMouseVelocityFilter(
+                    target_velocity,
+                    KeyboardMouse_Control.pitch_velocity_filt,
+                    KeyboardMouse_Control.mouse_filter_tau,
+                    KeyboardMouse_Control.mouse_accel_limit,
+                    dt);
+                KeyboardMouse_Control.pitch_velocity = filtered_velocity;
+
+                if (joint_manager.pitch.isOnline())
+                {
+                    float new_target = Controller_Data.pitch.target_angle + filtered_velocity * dt;
+
+                    if (gimbal_controller.imu_online)
+                    {
+                        const float pitch_imu_limit_max = 33.0f * (3.14159265358979f / 180.0f);
+                        const float pitch_imu_limit_min = -16.0f * (3.14159265358979f / 180.0f);
+                        if (new_target > pitch_imu_limit_max) new_target = pitch_imu_limit_max;
+                        if (new_target < pitch_imu_limit_min) new_target = pitch_imu_limit_min;
+                    }
+                    else
+                    {
+                        const auto &cfg = joint_manager.pitch.getConfig();
+                        if (!cfg.continuous)
+                        {
+                            if (new_target > cfg.limit_max) new_target = cfg.limit_max;
+                            if (new_target < cfg.limit_min) new_target = cfg.limit_min;
+                        }
+                    }
+
+                    Controller_Data.pitch.target_angle = new_target;
+                }
             }
             else
             {
-                // 编码器闭环：做编码器坐标系限位钳位
-                //   pitch 范围：-0.238846481 ~ 0.599253953 rad ≈ -13.7° ~ 34.4°
-                const auto &cfg = joint_manager.pitch.getConfig();
-                if (!cfg.continuous)  // 非连续关节才限位
+                KeyboardMouse_Control.pitch_velocity = 0.0f;
+
+                // 右摇杆 Y 轴(ch1)，范围 [-1.0, 1.0]，向上为正
+                float ch1 = static_cast<float>(dr16.GetCh1());
+                const float dead_zone = 0.05f;
+                if (ch1 > -dead_zone && ch1 < dead_zone)
                 {
-                    if (new_target > cfg.limit_max) new_target = cfg.limit_max;
-                    if (new_target < cfg.limit_min) new_target = cfg.limit_min;
+                    ch1 = 0.0f;
+                }
+
+                const float max_speed = 2.8f;
+                const float target_velocity = ch1 * max_speed;
+                const float dt = 0.001f;
+
+                if (joint_manager.pitch.isOnline())
+                {
+                    float new_target = Controller_Data.pitch.target_angle + target_velocity * dt;
+
+                    if (gimbal_controller.imu_online)
+                    {
+                        const float pitch_imu_limit_max = 33.0f * (3.14159265358979f / 180.0f);
+                        const float pitch_imu_limit_min = -16.0f * (3.14159265358979f / 180.0f);
+                        if (new_target > pitch_imu_limit_max) new_target = pitch_imu_limit_max;
+                        if (new_target < pitch_imu_limit_min) new_target = pitch_imu_limit_min;
+                    }
+                    else
+                    {
+                        const auto &cfg = joint_manager.pitch.getConfig();
+                        if (!cfg.continuous)
+                        {
+                            if (new_target > cfg.limit_max) new_target = cfg.limit_max;
+                            if (new_target < cfg.limit_min) new_target = cfg.limit_min;
+                        }
+                    }
+
+                    Controller_Data.pitch.target_angle = new_target;
                 }
             }
-
-            // 写入 Controller_Data(Step 3 会同步到 JointController.target_angle)
-            Controller_Data.pitch.target_angle = new_target;
-        }
         }  // end else (非急停 且 非TRANSITION) — Pitch
     }
 
@@ -1013,10 +1256,16 @@ void GimbalUpdate()
         else if (gimbal_deploy_requested)
         {
             auto &dr16 = BSP::Remote::DR16::Instance();
+            const bool keyboard_mode =
+                (dr16.GetS1() == BSP::Remote::DR16::Switch::MIDDLE) &&
+                (dr16.GetS2() == BSP::Remote::DR16::Switch::MIDDLE) &&
+                (KeyboardMouse_Control.enable != 0U);
+            const bool keyboard_rotate_chassis_mode =
+                isKeyboardRotateChassisMode(keyboard_mode);
 
             // ========== 1. 获取底盘模式 ==========
             auto chassis_mode = BoardComm::ChassisModeManager::Instance().GetCurrentState();
-            bool is_follow_mode = (chassis_mode == BoardComm::ChassisMode::CHASSIS_FOLLOW);
+            bool is_follow_mode = (chassis_mode == BoardComm::ChassisMode::CHASSIS_FOLLOW) && !keyboard_mode;
 
             // ========== 2. 计算IMU角速度反馈 ==========
             float imu_yaw_vel = 0.0f;
@@ -1076,7 +1325,38 @@ void GimbalUpdate()
             // 仅当 yaw 关节在线时才控制
             if (joint_manager.yaw.isOnline())
             {
-                if (is_follow_mode) {
+                if (keyboard_rotate_chassis_mode)
+                {
+                    KeyboardMouse_Control.yaw_velocity = 0.0f;
+                    KeyboardMouse_Control.yaw_velocity_filt = 0.0f;
+                }
+                else if (keyboard_mode)
+                {
+                    float mouse_x = static_cast<float>(dr16.GetMouseVelocity().x);
+                    const float dead_zone = KeyboardMouse_Control.mouse_deadzone;
+                    if (mouse_x > -dead_zone && mouse_x < dead_zone)
+                    {
+                        mouse_x = 0.0f;
+                    }
+
+                    const float dt = 0.001f;
+                    const float raw_velocity = mouse_x * KeyboardMouse_Control.mouse_yaw_gain;
+                    const float target_velocity =
+                        clampFloat(raw_velocity,
+                                   -KeyboardMouse_Control.mouse_yaw_max_speed,
+                                   KeyboardMouse_Control.mouse_yaw_max_speed);
+                    const float filtered_velocity = updateMouseVelocityFilter(
+                        target_velocity,
+                        KeyboardMouse_Control.yaw_velocity_filt,
+                        KeyboardMouse_Control.mouse_filter_tau,
+                        KeyboardMouse_Control.mouse_accel_limit,
+                        dt);
+                    KeyboardMouse_Control.yaw_velocity = filtered_velocity;
+                    Controller_Data.yaw.target_angle += filtered_velocity * dt;
+                }
+                else if (is_follow_mode) {
+                    KeyboardMouse_Control.yaw_velocity = 0.0f;
+                    KeyboardMouse_Control.yaw_velocity_filt = 0.0f;
                     // ===== 跟随模式：速度环单环 =====
                     // 写入Watch观察
                     FollowMode_Data.target_velocity = target_velocity;
@@ -1098,6 +1378,8 @@ void GimbalUpdate()
                                                 torque * joint_manager.yaw.getConfig().direction);
 
                 } else {
+                    KeyboardMouse_Control.yaw_velocity = 0.0f;
+                    KeyboardMouse_Control.yaw_velocity_filt = 0.0f;
                     // ===== 其他模式：串级PID（保持原有逻辑）=====
                     // 速度积分：target_angle += velocity × dt
                     const float dt = 0.001f;
@@ -1132,7 +1414,7 @@ void GimbalUpdate()
     //   连续10次（10ms）检测到相同状态才切换，防止开关抖动。
     //
     // 【调试观察点】Watch 中展开 ChassisModeDebug：
-    //   current_state       : 当前模式(0-3)
+    //   current_state       : 当前模式(0-5)
     //   state_change_count  : 状态切换次数
     //   filter_reject_count : 滤波拒绝次数
     //   remote_online       : 遥控器在线状态
@@ -1351,6 +1633,9 @@ void GimbalUpdate()
              dr16.GetS2() == BSP::Remote::DR16::Switch::MIDDLE)
                 ? 1
                 : 0;
+
+        KeyboardMouse_Control.active = DR16_Debug_Data.keyboard_mode && DR16_Data.online &&
+                                       (KeyboardMouse_Control.enable != 0U);
     }
 
     // ---------------------------------------------------------------

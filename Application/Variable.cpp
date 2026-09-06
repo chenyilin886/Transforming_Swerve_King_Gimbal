@@ -167,11 +167,11 @@ Controller_Data_t Controller_Data = {
         .kp              = 16.0f,    // 角度环 P, 15
         .ki              = 0.0f,    // 角度环 I
         .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
-        .torque_limit    = 22.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
+        .torque_limit    = 35.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
         .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
-        .vel_kp          = 12.0f,    // 速度环 P, 12
+        .vel_kp          = 13.0f,    // 速度环 P, 12
         .vel_ki          = 0.1f,    // 速度环 I
         .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.001
         .vel_limit       = 30.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
@@ -190,7 +190,7 @@ Controller_Data_t Controller_Data = {
         //   注意: gravity_enable=1 且 cascade_mode=1 时生效
         //         IMU 离线切编码器时, 若编码器零位≠枪口水平, 补偿会不准
         //         (当前编码器零位已标定为枪口水平, 可放心使用)
-        .gravity_k       = 7.0f,    // 重力补偿系数(N·m), 保守初值, Watch 在线标定
+        .gravity_k       = 14.0f,    // 重力补偿系数(N·m), 保守初值, Watch 在线标定
         .gravity_enable  = 1,        // ← 启用 Pitch 重力补偿(加摩擦轮后必需)
         .feedback_angle  = 0.0f,
         .error           = 0.0f,
@@ -335,7 +335,7 @@ Controller_Data_t Vision_Controller_Data = {
         .break_i_vel     = 1.0f,
         .limit_i_vel     = 2.0f,
         .enabled         = 1,
-        .gravity_k       = 7.0f,
+        .gravity_k       = 14.0f,
         .gravity_enable  = 1,
         .feedback_angle  = 0.0f,
         .error           = 0.0f,
@@ -409,6 +409,7 @@ Transform_Config_t Transform_Config = {
     .pitch_contract    = -0.792750061f,   // 收起 Pitch 角度(实测)
     .fold_expand       = 0.848020554f,    // 展开 Fold 最大上抬(实测)
     .fold_contract     = 0.0f,            // 收起 Fold 最小角度(机械限位)
+    .fold_speed_scale  = 1.0f,            // Fold 轨迹速度倍率：默认与以前一致
     .arrive_eps        = 0.1f,           // 到位阈值 0.1rad ≈ 1.1°
     .arrive_timeout_ms = 3000,            // 单步超时 3000ms
     .cmd               = 0,               // NONE（上电待命）
@@ -494,6 +495,32 @@ DR16_Debug_Data_t DR16_Debug_Data = {
     .keyboard_mode = 0,
 };
 
+KeyboardMouse_Control_t KeyboardMouse_Control = {
+    .enable = 1,
+    .mouse_deadzone = 0.0f,
+    .mouse_yaw_speed = 250.0f,
+    .mouse_pitch_speed = 230.0f,
+    .chassis_normal_scale = 0.3f,
+    .chassis_high_scale = 0.5f,
+    .fixed_gyro_speed = 0.65f,
+    .mouse_rotate_gain = 80.0f,
+    .active = 0,
+    .high_speed = 0,
+    .fixed_gyro = 0,
+    .chassis_lx = 0.0f,
+    .chassis_ly = 0.0f,
+    .yaw_velocity = 0.0f,
+    .pitch_velocity = 0.0f,
+    .yaw_velocity_filt = 0.0f,
+    .pitch_velocity_filt = 0.0f,
+    .mouse_filter_tau = 0.010f,
+    .mouse_accel_limit = 70.0f,
+    .mouse_yaw_gain = 240.0f,
+    .mouse_pitch_gain = 210.0f,
+    .mouse_yaw_max_speed = 4.0f,
+    .mouse_pitch_max_speed = 3.0f,
+};
+
 // ========================================================================
 // IMU 数据全局实例（Stage03 接入传感器）
 // ========================================================================
@@ -557,9 +584,12 @@ Remote_State_t Remote_State = {
     .s2              = 0,
     .last_s1         = 0,
     .planner_cmd_sent = 0,
+    .transform_pending_cmd = 0,
     .saved_yaw_en    = 0,
     .saved_pitch_en  = 0,
     .saved_fold_en   = 0,
+    .keyboard_transform_pending_cmd = 0,
+    .keyboard_friction_enable = 0,
 };
 
 // ========================================================================
@@ -636,18 +666,18 @@ Dial_Config_t Dial_Config = {
     .wheel_to_hz           = 0.0f,   // wheel 满幅映射到 0 Hz
 
     // === 位置环(外环) PID ===
-    .pos_kp                = 23.0f,    // P, 调好速度环后改 8.0
-    .pos_ki                = 0.0f,    // I, 保持 0
+    .pos_kp                = 42.0f,    // P, 调好速度环后改 8.0
+    .pos_ki                = 0.3f,    // I, 保持 0
     .pos_kd                = 0.0f,    // D, 调好速度环后改 0.3
     .pos_break_i           = 0.1f,    // 位置误差<0.1rad 才积分
-    .pos_limit_i           = 5.0f,    // 位置环 I 项限幅 5 rad/s
-    .pos_vel_limit         = 50.0f,   // 
+    .pos_limit_i           = 10.0f,    // 位置环 I 项限幅 5 rad/s
+    .pos_vel_limit         = 80.0f,   //
 
     // === 速度环(内环) PID ===
     .vel_kp                = 34.0f,    // P, 起步 50
-    .vel_ki                = 0.0f,    // I, 保持 0
+    .vel_ki                = 0.1f,    // I, 保持 0
     .vel_kd                = 0.0f,    // D, 起步 1.0
-    .vel_break_i           = 5.0f,    // 速度误差<5rad/s 才积分
+    .vel_break_i           = 10.0f,    // 速度误差<5rad/s 才积分
     .vel_limit_i           = 80.0f,   // 速度环 I 项限幅 80 raw
     .raw_output_limit      = 2048.0f, 
 
@@ -763,24 +793,16 @@ BoardComm_Data_t BoardComm_Data = {
     .last_rx_time        = 0,
 };
 
-// Gyro fixed-translation speed tuning block.
-// Profile: slow hold -> fast rise -> fast hold -> fast fall.
-// Direction sign chooses the side of 110; speed is clamped in BoardComm.cpp.
+// Gyro fixed-speed tuning block.
+// Adjust fixed_speed_norm in Watch to change the constant rotating speed.
 volatile GyroFixedSpeed_Config_t GyroFixedSpeed_Config = {
     .enable       = 1,
     .direction    = 1,
-    .slow_abs     = 0.25f,
-    .fast_abs     = 0.7f,
-    .slow_hold_ms = 700.0f,
-    .fast_hold_ms = 800.0f,
-    .rise_ms      = 110.0f,
-    .fall_ms      = 90.0f,
+    .fixed_speed_norm = 0.65f,
     .active       = 0,
-    .segment      = 0,
     .start_tick   = 0,
     .elapsed_ms   = 0,
-    .cycle_pos_ms = 0.0f,
-    .speed_norm   = 0.0f,
+    .output_norm  = 0.0f,
     .rotating_vel = 110,
 };
 
@@ -922,7 +944,7 @@ void VofaSendDebugChannels(void)
  *
  * Watch 观察建议：
  *   添加 ChassisModeDebug 到 Watch 窗口，展开观察：
- *   - current_state: 当前模式（0-3）
+ *   - current_state: 当前模式（0-5）
  *   - state_change_count: 状态切换次数
  *   - remote_online: 遥控器在线状态
  *
