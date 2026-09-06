@@ -396,7 +396,7 @@ FollowMode_Data_t FollowMode_Data = {
 //   - arrive_eps = 0.02 rad (≈1.1°)，到位判定阈值
 //   - arrive_timeout_ms = 3000 ms，单步超时保护
 //   - cmd = 0 (NONE)，上电 IDLE，必须用户主动下达命令才会动作
-//
+//  
 // Watch 操作流程：
 //   ① 展开: Watch 中改 Transform_Config.cmd = 1 → 状态机自动执行
 //   ② 收起: Watch 中改 Transform_Config.cmd = 2
