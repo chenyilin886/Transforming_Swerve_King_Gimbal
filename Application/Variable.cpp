@@ -662,7 +662,7 @@ Dial_Config_t Dial_Config = {
 
     // === 拨轮触发 ===
     .wheel_start_threshold = 0.5f,    // wheel > 0.5 触发(比旧版0.8更柔和)
-    .long_press_ms         = 800,     // 持续 800ms 切换为连发
+    .long_press_ms         = 1,     // 持续 800ms 切换为连发
     .auto_fire_hz          = 5.0f,    // 连发基础频率 8 Hz (仅 wheel_to_hz<=0 时使用)
     .wheel_to_hz           = 0.0f,   // wheel 满幅映射到 0 Hz
 
