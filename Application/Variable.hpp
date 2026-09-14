@@ -490,6 +490,7 @@ typedef struct
  *   acc_x/y/z          : 加速度(单位: g)
  *   quat_w/x/y/z       : 四元数
  *   add_yaw            : Yaw 累计角度(单位: deg，跨 ±180° 连续累加)
+ *   timestamp          : IMU 系统时间戳(单位: ms，传感器内部计时)
  *   temperature        : 温度(单位: °C)
  *   online             : 在线状态(0=离线, 1=在线)
  *
@@ -537,6 +538,7 @@ typedef struct
     float add_yaw;         // Yaw 累计角度(deg，跨 ±180° 连续)
 
     // --- 状态 ---
+    uint32_t timestamp;    // IMU 系统时间戳(ms，传感器内部计时)
     int8_t  temperature;   // 温度(°C)
     uint8_t online;        // 在线状态(0=离线, 1=在线)
 } IMU_Data_t;

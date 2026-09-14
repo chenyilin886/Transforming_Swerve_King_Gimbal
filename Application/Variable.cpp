@@ -17,7 +17,7 @@
 // 三关节数据全局实例
 // ========================================================================
 // 配置参数默认值：
-//   Yaw  : offset=0.1, continuous=1, 无限位, direction=1
+//   Yaw  : offset=-1.54936314, continuous=1, 无限位, direction=1
 //   Pitch: offset=0, continuous=0, ±1.5708rad(±90°), direction=1
 //   Fold : offset=0, continuous=0, ±1.5708rad(±90°), direction=1
 Joint_Data_t Joint_Data = {
@@ -32,7 +32,7 @@ Joint_Data_t Joint_Data = {
         .temperature      = 0.0f,
         .online           = 0,
         .config = {
-            .offset       = 0.1f,      // 临时偏移 0.1，用于测试
+            .offset       = -1.54936314f,  // 实测零位编码器位置(2026-09-09 拆装后重标)
             .limit_min    = -3.14159f,
             .limit_max    = 3.14159f,
             .direction    = 1.0f,
@@ -127,14 +127,14 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .yaw = {
         .target_angle    = 0.0f,
-        .kp              = 18.0f,    // 角度环 P, 15
+        .kp              = 18.0f,    // 角度环 P, 18
         .ki              = 0.00095f,    // 角度环 I
         .kd              = 2.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 30.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
         .break_i         = 0.5f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
-        .vel_kp          = 5.0f,    // 速度环 P, 13
+        .vel_kp          = 5.0f,    // 速度环 P, 5
         .vel_ki          = 0.0f,    // 速度环 I
         .vel_kd          = 2.0f,    // 速度环 D, 建议起点 0.001
         .vel_limit       = 50.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
@@ -565,6 +565,7 @@ IMU_Data_t IMU_Data = {
     .add_yaw         = 0.0f,
 
     // --- 状态 ---
+    .timestamp       = 0,       // IMU 系统时间戳(ms)
     .temperature     = 0,       // 温度(°C)
     .online          = 0,       // 初始离线（0=离线, 1=在线）
 };
@@ -666,17 +667,17 @@ Dial_Config_t Dial_Config = {
     .wheel_to_hz           = 0.0f,   // wheel 满幅映射到 0 Hz
 
     // === 位置环(外环) PID ===
-    .pos_kp                = 42.0f,    // P, 调好速度环后改 8.0
+    .pos_kp                = 45.0f,    // P, 调好速度环后改 8.0
     .pos_ki                = 0.3f,    // I, 保持 0
     .pos_kd                = 0.0f,    // D, 调好速度环后改 0.3
-    .pos_break_i           = 0.1f,    // 位置误差<0.1rad 才积分
+    .pos_break_i           = 3.1f,    // 位置误差<0.1rad 才积分
     .pos_limit_i           = 10.0f,    // 位置环 I 项限幅 5 rad/s
     .pos_vel_limit         = 80.0f,   //
 
     // === 速度环(内环) PID ===
-    .vel_kp                = 34.0f,    // P, 起步 50
+    .vel_kp                = 40.0f,    // P, 起步 50
     .vel_ki                = 0.1f,    // I, 保持 0
-    .vel_kd                = 0.0f,    // D, 起步 1.0
+    .vel_kd                = 10.0f,    // D, 起步 1.0
     .vel_break_i           = 10.0f,    // 速度误差<5rad/s 才积分
     .vel_limit_i           = 80.0f,   // 速度环 I 项限幅 80 raw
     .raw_output_limit      = 2048.0f, 
@@ -860,13 +861,13 @@ VisionComm_Data_t VisionComm_Data = {
  */
 void VofaSendDebugChannels(void)
 {
-    // === Yaw / Pitch / LK4005(拨盘) 目标值 vs 反馈值 ===
-    //   CH0(通道1): yaw.target_angle        Yaw 目标角度(rad)
-    //   CH1(通道2): yaw.feedback_angle      Yaw 反馈角度(rad)
-    //   CH2(通道3): pitch.target_angle      Pitch 目标角度(rad)
-    //   CH3(通道4): pitch.feedback_angle    Pitch 反馈角度(rad)
-    //   CH4(通道5): Dial.target_angle       LK4005 拨盘目标累计角度(rad, 多圈)
-    //   CH5(通道6): Dial.feedback_angle     LK4005 拨盘反馈累计角度(rad, 多圈)
+    // === 拨盘电机观测 + IMU 状态（通道1/2 改为 4005 拨盘目标与反馈）===
+    //   CH0(通道1): Dial_Status.target_angle    拨盘目标角度(rad)
+    //   CH1(通道2): Dial_Status.feedback_angle  拨盘反馈角度(rad)
+    //   CH2(通道3): IMU_Data.gyro_x             X 轴角速度(deg/s)
+    //   CH3(通道4): IMU_Data.gyro_y             Y 轴角速度(deg/s)
+    //   CH4(通道5): IMU_Data.gyro_z             Z 轴角速度(deg/s)
+    //   CH5(通道6): IMU_Data.online             在线状态(0/1)
     APP::Vofa.Send6Floats(
         VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
         IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
@@ -876,7 +877,19 @@ void VofaSendDebugChannels(void)
         Friction_Data.right.velocity_rpm        // CH5(通道6): 右摩擦轮转速(RPM)
     );
 
-   
+
+
+    // === 视觉跟踪 6 通道（原配置，已注释）===
+    /*
+    APP::Vofa.Send6Floats(
+        VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
+        IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
+        VisionComm_Data.pitch_angle,            // CH2(通道3): 视觉 Pitch 目标
+        IMU_Data.pitch,                         // CH3(通道4): IMU Pitch 反馈
+        Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
+        Friction_Data.right.velocity_rpm        // CH5(通道6): 右摩擦轮转速(RPM)
+    );
+    */
 
     // === Fold 重力补偿 6 通道（Stage04 标定观测，已注释）===
     //   标定 gravity_k 时切回此配置

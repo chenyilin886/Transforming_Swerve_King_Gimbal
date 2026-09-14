@@ -176,6 +176,9 @@ namespace BSP::IMU
         /// @brief 获取温度(单位: °C)
         inline int8_t getTemperature() const { return system_telemetry.temperature; }
 
+        /// @brief 获取 IMU 系统时间戳(单位: ms, 传感器内部计时)
+        inline uint32_t getTimestamp() const { return system_telemetry.system_time; }
+
         /// @brief 获取在线状态(0=离线, 1=在线) — Watch 观察用
         inline uint8_t isOnline() const { return is_online_; }
 

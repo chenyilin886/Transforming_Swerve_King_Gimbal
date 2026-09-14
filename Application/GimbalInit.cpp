@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file GimbalInit.cpp
  * @brief 云台系统初始化与周期更新实现
  *
@@ -1673,6 +1673,7 @@ void GimbalUpdate()
 
         IMU_Data.add_yaw     = BSP::IMU::imu.getAddYaw();    // Yaw累计角度(deg)
 
+        IMU_Data.timestamp   = BSP::IMU::imu.getTimestamp(); // IMU系统时间戳(ms)
         IMU_Data.temperature = BSP::IMU::imu.getTemperature(); // 温度(°C)
         IMU_Data.online      = BSP::IMU::imu.isOnline();     // 在线状态(0=离线, 1=在线)
     }
