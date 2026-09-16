@@ -647,9 +647,9 @@ typedef struct
 
     // === 拨轮触发 ===
     float    wheel_start_threshold; // 拨轮启动阈值, 默认 0.5 (wheel > 该值才触发)
-    uint32_t long_press_ms;         // 长按判定时间(ms), 默认 1000 (持续超过则切连发)
-    float    auto_fire_hz;          // 连发基础频率(Hz), 默认 8 (仅 wheel_to_hz<=0 时使用)
-    float    wheel_to_hz;           // wheel满幅映射频率(Hz), 默认 15 (>0时按wheel值线性映射)
+    uint32_t long_press_ms;         // 持续触发转连发时间(ms)，wheel 和视觉 fire 共用
+    float    auto_fire_hz;          // 固定连发频率(Hz)，视觉始终使用此值
+    float    wheel_to_hz;           // >0 时手动拨轮按幅度调速，0 使用 auto_fire_hz
 
     // === 位置环(外环) PID ===
     //   输入: 误差(rad), 输出: 速度目标(rad/s)
@@ -730,6 +730,9 @@ typedef struct
     uint8_t  jam_detected;          // 卡弹检测触发标志
     uint32_t shot_count;            // 单发累计计数
     uint8_t  online;                // LK4005 在线状态
+    uint8_t  config_mode;           // 0=Dial_Config, 1=UpUp, 2=UpDown
+    uint8_t  vision_control;        // 1=视觉独占触发（即使 fire=0）
+    uint8_t  waiting_release;       // 切配置/触发源后，等待当前触发信号释放
 } Dial_Status_t;
 
 // ========================================================================
@@ -777,7 +780,7 @@ typedef struct
  * 字段说明：
  *   state              : 当前发射机构状态(0=DISABLE,1=STOP,3=AUTO)
  *   safety_ok          : 安全条件是否满足(1=可控制, 0=需失能)
- *   friction_enable    : 摩擦轮使能(0=停, 1=转)，遥控模式由 S1上 + S2上 控制，键鼠模式由 R 键锁存控制
+ *   friction_enable    : 摩擦轮使能(0=停, 1=转)，遥控模式由 S1上 + S2上/下 控制，键鼠模式由 R 键锁存控制
  *   friction_online_l/r: 摩擦轮在线状态(预留)
  *   friction_vel_l/r   : 摩擦轮实际转速(预留)
  *
@@ -794,6 +797,9 @@ typedef struct
     uint8_t  friction_online_r;      // 右摩擦轮在线(预留)
     float    friction_vel_l;         // 左摩擦轮实际转速(RPM, 预留)
     float    friction_vel_r;         // 右摩擦轮实际转速(RPM, 预留)
+    uint8_t  dial_config_mode;       // 0=默认, 1=S1上S2上, 2=S1上S2下
+    uint8_t  vision_control;         // 拨盘触发源由视觉独占
+    uint8_t  waiting_release;        // 等待当前触发信号释放
 } Shoot_Status_t;
 
 // ========================================================================
@@ -1035,6 +1041,8 @@ extern IMU_Data_t         IMU_Data;          // IMU 姿态状态(Stage03 接入�
 extern Remote_State_t     Remote_State;      // 遥控器状态机(急停+展开/收起)
 extern LK4005_Data_t      LK4005_Data;       // LK4005 电机反馈状态
 extern Dial_Config_t      Dial_Config;       // 拨盘双环控制配置(Watch可调)
+extern Dial_Config_t      Dial_Config_UpUp;   // S1上S2上：独立拨盘配置
+extern Dial_Config_t      Dial_Config_UpDown; // S1上S2下：独立拨盘配置
 extern Dial_Status_t      Dial_Status;       // 拨盘双环控制状态(Watch观察)
 extern Shoot_Config_t     Shoot_Config;      // 发射机构整体配置(Watch可调)
 extern Shoot_Status_t     Shoot_Status;      // 发射机构整体状态(Watch观察)

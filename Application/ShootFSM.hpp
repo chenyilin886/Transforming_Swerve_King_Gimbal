@@ -48,7 +48,7 @@
  *     AUTO    : 拨盘可触发(enabled=1)，摩擦轮由右拨杆控制
  *
  *   摩擦轮使能独立于状态机：
- *     - 遥控模式：S1上 + S2上 且无急停/离线 → friction_enable=1
+ *     - 遥控模式：S1上 + S2上/下 且无急停/离线 → friction_enable=1
  *     - 键鼠模式：R 键边沿锁存切换 friction_enable
  *     - 否则 friction_enable=0（直接发 0 电流 + 清 PID）
  *
@@ -82,7 +82,7 @@ namespace BSP::FSM
  *   AUTO    ──(!safety_ok / !shoot_enabled)──→ DISABLE
  *   STOP    ──(预留)──→ AUTO
  *
- * @note 摩擦轮使能独立于此状态机，遥控模式由 S1上 + S2上 控制，键鼠模式由 R 键锁存（见 updateFriction_）
+ * @note 摩擦轮使能独立于此状态机，遥控模式由 S1上 + S2上/下 控制，键鼠模式由 R 键锁存（见 updateFriction_）
  */
 enum class ShootState : uint8_t
 {
@@ -139,7 +139,7 @@ public:
     uint8_t    last_safety_ok;     ///< 上一周期 safety_ok(边沿检测用)
 
     // === 摩擦轮控制字段 ===
-    uint8_t    friction_enable;    ///< 摩擦轮使能(0=停, 1=转), 遥控由 S1上 + S2上 控制, 键鼠由 R 键锁存
+    uint8_t    friction_enable;    ///< 摩擦轮使能(0=停, 1=转), 遥控由 S1上 + S2上/下 控制, 键鼠由 R 键锁存
 
     /**
      * @brief 默认构造
@@ -179,9 +179,9 @@ public:
      * 流程：
      *   1. 安全条件检查（遥控器离线 / 急停 / feature_enable / shoot_enabled）
      *   2. 状态机切换（DISABLE ↔ AUTO）
-     *   3. 把 state 映射到 Dial_Config.enabled（联动拨盘）
+     *   3. 选择挡位配置，把 state 映射到该配置 enabled（联动拨盘）
      *   4. 委托拨盘控制给 dial_ctrl.Update()
-     *   5. 摩擦轮速度环 PID 控制（遥控 S1上 + S2上 / 键鼠 R 键使能）
+     *   5. 摩擦轮速度环 PID 控制（遥控 S1上 + S2上/下 / 键鼠 R 键使能）
      *   6. 回写 Shoot_Status 供 Watch 观察
      *
      * @note 拨盘通过 DialController 间接访问 Motor
@@ -214,13 +214,13 @@ private:
      * @note 摩擦轮 enable 不由此函数控制，由 updateFriction_() 读右拨杆
      * @note 这是 ShootFSM 与 DialController 的唯一耦合点
      */
-    void applyStateToDialConfig_();
+    void applyStateToDialConfig_(Dial_Config_t &cfg);
 
     /**
      * @brief 摩擦轮速度环 PID 控制
      *
      * 使能条件（全部满足才转）：
-     *   - 遥控模式：S1上 + S2上
+     *   - 遥控模式：S1上 + S2上/下
      *   - 键鼠模式：R 键锁存
      *   - 遥控器在线（!IsOffline()）
      *   - 无急停（!(S1==DOWN && S2==DOWN)）

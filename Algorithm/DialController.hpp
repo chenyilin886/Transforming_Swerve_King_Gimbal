@@ -175,6 +175,9 @@ public:
         vel_feedback       = 0.0f;
         pos_error          = 0.0f;
         vel_error          = 0.0f;
+        last_update_ms     = 0;
+        trigger_context_inited_ = false;
+        waiting_release_ = true;
     }
 
     /**
@@ -184,6 +187,7 @@ public:
      * @param dr16   DR16 单例引用
      * @param cfg    Dial_Config_t 配置(Watch 可调)
      * @param status Dial_Status_t 状态(Watch 观察)
+     * @param config_mode 0=默认, 1=S1上S2上, 2=S1上S2下；切换后等待释放
      *
      * 流程：
      *   1. 安全检查(电机指针 / 离线 / 急停 / feature_enable / enabled)
@@ -197,13 +201,20 @@ public:
     void Update(BSP::MOTOR::LK::LK4005 *motor,
                 BSP::Remote::DR16 &dr16,
                 Dial_Config_t &cfg,
-                Dial_Status_t &status)
+                Dial_Status_t &status,
+                uint8_t config_mode = 0)
     {
+        status.config_mode = config_mode;
+        status.vision_control = 0;
+        status.waiting_release = waiting_release_ ? 1U : 0U;
         // ================================================================
         // Step 1: 电机指针安全检查
         // ================================================================
         if (motor == nullptr)
         {
+            trigger_context_inited_ = false;
+            waiting_release_ = true;
+            status.waiting_release = 1;
             status.control_source = 0;  // 0=未控制
             status.torque_cmd     = 0;
             status.online         = 0;
@@ -236,8 +247,16 @@ public:
              Friction_Data.right.online != 0U);
         const bool vision_fire_high =
             (vision_fire_allowed && VisionComm_Data.fire != 0U);
-        const bool safety_stop =
-            (remote_offline || remote_estop) && !vision_fire_high;
+        const bool safety_stop = remote_offline || remote_estop;
+        // Ownership is independent of fire level and vision_ready. fire=0
+        // under vision ownership must not fall back to wheel/mouse.
+        const bool context_changed = !trigger_context_inited_ ||
+            last_config_mode_ != config_mode ||
+            last_vision_control_ != vision_fire_allowed;
+        last_config_mode_ = config_mode;
+        last_vision_control_ = vision_fire_allowed;
+        trigger_context_inited_ = true;
+        status.vision_control = vision_fire_allowed ? 1U : 0U;
 
         // Clear_PID 单次触发命令
         if (cfg.clear_pid)
@@ -247,7 +266,7 @@ public:
             cfg.clear_pid = 0;
         }
 
-        if (!cfg.feature_enable || (!cfg.enabled && !vision_fire_high) || safety_stop)
+        if (!cfg.feature_enable || !cfg.enabled || safety_stop)
         {
             // 安全停止路径：清 PID，发送零力矩，保持 LK4005 在线反馈
             position_pid.clearPID();
@@ -259,6 +278,9 @@ public:
             jam_active         = 0;
             jam_torque_sat_ms  = 0;
             jam_pos_err_ms     = 0;
+            waiting_release_ = true;
+            last_update_ms = HAL_GetTick();
+            status.waiting_release = 1;
 
             status.wheel_input       = 0.0f;
             status.target_angle      = target_angle_rad;
@@ -319,9 +341,26 @@ public:
         float wheel_threshold = clampFloatCfg(cfg.wheel_start_threshold, 0.0f, 0.99f);
         bool  wheel_high = (wheel > wheel_threshold);
         const bool vision_fire_mode = vision_fire_allowed;
-        const bool trigger_high = vision_fire_mode ? vision_fire_high : (mouse_left_high || wheel_high);
-        const uint8_t trigger_source =
-            vision_fire_high ? 2U : (mouse_left_high ? 3U : (wheel_high ? 1U : 0U));
+        const bool raw_trigger_high = vision_fire_mode ? vision_fire_high : (mouse_left_high || wheel_high);
+
+        if (context_changed)
+        {
+            // A committed single shot keeps its target. Switching configuration
+            // or trigger ownership cancels AUTO backlog and holds feedback.
+            if (state == DialState::AUTO)
+            {
+                target_angle_rad = feedback_angle_rad;
+            }
+            if (state != DialState::DISABLE) state = DialState::STOP;
+            last_trigger_high = 0;
+            trigger_high_since_ms = 0;
+            waiting_release_ = true;
+        }
+        if (waiting_release_ && !raw_trigger_high) waiting_release_ = false;
+        const bool trigger_high = !waiting_release_ && raw_trigger_high;
+        const uint8_t trigger_source = !trigger_high ? 0U
+            : (vision_fire_mode ? 2U : (mouse_left_high ? 3U : 1U));
+        status.waiting_release = waiting_release_ ? 1U : 0U;
 
         // 状态机转移
         switch (state)
@@ -381,8 +420,7 @@ public:
                 if (!trigger_high)
                 {
                     // 拨轮释放 → 回到 STOP
-                    // 重置目标到当前反馈：松手即停，不追连发攒下的历史 target
-                    target_angle_rad = feedback_angle_rad;
+                    // 保留已经累计的目标：停止继续累加，但完成当前未完成的一发
                     state = DialState::STOP;
                     trigger_high_since_ms = 0;
                 }
@@ -411,7 +449,7 @@ public:
         last_trigger_high = trigger_high ? 1 : 0;
 
         // 回写拨轮输入到 Dial_Status
-        status.wheel_input = (!vision_fire_mode && wheel_high && !mouse_left_high) ? wheel : 0.0f;
+        status.wheel_input = (trigger_high && !vision_fire_mode && wheel_high && !mouse_left_high) ? wheel : 0.0f;
         status.trigger_source = trigger_source;
         status.vision_fire = vision_fire_mode ? VisionComm_Data.fire : 0U;
         status.state = (uint8_t)state;
@@ -561,6 +599,11 @@ public:
     }
 
 private:
+    bool trigger_context_inited_ = false;
+    bool waiting_release_ = true;
+    uint8_t last_config_mode_ = 0;
+    bool last_vision_control_ = false;
+
     /**
      * @brief 浮点值限幅（私有，避免与 GimbalInit.cpp 中 clampFloat 重名）
      */

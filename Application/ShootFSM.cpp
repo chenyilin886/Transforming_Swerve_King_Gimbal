@@ -46,7 +46,17 @@ void Class_ShootFSM::Control()
     // ================================================================
     // Step 2: 把 state 映射到 Dial_Config.enabled（联动拨盘）
     // ================================================================
-    applyStateToDialConfig_();
+    auto &dr16 = BSP::Remote::DR16::Instance();
+    using Switch = BSP::Remote::DR16::Switch;
+    uint8_t config_mode = 0;
+    if (dr16.GetS1() == Switch::UP)
+    {
+        if (dr16.GetS2() == Switch::UP) config_mode = 1;
+        else if (dr16.GetS2() == Switch::DOWN) config_mode = 2;
+    }
+    Dial_Config_t &cfg = config_mode == 1 ? Dial_Config_UpUp
+                       : config_mode == 2 ? Dial_Config_UpDown : Dial_Config;
+    applyStateToDialConfig_(cfg);
 
     // ================================================================
     // Step 3: 委托拨盘控制给 DialController
@@ -57,14 +67,14 @@ void Class_ShootFSM::Control()
     //   - 双环 PID
     //   - 卡弹检测
     //   - 发送 ctrl_Torque + 回写 Dial_Status
-    auto &dr16 = BSP::Remote::DR16::Instance();
     dial_ctrl.Update(lk4005_motor,
                      dr16,
-                     Dial_Config,
-                     Dial_Status);
+                     cfg,
+                     Dial_Status,
+                     config_mode);
 
     // ================================================================
-    // Step 4: 摩擦轮速度环 PID 控制（S1上 + S2上 使能）
+    // Step 4: 摩擦轮速度环 PID 控制（S1上 + S2上/下 使能）
     // ================================================================
     //   - 读 GM3508 反馈速度
     //   - 位置式 PID 计算电流命令
@@ -136,7 +146,7 @@ void Class_ShootFSM::updateStateMachine_()
 // ========================================================================
 // applyStateToDialConfig_() - state → Dial_Config.enabled 映射
 // ========================================================================
-void Class_ShootFSM::applyStateToDialConfig_()
+void Class_ShootFSM::applyStateToDialConfig_(Dial_Config_t &cfg)
 {
     // 映射规则（见 ShootFSM.hpp 注释）：
     //   DISABLE → Dial_Config.enabled = 0（拨盘零力矩）
@@ -148,15 +158,15 @@ void Class_ShootFSM::applyStateToDialConfig_()
     switch (state)
     {
         case ShootState::DISABLE:
-            Dial_Config.enabled = 0;
+            cfg.enabled = 0;
             break;
 
         case ShootState::STOP:
-            Dial_Config.enabled = 1;
+            cfg.enabled = 1;
             break;
 
         case ShootState::AUTO:
-            Dial_Config.enabled = 1;
+            cfg.enabled = 1;
             break;
     }
 }
@@ -180,13 +190,13 @@ void Class_ShootFSM::updateFriction_()
     // 安全条件判定：摩擦轮使能独立于 ShootFSM 状态机
     // ==================================================================
     // 使能条件（全部满足）：
-    //   1. S1上 + S2上
+    //   1. S1上 + S2上/下
     //   2. 遥控器在线（!IsOffline()）
     //   3. 无急停（!(S1==DOWN && S2==DOWN)）
     //
     // 注：条件 2 和 3 是冗余保护
     //   - 离线时 GetS2() 返回 UNKNOWN（非 UP），条件 1 已覆盖
-    //   - 急停时 S2==DOWN（非 UP），条件 1 已覆盖
+    //   - 急停时 S1==DOWN，条件 1 已覆盖
     //   但显式写出更清晰，便于未来修改使能逻辑
     auto &dr16 = BSP::Remote::DR16::Instance();
     using Switch = BSP::Remote::DR16::Switch;
@@ -195,7 +205,8 @@ void Class_ShootFSM::updateFriction_()
                                 dr16.GetS2() == Switch::MIDDLE &&
                                 KeyboardMouse_Control.enable != 0U);
     const bool friction_switch = (dr16.GetS1() == Switch::UP &&
-                                  dr16.GetS2() == Switch::UP);
+                                  (dr16.GetS2() == Switch::UP ||
+                                   dr16.GetS2() == Switch::DOWN));
     const bool remote_offline  = dr16.IsOffline();
     const bool remote_estop    = (dr16.GetS1() == Switch::DOWN &&
                                   dr16.GetS2() == Switch::DOWN);
@@ -245,7 +256,7 @@ void Class_ShootFSM::updateFriction_()
     else
     {
         // --- 正常/停止：始终跑 PID ---
-        //   S1上+S2上: target = friction_target_rpm（Watch 设定值）
+        //   S1上+S2上/下: target = friction_target_rpm（Watch 设定值）
         //   其他挡位: target = 0（PID 主动刹停，不自由滑停）
         float target   = friction_enable ? Shoot_Config.friction_target_rpm : 0.0f;
         float target_l = +target;
@@ -301,6 +312,9 @@ void Class_ShootFSM::syncStatus_()
     Shoot_Status.friction_enable = friction_enable;
     Shoot_Status.trigger_source = Dial_Status.trigger_source;
     Shoot_Status.vision_fire    = Dial_Status.vision_fire;
+    Shoot_Status.dial_config_mode = Dial_Status.config_mode;
+    Shoot_Status.vision_control = Dial_Status.vision_control;
+    Shoot_Status.waiting_release = Dial_Status.waiting_release;
 }
 
 } // namespace BSP::FSM

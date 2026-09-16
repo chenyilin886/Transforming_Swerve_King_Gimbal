@@ -662,22 +662,22 @@ Dial_Config_t Dial_Config = {
 
     // === 拨轮触发 ===
     .wheel_start_threshold = 0.5f,    // wheel > 0.5 触发(比旧版0.8更柔和)
-    .long_press_ms         = 1,     // 持续 800ms 切换为连发
-    .auto_fire_hz          = 5.0f,    // 连发基础频率 8 Hz (仅 wheel_to_hz<=0 时使用)
-    .wheel_to_hz           = 0.0f,   // wheel 满幅映射到 0 Hz
+    .long_press_ms         = 800,     // 持续 800ms 切换为连发
+    .auto_fire_hz          = 5.0f,    // 视觉/手动固定连发频率 5 Hz
+    .wheel_to_hz           = 0.0f,    // 0=关闭拨轮幅度调速
 
     // === 位置环(外环) PID ===
-    .pos_kp                = 45.0f,    // P, 调好速度环后改 8.0
-    .pos_ki                = 0.3f,    // I, 保持 0
-    .pos_kd                = 0.0f,    // D, 调好速度环后改 0.3
+    .pos_kp                = 41.0f,    // P, 调好速度环后改 8.0
+    .pos_ki                = 0.0f,    // I, 保持 0
+    .pos_kd                = 12.0f,    // D, 调好速度环后改 0.3
     .pos_break_i           = 3.1f,    // 位置误差<0.1rad 才积分
     .pos_limit_i           = 10.0f,    // 位置环 I 项限幅 5 rad/s
     .pos_vel_limit         = 80.0f,   //
 
     // === 速度环(内环) PID ===
     .vel_kp                = 40.0f,    // P, 起步 50
-    .vel_ki                = 0.1f,    // I, 保持 0
-    .vel_kd                = 10.0f,    // D, 起步 1.0
+    .vel_ki                = 0.0f,    // I, 保持 0
+    .vel_kd                = 18.0f,    // D, 起步 1.0
     .vel_break_i           = 10.0f,    // 速度误差<5rad/s 才积分
     .vel_limit_i           = 80.0f,   // 速度环 I 项限幅 80 raw
     .raw_output_limit      = 2048.0f, 
@@ -694,6 +694,26 @@ Dial_Config_t Dial_Config = {
     .jam_reverse_ms        = 200,     // 反转 200ms 解卡
     .jam_reverse_torque    = 250,     // 反转力矩 +250 raw (正负由用户标定)
 };
+
+// Copy defaults once at startup; each object has independent Watch storage.
+// PID/geometry/jam defaults follow Dial_Config; trigger settings are editable here.
+Dial_Config_t Dial_Config_UpUp = [] {
+    Dial_Config_t cfg = Dial_Config;
+    cfg.wheel_start_threshold = 0.5f;
+    cfg.long_press_ms = 800;
+    cfg.auto_fire_hz = 5.0f;
+    cfg.wheel_to_hz = 0.0f;
+    return cfg;
+}();
+
+Dial_Config_t Dial_Config_UpDown = [] {
+    Dial_Config_t cfg = Dial_Config;
+    cfg.wheel_start_threshold = 0.5f;
+    cfg.long_press_ms = 1;
+    cfg.auto_fire_hz = 5.0f;
+    cfg.wheel_to_hz = 0.0f;
+    return cfg;
+}();
 
 Dial_Status_t Dial_Status = {
     .state              = 0,         // DISABLE
@@ -715,6 +735,9 @@ Dial_Status_t Dial_Status = {
     .jam_detected       = 0,
     .shot_count         = 0,
     .online             = 0,         // 0=LK4005 初始按离线处理
+    .config_mode        = 0,
+    .vision_control     = 0,
+    .waiting_release    = 0,
 };
 
 // ========================================================================
@@ -753,6 +776,9 @@ Shoot_Status_t Shoot_Status = {
     .friction_online_r  = 0,
     .friction_vel_l     = 0.0f,
     .friction_vel_r     = 0.0f,
+    .dial_config_mode   = 0,
+    .vision_control     = 0,
+    .waiting_release    = 0,
 };
 
 // ========================================================================
@@ -827,7 +853,7 @@ VisionComm_Data_t VisionComm_Data = {
     .fire         = 0,
     .timestamp    = 0,
     .aim_x        = 0,
-    .aim_y        = 0,
+    .aim_y        = 0,  
     .online       = 0,       // 初始离线（等待视觉上位机连接）
     
     // --- 发送统计（初始值）---
@@ -861,20 +887,20 @@ VisionComm_Data_t VisionComm_Data = {
  */
 void VofaSendDebugChannels(void)
 {
-    // === 拨盘电机观测 + IMU 状态（通道1/2 改为 4005 拨盘目标与反馈）===
-    //   CH0(通道1): Dial_Status.target_angle    拨盘目标角度(rad)
-    //   CH1(通道2): Dial_Status.feedback_angle  拨盘反馈角度(rad)
-    //   CH2(通道3): IMU_Data.gyro_x             X 轴角速度(deg/s)
-    //   CH3(通道4): IMU_Data.gyro_y             Y 轴角速度(deg/s)
-    //   CH4(通道5): IMU_Data.gyro_z             Z 轴角速度(deg/s)
-    //   CH5(通道6): IMU_Data.online             在线状态(0/1)
+    // === 4005 拨盘电机观测（目标值 vs 反馈）===
+    //   CH0(通道1): Dial_Status.target_angle       拨盘目标角度(rad, 多圈)
+    //   CH1(通道2): Dial_Status.feedback_angle     拨盘反馈角度(rad, LK4005累计角度)
+    //   CH2(通道3): Dial_Status.target_velocity    速度环目标(rad/s) = 位置环输出
+    //   CH3(通道4): Dial_Status.feedback_velocity  速度环反馈(rad/s)
+    //   CH4(通道5): Dial_Status.error              位置环误差(rad)
+    //   CH5(通道6): Dial_Status.torque_cmd         最终发送的 LK raw 力矩命令
     APP::Vofa.Send6Floats(
-        VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
-        IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
-        VisionComm_Data.pitch_angle,            // CH2(通道3): 视觉 Pitch 目标
-        IMU_Data.pitch,                         // CH3(通道4): IMU Pitch 反馈
-        Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
-        Friction_Data.right.velocity_rpm        // CH5(通道6): 右摩擦轮转速(RPM)
+        Dial_Status.target_angle,               // CH0(通道1): 拨盘目标角度
+        Dial_Status.feedback_angle,             // CH1(通道2): 拨盘反馈角度
+        Dial_Status.target_velocity,            // CH2(通道3): 速度环目标
+        Dial_Status.feedback_velocity,          // CH3(通道4): 速度环反馈
+        Dial_Status.error,                      // CH4(通道5): 位置环误差
+        (float)Dial_Status.torque_cmd           // CH5(通道6): 输出力矩命令(raw)
     );
 
 

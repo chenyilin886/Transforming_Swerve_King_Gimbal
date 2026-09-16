@@ -279,7 +279,8 @@ static inline void syncDataToController(const Controller_Data_Unit_t &data,
  */
 static inline void syncControllerToData(const BSP::CTRL::JointController &ctrl,
                                         Controller_Data_Unit_t &data,
-                                        const BSP::JOINT::Joint &joint)
+                                        const BSP::JOINT::Joint &joint,
+                                        bool sync_control_mode = true)
 {
     data.feedback_angle = ctrl.feedback_angle;
     data.error          = ctrl.error;
@@ -289,7 +290,8 @@ static inline void syncControllerToData(const BSP::CTRL::JointController &ctrl,
     data.torque_output  = ctrl.torque_output;
     data.gravity_torque = ctrl.gravity_torque;  // 重力补偿输出(N·m)
     data.enabled        = ctrl.enabled;
-    data.cascade_mode   = ctrl.cascade_mode;
+    // Preserve manual mode settings while publishing vision runtime feedback.
+    if (sync_control_mode) data.cascade_mode = ctrl.cascade_mode;
     // 回写 target_angle：首次初始化时让 Watch 看到当前实际 target
     data.target_angle   = ctrl.target_angle;
     // 限位值从 Joint 同步
@@ -918,14 +920,18 @@ void GimbalUpdate()
     const bool gimbal_deploy_requested =
         (s1_mode == RemoteSwitch::MIDDLE || s1_mode == RemoteSwitch::UP);
     const bool vision_requested =
-        (s1_mode == RemoteSwitch::UP && s2_mode == RemoteSwitch::UP);
+        (s1_mode == RemoteSwitch::UP &&
+         (s2_mode == RemoteSwitch::UP || s2_mode == RemoteSwitch::DOWN));
     const bool vision_ready =
         (vision_requested && VisionComm_Data.online && VisionComm_Data.vision_ready);
+    const bool transform_busy = BSP::PLANNER::isTransitionState(
+        static_cast<BSP::PLANNER::TransformState>(Transform_Status.state));
+    const bool vision_can_control = vision_ready && !Remote_State.estop_active && !transform_busy;
 
     static uint8_t vision_active = 0;
     uint8_t vision_just_entered = 0;
 
-    if (vision_ready && !vision_active)
+    if (vision_can_control && !vision_active)
     {
         vision_active = 1;
         vision_just_entered = 1;
@@ -947,13 +953,33 @@ void GimbalUpdate()
                 Controller_Data.yaw.cascade_mode = 1;
                 FollowMode_Data.control_mode = 0;
             }
-            Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
+            Controller_Data.yaw.target_angle = gimbal_controller.imu_online
+                ? gimbal_controller.yaw_imu_angle : joint_manager.yaw.getNormalizedAngle();
         }
+        gimbal_controller.yaw.position_pid.clearPID();
+        gimbal_controller.yaw.velocity_pid.clearPID();
+        gimbal_controller.pitch.position_pid.clearPID();
+        gimbal_controller.pitch.velocity_pid.clearPID();
     }
-    else if (!vision_ready && vision_active)
+    else if (!vision_can_control && vision_active)
     {
         vision_active = 0;
         vision_just_entered = 0;
+        // Planner owns targets during transformation. Otherwise manual control
+        // resumes at feedback, rather than chasing the last vision target.
+        if (!transform_busy && !Remote_State.estop_active)
+        {
+            if (joint_manager.yaw.isOnline())
+                Controller_Data.yaw.target_angle = gimbal_controller.imu_online
+                    ? gimbal_controller.yaw_imu_angle : joint_manager.yaw.getNormalizedAngle();
+            if (joint_manager.pitch.isOnline())
+                Controller_Data.pitch.target_angle = gimbal_controller.imu_online
+                    ? gimbal_controller.pitch_imu_angle : joint_manager.pitch.getRealAngle();
+        }
+        gimbal_controller.yaw.position_pid.clearPID();
+        gimbal_controller.yaw.velocity_pid.clearPID();
+        gimbal_controller.pitch.position_pid.clearPID();
+        gimbal_controller.pitch.velocity_pid.clearPID();
     }
 
     // ---------------------------------------------------------------
@@ -1444,18 +1470,18 @@ void GimbalUpdate()
     bool is_transition = BSP::PLANNER::isTransitionState(
         static_cast<BSP::PLANNER::TransformState>(Transform_Status.state));
 
-    Controller_Data_Unit_t yaw_sync = vision_requested ? Vision_Controller_Data.yaw : Controller_Data.yaw;
+    Controller_Data_Unit_t yaw_sync = vision_active ? Vision_Controller_Data.yaw : Controller_Data.yaw;
     yaw_sync.target_angle = Controller_Data.yaw.target_angle;
     yaw_sync.enabled = Controller_Data.yaw.enabled;
 
-    Controller_Data_Unit_t pitch_sync = vision_requested ? Vision_Controller_Data.pitch : Controller_Data.pitch;
+    Controller_Data_Unit_t pitch_sync = vision_active ? Vision_Controller_Data.pitch : Controller_Data.pitch;
     pitch_sync.target_angle = Controller_Data.pitch.target_angle;
     pitch_sync.enabled = Controller_Data.pitch.enabled;
 
     // Vision mode uses its own PID parameters and forces Yaw inner-loop
     // velocity feedback back to the motor encoder. Other modes keep the
     // current IMU-velocity inner-loop behavior.
-    gimbal_controller.yaw_inner_vel_use_encoder = vision_requested ? 1 : 0;
+    gimbal_controller.yaw_inner_vel_use_encoder = vision_active ? 1 : 0;
 
     // Yaw轴：非跟随模式 或 变形期间 都要同步
     if (FollowMode_Data.control_mode == 0 || is_transition) {
@@ -1552,11 +1578,11 @@ void GimbalUpdate()
     syncJointToData(joint_manager.pitch, Joint_Data.pitch);
     syncJointToData(joint_manager.fold,  Joint_Data.fold);
 
-    syncControllerToData(gimbal_controller.yaw,   Controller_Data.yaw,   joint_manager.yaw);
-    syncControllerToData(gimbal_controller.pitch, Controller_Data.pitch, joint_manager.pitch);
+    syncControllerToData(gimbal_controller.yaw,   Controller_Data.yaw,   joint_manager.yaw, !vision_active);
+    syncControllerToData(gimbal_controller.pitch, Controller_Data.pitch, joint_manager.pitch, !vision_active);
     syncControllerToData(gimbal_controller.fold,  Controller_Data.fold,  joint_manager.fold);
 
-    if (vision_requested)
+    if (vision_active)
     {
         syncControllerToData(gimbal_controller.yaw,   Vision_Controller_Data.yaw,   joint_manager.yaw);
         syncControllerToData(gimbal_controller.pitch, Vision_Controller_Data.pitch, joint_manager.pitch);
@@ -1564,7 +1590,7 @@ void GimbalUpdate()
 
     // Yaw + Pitch IMU 反馈源 → Watch（观察 feedback_source 判断当前闭环方式）
     syncImuToData(gimbal_controller, Controller_Data.yaw, Controller_Data.pitch);
-    if (vision_requested)
+    if (vision_active)
     {
         syncImuToData(gimbal_controller, Vision_Controller_Data.yaw, Vision_Controller_Data.pitch);
     }
@@ -1763,7 +1789,7 @@ void GimbalUpdate()
     {
         static uint8_t vision_counter = 0;
         vision_counter++;
-        if (vision_counter >= 5)  // 1000Hz / 5 = 200Hz
+        if (vision_counter >= 2)  // 1000Hz / 5 = 200Hz
         {
             vision_counter = 0;
             VisionComm::Manager::Instance().Send();
