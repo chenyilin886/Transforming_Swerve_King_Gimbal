@@ -10,7 +10,10 @@
  *     - 位置环(位置式 PID) → 速度目标
  *     - 速度环(位置式 PID) → 力矩 raw 命令
  *     - 单击单发：wheel / mouse_left 上沿触发，或视觉 fire 脉冲触发，每次目标角度 += angle_per_shot
- *     - 长按连发：wheel / mouse_left 持续超过 long_press_ms，或视觉 fire 持续为 1，按 fire_hz 累加目标角度
+ *     - 长按连发：持续超过 long_press_ms 后，按 fire_hz 连续线性增加目标
+ *     - 直接连发：DIRECT_AUTO首周期进入AUTO，不提交起始40°单发
+ *     - 连发停火立即制动并保持当前位置；单发仍完成40°
+ *     - 上电时以当前A1累计角为目标，不执行机械槽位修正
  *     - 卡弹检测：力矩饱和 + 位置误差持续 → 反转解卡
  *
  * 与参考工程差异：
@@ -34,7 +37,7 @@
  * 安全策略：
  *   - 遥控器离线 / 急停(S1&&S2 DOWN) / feature_enable=0 / enabled=0
  *     → 清 PID，发送零力矩(0xA1=0)，保持 LK4005 在线反馈
- *   - 电机离线 → 不发送 CAN 命令（避免空指针解引用）
+ *   - 电机离线 / A1过期或反馈无效 → 零力矩，不接收发弹
  *   - 卡弹检测触发 → 反转 jam_reverse_ms 后自动恢复
  *
  * 调参建议（参考工程实测 + LK4005 特性）：
@@ -48,7 +51,7 @@
  *      pos_ki = 0    (拨盘是供弹, 不需要消除稳态误差)
  *   ③ 单发触发测试：
  *      Watch 中 pos_kp/pos_kd 设好后, 拨轮短暂上抬一次
- *      观察 Dial_Status.target_angle 应减 40°, 反馈角度跟随到位
+ *      观察 Dial_Status.target_angle 应增加 40°, 反馈角度跟随到位
  *   ④ 卡弹检测：
  *      手堵拨盘 → 力矩饱和 + 位置误差大 → 反转解卡
  *      初调时 jam_detect_enable=0, 防止误触发
@@ -73,6 +76,7 @@ namespace BSP::CTRL
  * 状态转移：
  *   DISABLE ──(enabled=1 & safety_ok)──→ STOP
  *   STOP ──(wheel/fire 上沿)──→ SINGLE
+ *   STOP ──(DIRECT_AUTO模式下wheel/fire上沿)──→ AUTO
  *   SINGLE ──(wheel/fire 持续 > long_press_ms)──→ AUTO
  *   SINGLE ──(wheel < threshold)──→ STOP
  *   AUTO ──(wheel < threshold)──→ STOP
@@ -84,7 +88,7 @@ enum class DialState : uint8_t
     DISABLE = 0,   ///< 失能：发送零力矩，PID 清零
     STOP    = 1,   ///< 停止：target_angle 保持，PID 把拨盘拉停
     SINGLE  = 2,   ///< 单发：wheel/fire 上沿瞬间，target_angle += angle_per_shot
-    AUTO    = 3,   ///< 连发：wheel/fire 持续触发，target_angle += hz_to_angle(fire_hz) * dt
+    AUTO    = 3,   ///< 连发：每周期按频率线性增加目标，无起步加速曲线
 };
 
 
@@ -125,7 +129,7 @@ public:
     // === 累计目标角度 ===
     float target_angle_rad;   ///< 目标累计角度(rad, 多圈)
     float feedback_angle_rad; ///< 反馈累计角度(rad, 来自 LK4005.getAddAngleRad)
-    uint8_t target_inited;    ///< 目标是否已初始化(首次使能时贴当前反馈)
+    uint8_t target_inited;    ///< 是否已用当前A1累计角建立相对位置目标
 
     // === 卡弹检测字段 ===
     uint8_t  jam_active;         ///< 卡弹解卡中标志(1=正在反转)
@@ -178,6 +182,12 @@ public:
         last_update_ms     = 0;
         trigger_context_inited_ = false;
         waiting_release_ = true;
+        reference_was_ever_inited_ = false;
+        home_ready_ = false;
+        auto_shot_phase_ = 0.0;
+        raw_override_was_active_ = false;
+        single_pending_ = false;
+        reference_after_ms_ = HAL_GetTick();
     }
 
     /**
@@ -207,11 +217,17 @@ public:
         status.config_mode = config_mode;
         status.vision_control = 0;
         status.waiting_release = waiting_release_ ? 1U : 0U;
+        status.home_delta_deg = 0.0f;
         // ================================================================
         // Step 1: 电机指针安全检查
         // ================================================================
         if (motor == nullptr)
         {
+            Reset();
+            status.home_state = 0;
+            status.slot_reference_valid = 0;
+            status.home_feedback_valid = 0;
+            status.home_error_deg = 0.0f;
             trigger_context_inited_ = false;
             waiting_release_ = true;
             status.waiting_release = 1;
@@ -229,6 +245,34 @@ public:
         status.feedback_velocity  = motor->getVelocityRad(1);
         status.feedback_angle     = motor->getAddAngleRad(1);  // 多圈累计角度(rad)
         feedback_angle_rad        = status.feedback_angle;
+        const uint32_t now_ms = HAL_GetTick();
+        const auto a1 = motor->getA1Position(1);
+        status.feedback_angle = feedback_angle_rad = a1.accumulated_rad;
+        status.feedback_velocity = a1.velocity_rad;
+        status.a1_output_deg = a1.output_phase_deg;
+        if (!status.online)
+        {
+            target_inited = 0;
+            home_ready_ = false;
+            reference_after_ms_ = now_ms;
+        }
+        if (target_inited && raw_override_was_active_ && !cfg.raw_override_enable)
+        {
+            // Leaving direct torque control must not invoke mechanical correction.
+            // Resume position control from the actual current position.
+            HoldCurrent();
+            state = DialState::STOP;
+            waiting_release_ = true;
+            raw_override_was_active_ = false;
+        }
+        const bool feedback_valid = a1.valid && std::isfinite(a1.accumulated_rad) &&
+            std::isfinite(a1.velocity_rad) &&
+            now_ms - a1.received_ms <= 100U;
+        // A fresh A1 sample is enough to establish the local accumulated-angle
+        // coordinate. Requiring the feeder to stop here made a moving/recovering
+        // mechanism stay disabled even though valid feedback was available.
+        const bool reference_valid = feedback_valid &&
+            int32_t(a1.received_ms - reference_after_ms_) >= 0;
 
         // ================================================================
         // Step 2: 安全条件检查（遥控器离线 / 急停 / feature 关闭）
@@ -250,10 +294,11 @@ public:
         const bool safety_stop = remote_offline || remote_estop;
         // Ownership is independent of fire level and vision_ready. fire=0
         // under vision ownership must not fall back to wheel/mouse.
-        const bool context_changed = !trigger_context_inited_ ||
-            last_config_mode_ != config_mode ||
-            last_vision_control_ != vision_fire_allowed;
+        const bool context_changed = trigger_context_inited_ &&
+            (last_config_mode_ != config_mode || last_fire_mode_ != cfg.fire_mode ||
+             last_vision_control_ != vision_fire_allowed);
         last_config_mode_ = config_mode;
+        last_fire_mode_ = cfg.fire_mode;
         last_vision_control_ = vision_fire_allowed;
         trigger_context_inited_ = true;
         status.vision_control = vision_fire_allowed ? 1U : 0U;
@@ -266,8 +311,23 @@ public:
             cfg.clear_pid = 0;
         }
 
-        if (!cfg.feature_enable || !cfg.enabled || safety_stop)
+        const bool inhibited = !cfg.feature_enable || !cfg.enabled || safety_stop ||
+            !status.online ||
+            (cfg.fire_mode != DialFireMode::SINGLE_THEN_AUTO &&
+             cfg.fire_mode != DialFireMode::DIRECT_AUTO) ||
+            cfg.slots_per_rotation != 9.0f || cfg.angle_per_shot_deg != 40.0f;
+
+        status.home_feedback_valid = feedback_valid ? 1U : 0U;
+        status.home_error_deg = 0.0f;
+        if (inhibited || !feedback_valid || (!target_inited && !reference_valid))
         {
+            if (inhibited || !feedback_valid) reference_after_ms_ = now_ms;
+            home_ready_ = false;
+            auto_shot_phase_ = 0.0;
+            raw_override_was_active_ = false;
+            single_pending_ = false;
+            status.home_state = inhibited ? 0U : 1U;
+            status.slot_reference_valid = 0;
             // 安全停止路径：清 PID，发送零力矩，保持 LK4005 在线反馈
             position_pid.clearPID();
             velocity_pid.clearPID();
@@ -297,45 +357,62 @@ public:
             status.jam_detected      = 0;
             status.trigger_source    = 0;
             status.vision_fire       = 0;
-            status.shot_count        = status.shot_count;  // 保留累计
             motor->ctrl_Torque(1, 0);  // 零力矩保反馈
             return;
         }
 
-        // 首次进入可控状态时，把目标贴到当前反馈，避免继续追上一次的累计目标。
+        // Establish only a local accumulated-angle reference. Startup never moves
+        // the mechanism to a calibrated phase or a nominal 40-degree slot.
         if (!target_inited)
         {
-            target_angle_rad = feedback_angle_rad;
+            target_angle_rad = a1.accumulated_rad;
+            trajectory_angle_rad_ = target_angle_rad;
+            single_pending_ = false;
+            status.home_delta_deg = 0.0f;
+            home_ready_ = true;
+            state = DialState::STOP;
+            last_trigger_high = 0;
+            auto_shot_phase_ = 0.0;
+            // The first startup reference may immediately accept a held wheel.
+            // A later re-reference follows a safety interruption and still
+            // requires release to prevent an unintended restart.
+            waiting_release_ = reference_was_ever_inited_;
+            reference_was_ever_inited_ = true;
             position_pid.clearPID();
             velocity_pid.clearPID();
-            vel_target = 0.0f;
-            vel_error  = 0.0f;
-            pos_error  = 0.0f;
+            vel_target = vel_error = pos_error = 0.0f;
             target_inited = 1;
         }
+
+        status.slot_reference_valid = 1;
+        const auto is_at_target = [&]() {
+            status.home_error_deg = (target_angle_rad - feedback_angle_rad) * (180.0f / PI);
+            return feedback_valid && fabsf(target_angle_rad - feedback_angle_rad) <= target_tolerance_rad_ &&
+                fabsf(status.feedback_velocity) < 0.1f;
+        };
+        const bool at_target = is_at_target();
+        if (single_pending_ && at_target) single_pending_ = false;
 
         // ================================================================
         // Step 3: 时间戳与 dt 计算
         // ================================================================
         // 使用 HAL_GetTick() 获取毫秒级时间戳
-        uint32_t now_ms = HAL_GetTick();
         if (last_update_ms == 0) last_update_ms = now_ms;
         uint32_t dt_ms = now_ms - last_update_ms;
         last_update_ms = now_ms;
         // 限幅 dt，避免首次调用或长时间挂起后 dt 过大导致目标角度跳变
         if (dt_ms > 50) dt_ms = 50;
-        float dt_s = (float)dt_ms * 0.001f;
 
         // ================================================================
         // Step 4: 状态机 - 单击/长按判定
         // ================================================================
         // 拨轮读取与阈值处理
         //   wheel 范围 [-1, 1]，参考工程用 wheel > 0 触发(向下拨)
-        //   本工程也用 wheel > threshold 触发，方向由 wheel_to_speed 正负决定
-        //   （wheel_to_speed < 0 表示拨盘反转，对应参考工程 Dail_target_pos -= angle_per_shot）
+        //   本工程用 wheel > threshold 触发，正常发弹统一增加 40°。
         // Vision fire is allowed only while the DR16 is still in vision-enabled
         // switch positions; leaving vision mode immediately drops this path.
-        // vision fire: one high pulse = one shot; continuous high = auto fire.
+        // SINGLE_THEN_AUTO commits a shot on an edge; DIRECT_AUTO integrates only
+        // while fire is high, including short pulses, without an initial 40-degree step.
         float wheel = (float)dr16.GetWheel();
         const bool mouse_left_high = dr16.GetMouse().left;
         float wheel_threshold = clampFloatCfg(cfg.wheel_start_threshold, 0.0f, 0.99f);
@@ -343,122 +420,131 @@ public:
         const bool vision_fire_mode = vision_fire_allowed;
         const bool raw_trigger_high = vision_fire_mode ? vision_fire_high : (mouse_left_high || wheel_high);
 
+        if (jam_active && !raw_trigger_high && !single_pending_)
+        {
+            // Releasing AUTO also cancels its ongoing reverse unjam action.
+            jam_active = 0;
+            status.jam_detected = 0;
+            HoldCurrent();
+        }
+        // A fresh A1 coordinate is the only position prerequisite; there is no
+        // startup or idle slot-correction state.
+        const bool firing_ready = target_inited && feedback_valid &&
+            !jam_active && !cfg.raw_override_enable;
+        if (state == DialState::AUTO &&
+            (context_changed || !firing_ready || !raw_trigger_high))
+        {
+            // Cancel all unexecuted lead once; the velocity loop brakes immediately.
+            HoldCurrent();
+        }
         if (context_changed)
         {
-            // A committed single shot keeps its target. Switching configuration
-            // or trigger ownership cancels AUTO backlog and holds feedback.
-            if (state == DialState::AUTO)
-            {
-                target_angle_rad = feedback_angle_rad;
-            }
+            auto_shot_phase_ = 0.0;
             if (state != DialState::DISABLE) state = DialState::STOP;
             last_trigger_high = 0;
             trigger_high_since_ms = 0;
             waiting_release_ = true;
         }
-        if (waiting_release_ && !raw_trigger_high) waiting_release_ = false;
+        if (!firing_ready)
+        {
+            waiting_release_ = true;
+            auto_shot_phase_ = 0.0;
+            state = DialState::STOP;
+        }
+        if (firing_ready && waiting_release_ && !raw_trigger_high) waiting_release_ = false;
         const bool trigger_high = !waiting_release_ && raw_trigger_high;
         const uint8_t trigger_source = !trigger_high ? 0U
             : (vision_fire_mode ? 2U : (mouse_left_high ? 3U : 1U));
         status.waiting_release = waiting_release_ ? 1U : 0U;
 
-        // 状态机转移
+        if (trigger_high)
+        {
+            home_ready_ = true;
+        }
+
         switch (state)
         {
             case DialState::DISABLE:
-                state = DialState::STOP;
-                last_trigger_high = 0;
-                trigger_high_since_ms = 0;
-                if (trigger_high)
-                {
-                    state = DialState::SINGLE;
-                    trigger_high_since_ms = now_ms;
-                    float angle_per_shot_rad =
-                        cfg.angle_per_shot_deg * (PI / 180.0f);
-                    target_angle_rad += angle_per_shot_rad;
-                    status.shot_count++;
-                }
-                break;
-
             case DialState::STOP:
+                state = DialState::STOP;
                 if (trigger_high && !last_trigger_high)
                 {
-                    // 上沿：触发单发
-                    state = DialState::SINGLE;
                     trigger_high_since_ms = now_ms;
-                    // 单发：目标角度增加 angle_per_shot_deg（一个弹槽）
-                    //   方向说明:
-                    //     本工程 LK4005 raw 命令为正 → 电机正转 → feedback_angle 增大
-                    //     (已用 raw_override 模式实测确认)
-                    //     拨盘供弹方向 = 电机正转方向, 因此 target_angle 应往正方向走
-                    //     使位置环输出正 raw 命令, 电机正转, feedback_angle 增大并朝 target 靠近
-                    //   与参考工程差异:
-                    //     参考工程 ShootTask.cpp 用 -= 是因其电机正转方向与供弹方向相反
-                    float angle_per_shot_rad =
-                        cfg.angle_per_shot_deg * (PI / 180.0f);
-                    target_angle_rad += angle_per_shot_rad;
-                    status.shot_count++;
+                    if (cfg.fire_mode == DialFireMode::DIRECT_AUTO)
+                    {
+                        state = DialState::AUTO;
+                        single_pending_ = false;
+                        auto_shot_phase_ = 0.0;
+                    }
+                    else
+                    {
+                        state = DialState::SINGLE;
+                        CommitShot(status);
+                    }
                 }
                 break;
-
             case DialState::SINGLE:
                 if (!trigger_high)
                 {
-                    // 拨轮释放 → 回到 STOP
-                    // 注意：不重置 target，单发是"已提交"动作，必须走完 40°
+                    // A single pulse still completes its full 40-degree target.
                     state = DialState::STOP;
                     trigger_high_since_ms = 0;
                 }
-                else if (trigger_high && (now_ms - trigger_high_since_ms) >= cfg.long_press_ms)
+                else if (now_ms - trigger_high_since_ms >= cfg.long_press_ms)
                 {
-                    // 长按时间到 → 切换为连发
                     state = DialState::AUTO;
+                    single_pending_ = false;
+                    auto_shot_phase_ = 0.0;
                 }
                 break;
-
             case DialState::AUTO:
                 if (!trigger_high)
                 {
-                    // 拨轮释放 → 回到 STOP
-                    // 保留已经累计的目标：停止继续累加，但完成当前未完成的一发
                     state = DialState::STOP;
                     trigger_high_since_ms = 0;
-                }
-                else
-                {
-                    // 连发：每周期累加目标角度
-                    //   angle_per_frame = fire_hz * (360 / slots) * dt
-                    //   方向：与单发一致，使用 += (供弹方向 = feedback 增大方向)
-                    //   wheel 满幅映射到 wheel_to_hz 频率
-                    float fire_hz = cfg.auto_fire_hz;
-                    if (!vision_fire_mode && wheel_high && cfg.wheel_to_hz > 0.0f)
-                    {
-                        // 拨轮值越大，连发越快（线性映射）
-                        float wheel_norm =
-                            (wheel - wheel_threshold) / (1.0f - wheel_threshold);
-                        if (wheel_norm < 0.0f) wheel_norm = 0.0f;
-                        if (wheel_norm > 1.0f) wheel_norm = 1.0f;
-                        fire_hz = wheel_norm * cfg.wheel_to_hz;
-                    }
-                    float angle_per_frame_deg =
-                        fire_hz * (360.0f / cfg.slots_per_rotation) * dt_s;
-                    target_angle_rad += angle_per_frame_deg * (PI / 180.0f);
+                    auto_shot_phase_ = 0.0;
                 }
                 break;
         }
+
+        // Integrate on every AUTO cycle, including the first: no acceleration ramp.
+        if (state == DialState::AUTO && trigger_high)
+        {
+            float fire_hz = cfg.auto_fire_hz;
+            if (!vision_fire_mode && wheel_high && cfg.wheel_to_hz > 0.0f)
+            {
+                const float wheel_norm = clampFloatCfg(
+                    (wheel - wheel_threshold) / (1.0f - wheel_threshold), 0.0f, 1.0f);
+                fire_hz = wheel_norm * cfg.wheel_to_hz;
+            }
+            if (std::isfinite(fire_hz) && fire_hz > 0.0f)
+            {
+                const double shots = double(fminf(fire_hz, 50.0f)) * double(dt_ms) / 1000.0;
+                trajectory_angle_rad_ += shots * shot_step_rad_;
+                target_angle_rad = float(trajectory_angle_rad_);
+                auto_shot_phase_ += shots;
+                while (auto_shot_phase_ + 1e-9 >= 1.0)
+                {
+                    ++status.shot_count; // Planned whole slots, not sensed bullets.
+                    auto_shot_phase_ -= 1.0;
+                }
+            }
+        }
         last_trigger_high = trigger_high ? 1 : 0;
 
-        // 回写拨轮输入到 Dial_Status
         status.wheel_input = (trigger_high && !vision_fire_mode && wheel_high && !mouse_left_high) ? wheel : 0.0f;
         status.trigger_source = trigger_source;
         status.vision_fire = vision_fire_mode ? VisionComm_Data.fire : 0U;
         status.state = (uint8_t)state;
+        const bool target_reached = is_at_target();
+        status.home_state = target_reached ? 3U : 2U;
 
         // ================================================================
         // Step 5: raw_override 模式（绕过 PID，直接发送原始命令）
         // ================================================================
-        if (cfg.raw_override_enable)
+        if (cfg.raw_override_enable && home_ready_)
         {
+            raw_override_was_active_ = true;
             int16_t raw_cmd = toLkRawCmd((float)cfg.raw_override_cmd);
             position_pid.clearPID();
             velocity_pid.clearPID();
@@ -471,6 +557,7 @@ public:
             status.pid_d           = 0.0f;
             status.torque_cmd      = raw_cmd;
             status.control_source  = 2;
+            status.home_state = 2; // Direct torque is not a position-holding mode.
             motor->ctrl_Torque(1, raw_cmd);
             return;
         }
@@ -479,21 +566,21 @@ public:
         // Step 6: 双环 PID 计算
         // ================================================================
         // 同步 PID 参数（Watch 在线调参）
-        kpid_pos.kp = cfg.pos_kp;
-        kpid_pos.ki = cfg.pos_ki;
-        kpid_pos.kd = cfg.pos_kd;
-        kpid_vel.kp = cfg.vel_kp;
-        kpid_vel.ki = cfg.vel_ki;
-        kpid_vel.kd = cfg.vel_kd;
-        position_pid.pid.Break_I = cfg.pos_break_i;
-        position_pid.pid.MixI    = cfg.pos_limit_i;
-        velocity_pid.pid.Break_I = cfg.vel_break_i;
-        velocity_pid.pid.MixI    = cfg.vel_limit_i;
+        kpid_pos.kp = Dial_PID_Config.pos_kp;
+        kpid_pos.ki = Dial_PID_Config.pos_ki;
+        kpid_pos.kd = Dial_PID_Config.pos_kd;
+        kpid_vel.kp = Dial_PID_Config.vel_kp;
+        kpid_vel.ki = Dial_PID_Config.vel_ki;
+        kpid_vel.kd = Dial_PID_Config.vel_kd;
+        position_pid.pid.Break_I = Dial_PID_Config.pos_break_i;
+        position_pid.pid.MixI    = Dial_PID_Config.pos_limit_i;
+        velocity_pid.pid.Break_I = Dial_PID_Config.vel_break_i;
+        velocity_pid.pid.MixI    = Dial_PID_Config.vel_limit_i;
 
         // 外环：位置环 PID（位置式）
         //   输入: target_angle_rad (rad), feedback_angle_rad (rad)
         //   输出: vel_target (rad/s), 限幅到 [-pos_vel_limit, pos_vel_limit]
-        float pos_vel_limit = clampFloatCfg(cfg.pos_vel_limit, 0.0f, 100.0f);
+        float pos_vel_limit = clampFloatCfg(Dial_PID_Config.pos_vel_limit, 0.0f, 100.0f);
         vel_target = (float)position_pid.GetPidPos(
             kpid_pos,
             (double)target_angle_rad,
@@ -505,14 +592,13 @@ public:
         //   输入: vel_target (rad/s), vel_feedback (rad/s)
         //   输出: raw 命令, 限幅到 [-raw_output_limit, raw_output_limit]
         vel_feedback = status.feedback_velocity;
-        float raw_limit = clampFloatCfg(cfg.raw_output_limit, 0.0f, 2048.0f);
+        float raw_limit = clampFloatCfg(Dial_PID_Config.raw_output_limit, 0.0f, 2048.0f);
         float raw_output = (float)velocity_pid.GetPidPos(
             kpid_vel,
             (double)vel_target,
             (double)vel_feedback,
             (double)raw_limit);
         vel_error = (float)velocity_pid.GetErr();
-
         // ================================================================
         // Step 7: 卡弹检测
         // ================================================================
@@ -522,7 +608,8 @@ public:
         //   解卡动作：
         //     反转 jam_reverse_ms 时间，期间命令取反方向
         //     解卡完成后清状态，恢复正常控制
-        if (cfg.jam_detect_enable)
+        if (cfg.jam_detect_enable && home_ready_ &&
+            (trigger_high || single_pending_ || jam_active))
         {
             // 检测条件
             bool torque_saturated =
@@ -535,12 +622,11 @@ public:
                 // 解卡中：检查是否到时间
                 if ((now_ms - jam_start_ms) >= cfg.jam_reverse_ms)
                 {
-                    // 解卡完成：清状态，重置目标到当前反馈角度
+                    // 解卡完成：清 PID，继续完成原有槽位目标。
                     jam_active        = 0;
                     jam_start_ms      = 0;
                     jam_torque_sat_ms = 0;
                     jam_pos_err_ms    = 0;
-                    target_angle_rad  = feedback_angle_rad;  // 重置目标
                     position_pid.clearPID();
                     velocity_pid.clearPID();
                     status.jam_detected = 0;
@@ -599,9 +685,39 @@ public:
     }
 
 private:
+    static constexpr double shot_step_rad_ = 40.0 * 3.14159265358979323846 / 180.0;
+    static constexpr float target_tolerance_rad_ = 0.3f * 3.14159265358979323846f / 180.0f;
+    double trajectory_angle_rad_ = 0.0;
+    bool single_pending_ = false;
+    double auto_shot_phase_ = 0.0;
+    bool home_ready_ = false;
+    uint32_t reference_after_ms_ = 0;
+    bool raw_override_was_active_ = false;
+
+    void CommitShot(Dial_Status_t &status)
+    {
+        ++status.shot_count;
+        trajectory_angle_rad_ += shot_step_rad_;
+        target_angle_rad = float(trajectory_angle_rad_);
+        single_pending_ = true;
+    }
+
+    void HoldCurrent()
+    {
+        target_angle_rad = feedback_angle_rad;
+        trajectory_angle_rad_ = feedback_angle_rad;
+        auto_shot_phase_ = 0.0;
+        single_pending_ = false;
+        position_pid.clearPID();
+        velocity_pid.clearPID();
+        jam_torque_sat_ms = jam_pos_err_ms = 0;
+    }
+
     bool trigger_context_inited_ = false;
     bool waiting_release_ = true;
+    bool reference_was_ever_inited_ = false;
     uint8_t last_config_mode_ = 0;
+    DialFireMode last_fire_mode_ = DialFireMode::SINGLE_THEN_AUTO;
     bool last_vision_control_ = false;
 
     /**

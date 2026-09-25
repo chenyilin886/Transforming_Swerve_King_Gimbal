@@ -550,15 +550,15 @@ typedef struct
  * @brief LK4005 电机数据（Watch 可观察）
  *
  * Watch 中展开 LK4005_Data 即可观察电机反馈状态，验证数据接收：
- *   --- SI 单位（输出端，由 MotorBase.unit_data_ 同步）---
- *   angle        : 输出端角度(rad)，0~2π（编码器单圈）
+ *   --- SI 单位（由 MotorBase.unit_data_ 同步）---
+ *   angle        : A1 转子单圈角度(rad)，0~2π；不能作为输出槽位的绝对参考
  *   velocity     : 输出端角速度(rad/s)
  *   torque       : 输出端力矩(N·m)
  *   temperature  : 温度(°C)
  *
  *   --- 原始反馈（LKFeedback 解析结果，便于核对协议解析）---
  *   raw_angle    : 编码器原始值(0~65535)
- *   raw_velocity : 电机端 RPM 原始值(int16)
+ *   raw_velocity : 电机端速度原始值(int16)，1 dps/LSB
  *   raw_current  : 反馈电流原始值(int16, ±2048)
  *   raw_cmd      : 命令字节(0xA1=力矩反馈, ...)
  *
@@ -574,21 +574,20 @@ typedef struct
  *   CAN1 接收中断 → LK4005::Parse → Configure → unit_data_[0]
  *     → GimbalUpdate 同步到 LK4005_Data → Watch 观察
  *
- * @note 当前任务：仅验证数据接收。
- *       LK4005 需周期性发送 ctrl_Torque(1, 0) 维持反馈上报，
- *       GimbalUpdate 中每周期调用一次。
+ * @note 拨盘任务周期发送0xA1力矩命令维持反馈，不查询0x92/0x94。
+ *       A1输出相位仅作诊断，不再用于机械槽位修正。
  */
 typedef struct
 {
-    // --- SI 单位（输出端，与 MotorBase.unit_data_ 一致）---
-    float    angle;            // 输出端角度(rad)，0~2π
+    // --- SI 单位（angle 是转子端，velocity/torque 是输出端）---
+    float    angle;            // A1 电机转子单圈角度(rad)，0~2π；不是拨盘零位标定值
     float    velocity;         // 输出端角速度(rad/s)
     float    torque;           // 输出端力矩(N·m)
     float    temperature;      // 温度(°C)
 
     // --- 原始反馈（调试用）---
     uint16_t raw_angle;        // 编码器原始值(0~65535)
-    int16_t  raw_velocity;     // 电机端 RPM 原始值
+    int16_t  raw_velocity;     // 电机端速度原始值，1 dps/LSB
     int16_t  raw_current;      // 反馈电流原始值(±2048)
     uint8_t  raw_cmd;          // 命令字节(0xA1=力矩反馈, ...)
 
@@ -600,6 +599,17 @@ typedef struct
     // --- 在线状态 ---
     uint8_t  online;           // 在线状态(0=离线, 1=在线)
 } LK4005_Data_t;
+
+// 兼容保留的旧A1对槽配置。DialController不再读取这些字段，避免现有Watch路径失效。
+typedef struct
+{
+    double zero_output_deg;       // 兼容字段，已不参与上电目标计算
+    float home_tolerance_deg;     // 兼容字段，已不参与控制
+    float home_velocity_limit;    // 兼容字段，已不参与控制
+    float home_raw_limit;         // 兼容字段，已不参与控制
+    uint32_t stop_align_delay_ms; // 兼容字段，已取消停火自动对槽
+    uint32_t home_settle_ms;      // 兼容字段，已取消到位等待
+} Dial_Calibration_t;
 
 // ========================================================================
 // LK4005 拨盘双环控制配置 / 状态（参考工程方式：位置环+速度环）
@@ -621,15 +631,43 @@ typedef struct
 // 拨盘几何：
 //   - 槽位数 slots_per_rotation: 默认 9（参考工程，单发角度 360/9 = 40°）
 //   - 单发角度 angle_per_shot_deg: 默认 40°
-//   - 拨盘方向：target_angle -= 实现正向供弹（与参考工程一致）
+//   - 本工程拨盘方向：target_angle += 40° 实现正向供弹
+
+// 所有拨盘挡位实时共用这一份PID参数，Watch修改后下一周期生效。
+typedef struct
+{
+    // === 位置环(外环) PID ===
+    //   输入: 误差(rad), 输出: 速度目标(rad/s)
+    float    pos_kp;                // 位置环 P, 建议起点 8.0
+    float    pos_ki;                // 位置环 I, 建议保持 0 (拨盘是供弹, 无需消除稳态误差)
+    float    pos_kd;                // 位置环 D, 建议起点 0.3
+    float    pos_break_i;           // 位置环积分隔离阈值(rad), |误差|<此值才积分
+    float    pos_limit_i;           // 位置环积分输出限幅(rad/s)
+    float    pos_vel_limit;         // 位置环输出限幅(rad/s) = 速度目标上限
+
+    // === 速度环(内环) PID ===
+    //   输入: 误差(rad/s), 输出: LK raw 命令 (-2048~2048)
+    float    vel_kp;                // 速度环 P, 建议起点 50
+    float    vel_ki;                // 速度环 I, 建议保持 0
+    float    vel_kd;                // 速度环 D, 建议起点 1.0
+    float    vel_break_i;           // 速度环积分隔离阈值(rad/s)
+    float    vel_limit_i;           // 速度环积分输出限幅(raw)
+    float    raw_output_limit;      // 速度环总输出限幅(raw)，最大2048
+} Dial_PID_Config_t;
+
+enum class DialFireMode : uint8_t
+{
+    SINGLE_THEN_AUTO = 0, // 单发40°，保持触发后转连发
+    DIRECT_AUTO = 1,      // 首周期直接连发，不提交单发40°
+};
 
 /**
  * @brief 拨盘双环控制配置（Watch 可调）
  *
  * Watch 调试建议：
- *   ① 先调速度环(内环): vel_kp=50, vel_kd=1.0, vel_ki=0
- *   ② 再调位置环(外环): pos_kp=8.0, pos_kd=0.3, pos_ki=0
- *   ③ 拨轮短暂上抬一次 → 观察 target_angle 减 40°、反馈角度跟随
+ *   ① 公共速度环参数在 Dial_PID_Config.vel_kp/ki/kd 中调整
+ *   ② 公共位置环参数在 Dial_PID_Config.pos_kp/ki/kd 中调整
+ *   ③ 上上单发目标加40°；上下直接连发目标按 auto_fire_hz 线性增加
  *   ④ 卡弹检测初调时 jam_detect_enable=0，速度环稳定后再开
  *
  * @note feature_enable=0 / enabled=0 / 急停 → 自动发送零力矩保反馈
@@ -642,32 +680,15 @@ typedef struct
     uint8_t  clear_pid;             // 单次清PID: Watch置1后清空PID, 本周期自动回写0
 
     // === 拨盘几何 ===
-    float    slots_per_rotation;    // 拨盘槽位数, 默认 9 (单发角度 = 360/9 = 40°)
-    float    angle_per_shot_deg;    // 单发角度(度), 默认 40°, 与 slots_per_rotation 对应
+    float    slots_per_rotation;    // 当前标定方案固定 9；其他值禁止拨盘输出
+    float    angle_per_shot_deg;    // 当前标定方案固定 40°；三套配置应保持一致
 
     // === 拨轮触发 ===
     float    wheel_start_threshold; // 拨轮启动阈值, 默认 0.5 (wheel > 该值才触发)
-    uint32_t long_press_ms;         // 持续触发转连发时间(ms)，wheel 和视觉 fire 共用
-    float    auto_fire_hz;          // 固定连发频率(Hz)，视觉始终使用此值
+    DialFireMode fire_mode;         // 0=SINGLE_THEN_AUTO, 1=DIRECT_AUTO
+    uint32_t long_press_ms;         // 单发转连发时间(ms)，仅SINGLE_THEN_AUTO使用
+    float    auto_fire_hz;          // 固定连发频率(Hz)，视觉始终使用此值，有效上限 50Hz
     float    wheel_to_hz;           // >0 时手动拨轮按幅度调速，0 使用 auto_fire_hz
-
-    // === 位置环(外环) PID ===
-    //   输入: 误差(rad), 输出: 速度目标(rad/s)
-    float    pos_kp;                // 位置环 P, 建议起点 8.0
-    float    pos_ki;                // 位置环 I, 建议保持 0 (拨盘是供弹, 无需消除稳态误差)
-    float    pos_kd;                // 位置环 D, 建议起点 0.3
-    float    pos_break_i;           // 位置环积分隔离阈值(rad), |误差|<此值才积分
-    float    pos_limit_i;           // 位置环积分输出限幅(rad/s)
-    float    pos_vel_limit;         // 位置环输出限幅(rad/s) = 速度目标上限, 默认 20
-
-    // === 速度环(内环) PID ===
-    //   输入: 误差(rad/s), 输出: LK raw 命令 (-2048~2048)
-    float    vel_kp;                // 速度环 P, 建议起点 50
-    float    vel_ki;                // 速度环 I, 建议保持 0
-    float    vel_kd;                // 速度环 D, 建议起点 1.0
-    float    vel_break_i;           // 速度环积分隔离阈值(rad/s)
-    float    vel_limit_i;           // 速度环积分输出限幅(raw)
-    float    raw_output_limit;      // 速度环总输出限幅(raw), 默认 500, 调好后可放宽到 1500
 
     // === raw_override 模式(调试用) ===
     //   绕过 PID 直接发送原始命令，用于验证 CAN 输出 / 电机方向
@@ -706,7 +727,7 @@ typedef struct
  *   trigger_source   : 0=none, 1=wheel manual, 2=vision fire, 3=mouse left
  *   vision_fire      : 当前视觉 fire 电平
  *   jam_detected     : 卡弹检测触发标志(1=正在解卡)
- *   shot_count       : 单发累计计数(Watch 观察发弹数)
+ *   shot_count       : 单发指令数+连发规划每累计40°的计数，不是实弹出弹检测
  *   online           : LK4005 在线状态
  */
 typedef struct
@@ -728,11 +749,17 @@ typedef struct
     uint8_t  trigger_source;        // 0=none, 1=wheel manual, 2=vision fire, 3=mouse left
     uint8_t  vision_fire;           // 当前视觉 fire 电平
     uint8_t  jam_detected;          // 卡弹检测触发标志
-    uint32_t shot_count;            // 单发累计计数
+    uint32_t shot_count;            // 单发指令数+连发规划每累计40°的计数；中断丢弃不足40°部分
     uint8_t  online;                // LK4005 在线状态
     uint8_t  config_mode;           // 0=Dial_Config, 1=UpUp, 2=UpDown
     uint8_t  vision_control;        // 1=视觉独占触发（即使 fire=0）
     uint8_t  waiting_release;       // 切配置/触发源后，等待当前触发信号释放
+    uint8_t home_state;             // 兼容状态: 0=禁止, 1=等A1, 2=运动中, 3=到达当前相对目标
+    float home_delta_deg;           // 兼容字段，固定为0（不再执行定位修正）
+    uint8_t slot_reference_valid;   // 已根据A1累计角建立本次相对位置参考
+    uint8_t home_feedback_valid;    // A1快照有效且100ms内更新
+    float home_error_deg;          // 当前A1目标减累计反馈，单位度
+    float a1_output_deg;           // A1转子单圈角度/减速比，[0,36)，仅作诊断
 } Dial_Status_t;
 
 // ========================================================================
@@ -1040,6 +1067,8 @@ extern KeyboardMouse_Control_t KeyboardMouse_Control; // 键鼠控制参数/状�
 extern IMU_Data_t         IMU_Data;          // IMU 姿态状态(Stage03 接入传感器)
 extern Remote_State_t     Remote_State;      // 遥控器状态机(急停+展开/收起)
 extern LK4005_Data_t      LK4005_Data;       // LK4005 电机反馈状态
+extern Dial_Calibration_t Dial_Calibration;  // 旧对槽配置，仅为Watch兼容保留
+extern Dial_PID_Config_t  Dial_PID_Config; // Shared live PID gains and limits
 extern Dial_Config_t      Dial_Config;       // 拨盘双环控制配置(Watch可调)
 extern Dial_Config_t      Dial_Config_UpUp;   // S1上S2上：独立拨盘配置
 extern Dial_Config_t      Dial_Config_UpDown; // S1上S2下：独立拨盘配置
@@ -1058,22 +1087,28 @@ extern VisionComm_Data_t  VisionComm_Data;   // 视觉通信数据(Stage07)
 // VOFA+ 调试通道发送函数(定义在 Variable.cpp)
 // ========================================================================
 /**
- * @brief VOFA+ 6 通道发送函数（在 GimbalUpdate 中调用）
+ * @brief 发送 Pitch/Yaw 实际 PID 输入到 VOFA+（在 GimbalUpdate 中调用）
  *
- * 数据来源：Controller_Data.pitch（方便在 Variable.cpp 中修改通道配置）
+ * 通道值直接取自 PID::pid.cin / PID::pid.feedback，保证每一对数据就是
+ * GetPidPos() 本周期实际使用的目标值和反馈值，而不是上层配置或传感器原始值。
  *
- * 通道分配（Stage03 Pitch 串级 PID 调参观测）：
- *   CH0: pitch.target_angle    目标角度（rad）       外环输入
- *   CH1: pitch.feedback_angle  反馈角度（rad）       外环反馈
- *   CH2: pitch.error           角度环误差（rad）     外环误差
- *   CH3: pitch.torque_output   输出力矩（N·m）       内环输出
- *   CH4: pitch.vel_target      速度环目标（rad/s）   外环输出=内环输入
- *   CH5: pitch.vel_feedback    速度环反馈（rad/s）   内环反馈
+ * 通道分配：
+ *   CH0: Pitch 角度外环目标（rad）
+ *   CH1: Pitch 角度外环反馈（rad）
+ *   CH2: Pitch 速度内环目标（rad/s）
+ *   CH3: Pitch 速度内环反馈（rad/s）
+ *   CH4: Yaw 当前控制环目标（非跟随=角度 rad；跟随=角速度 rad/s）
+ *   CH5: Yaw 当前控制环反馈（非跟随=角度 rad；跟随=角速度 rad/s）
  *
- * @note 调用频率：由 GimbalInit.cpp 控制（500Hz 降频）
- *       修改通道配置：只需改 Variable.cpp 中的实现，无需改 GimbalInit.cpp
+ * @note Yaw 跟随模式只执行速度环，因此 CH4/CH5 会随控制模式切换单位。
+ *       调用频率由 GimbalInit.cpp 控制（500Hz 降频）。
  */
-extern void VofaSendDebugChannels(void);
+extern void VofaSendDebugChannels(float pitch_pos_target,
+                                  float pitch_pos_feedback,
+                                  float pitch_vel_target,
+                                  float pitch_vel_feedback,
+                                  float yaw_active_target,
+                                  float yaw_active_feedback);
 
 #ifdef __cplusplus
 }

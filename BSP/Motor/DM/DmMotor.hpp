@@ -189,8 +189,12 @@ public:
                 this->unit_data_[i].angle       = uint_to_float(feedback_[i].angle,    params_.P_MIN,  params_.P_MAX,  16);
                 this->unit_data_[i].velocity    = uint_to_float(feedback_[i].velocity, params_.V_MIN,  params_.V_MAX,  12);
                 {
-                    float torque_raw = uint_to_float(feedback_[i].torque, params_.T_MIN, params_.T_MAX, 12);
-                    this->unit_data_[i].current = torque_is_output_side_ ? torque_raw : torque_raw * gear_ratio_;
+                    // 反馈力矩直接使用(N·m)：J 系列减速电机固件扭矩系数
+                    // Kt = 1.5·Npp·ψf·GR·GREF 已含减速比(说明书"扭矩系数"节)，
+                    // 反馈帧 T 字段本身就是输出端力矩，禁止再乘 gear_ratio_
+                    // （此前 DM4310 反馈多乘 10 倍 → Watch 显示 7+ 的根因，已修）
+                    this->unit_data_[i].current =
+                        uint_to_float(feedback_[i].torque, params_.T_MIN, params_.T_MAX, 12);
                 }
                 this->unit_data_[i].temperature = (float)feedback_[i].T_Mos;
                 this->unit_data_[i].accel        = 0.0f;
@@ -236,8 +240,11 @@ public:
      * 命令帧 8 字节:
      *   pos(16) + vel(12) + kp(12) + kd(12) + torque(12)
      *
-     * @note  外部传入的 torque 视为输出端力矩，函数内部会除以 gear_ratio_
-     *        换算为电机端力矩后发送给电机。这样上层代码无需关心减速比。
+     * @note  固件 MIT 的 t_ff 与反馈 T 同量纲，均为输出端力矩(N·m)。
+     *        - DM4340: torque_is_output_side_=true，传入值直发（传入即所得）
+     *        - DM4310: 发送前 ÷gear_ratio_(÷10) —— 历史原因：yaw/pitch 的 PID
+     *          增益、gravity_k、torque_limit 均按"实际输出=传入值÷10"整定，
+     *          ÷10 必须保留以维持环路增益；整批增益重调后才可置 true 直发
      *
      * @note  CAN 发送 ID = send_idxs_[id-1](电机 Master ID)
      */
@@ -396,16 +403,14 @@ protected:
     /**
      * @brief 减速比(电机端转数 / 输出端转数)
      *
-     * 用于 torque 输入/反馈换算：
+     * 用于 ctrl_Mit 发送换算（反馈 angle/velocity/torque 固件均已换算为
+     * 输出端，Motor 层不再做任何反馈换算）：
      * - 外部接口(上层代码)统一使用 **输出端 SI 单位**：
      *     angle / velocity / torque 都以输出端为参考
-     * - 内部 CAN 协议：
-     *     angle / velocity 已由电机固件换算为输出端
-     *     torque 仍是电机端力矩，需在 Motor 层换算
      *
-     * 换算关系：
-     * - 发送：torque_motor = torque_output / gear_ratio_
-     * - 反馈：torque_output = torque_motor × gear_ratio_
+     * 换算关系（仅发送路径）：
+     * - torque_motor = torque_output / gear_ratio_
+     *   DM4310 保留 ÷10 以兼容旧标定增益（见 torque_is_output_side_ 注释）
      *
      * 子类在构造函数中设置：
      * - DM4310: gear_ratio_ = 10.0f (10:1 减速比)
@@ -414,22 +419,21 @@ protected:
     float gear_ratio_ = 1.0f;
 
     /**
-     * @brief 力矩是否已由固件换算为输出端
+     * @brief 发送路径是否跳过减速比换算（仅影响 ctrl_Mit，不影响反馈解析）
      *
-     * 用于 torque 输入/反馈换算的条件判断：
-     *   false(DM4310 默认): torque 字段是电机端力矩，需在 Motor 层换算
-     *                        - 发送: torque_motor = torque / gear_ratio_
-     *                        - 反馈: torque_output = torque_motor × gear_ratio_
-     *   true (DM4340 设置): 固件内部 GR=40 已把 torque 换算为输出端力矩
-     *                        - 发送: 直接使用上层传入的输出端力矩
-     *                        - 反馈: 直接使用固件反馈的输出端力矩
+     * 反馈解析(2026-09 修正)：J 系列固件扭矩系数 Kt = 1.5·Npp·ψf·GR·GREF
+     * 已含减速比，反馈帧 T 字段即输出端力矩，DM4310/DM4340 均直接使用。
+     * （此前 DM4310 反馈再乘 gear_ratio_，Watch 显示偏大 10 倍 → 已修）
+     *
+     * 发送路径(ctrl_Mit)：
+     *   false(DM4310): 发送 torque_motor = torque / gear_ratio_
+     *                  历史原因：yaw/pitch 的 PID 增益、gravity_k、torque_limit
+     *                  均按"实际输出 = PID 输出 ÷ 10"整定，÷10 保留以维持
+     *                  环路增益不变；整批增益重调(÷10)后方可置 true
+     *   true (DM4340): 固件 t_ff 即输出端力矩，直接发送
      *
      * @note DM4340 实测：TMAX=28 N·m 是输出端峰值（与规格书 27 N·m 接近）
-     *       若仍按电机端处理（除以 40），发送 0.7 N·m 远小于重力 → Fold 抬不动
-     *
-     * 子类设置：
-     * - DM4310: 保持默认 false（固件 torque 是电机端）
-     * - DM4340: 构造时置 true（固件 GR=40 已换算为输出端）
+     *       若发送时除以 40，0.7 N·m 远小于重力 → Fold 抬不动
      */
     bool torque_is_output_side_ = false;
 
@@ -460,9 +464,10 @@ protected:
  * @class DM4310
  * @brief DM4310 电机驱动(Yaw + Pitch 两台)
  *
- * 参数来源: 达妙 DM-J4310-2EC V1.2 减速电机说明书 + Seeed Studio Wiki
- *   - 默认 PMAX=12.5 rad, VMAX=30 rad/s, TMAX=10 Nm
- *   - 减速比 10:1，电机固件内 GR=10，反馈角度/速度已换算为输出轴值
+ * 参数来源: 达妙 DM-J4310-2EC 说明书（V1.1 电机，出厂预设已按 V1.1 手册核对）
+ *   - 默认 PMAX=12.5 rad, VMAX=30 rad/s, TMAX=10 Nm（两版手册预设相同）
+ *   - 减速比 10:1，电机固件内 GR=10，反馈角度/速度/力矩均已换算为输出轴值
+ *   - 注意: V1.1 电机峰值扭矩 7 N·m < TMAX=10（映射天花板留余量，非配置错误）
  *   - P 范围必须与电机固件 PMAX 一致，否则反馈解码和控制编码都会出错
  * CAN 配置: Yaw ID=0x04, Pitch ID=0x02(均接 CAN1)
  */
@@ -476,13 +481,14 @@ public:
         params_ = {
             -12.5f, 12.5f,    // P: ±12.5 rad (输出轴，电机默认 PMAX=12.5)
             -30.0f, 30.0f,    // V: ±30 rad/s (输出轴，电机默认 VMAX=30)
-            -10.0f, 10.0f,    // T: ±10 N·m (电机端力矩，电机默认 TMAX=10)
+            -10.0f, 10.0f,    // T: ±10 N·m (输出端力矩，固件 Kt 已含 GR=10，默认 TMAX=10)
             0.0f, 500.0f,     // KP: 0~500
             0.0f, 5.0f        // KD: 0~5
         };
 
         // 减速比 10:1（DM-J4310-2EC 标准减速比）
-        // 上层接口看到的全是输出端 SI 单位，Motor 层自动处理换算
+        // 上层接口看到的全是输出端 SI 单位
+        // 仅用于 ctrl_Mit 发送 ÷10（兼容旧标定增益），反馈已不做换算
         gear_ratio_ = 10.0f;
 
         // 反馈帧 ID(电机 CAN ID): Yaw=0x04, Pitch=0x02
@@ -503,18 +509,19 @@ public:
  * 参数来源: 达妙 DM-J4340-2EC V1.1 减速电机说明书 + Seeed Studio Wiki
  *   - 默认 PMAX=12.5 rad, VMAX=8 rad/s, TMAX=28 Nm
  *   - 减速比 40:1，电机固件内 GR=40
- *   - **力矩字段已是输出端力矩**（与 DM4310 不同）
+ *   - **力矩字段是输出端力矩**（DM4310 反馈亦同，差别仅在发送路径：
+ *     DM4340 直发，DM4310 为兼容旧标定增益 ÷10 后发送）
  * CAN 配置: Fold ID=0x03(接 CAN1)
  *
  * @note DM4340 扭矩(28N·m)远大于 DM4310(10N·m)，适合 Fold 关节
  *      的大力矩需求。位置范围±12.5rad 允许多圈旋转。
  *
- * @note **力矩换算差异（重要）**:
+ * @note **力矩量纲（重要）**:
  *   电机固件 GR=40 已把 P/V/T 三个字段全部换算为输出端 SI 单位：
  *     - TMAX=28 N·m 是输出端峰值（与规格书峰值 27 N·m 接近，留 1 N·m 余量）
  *     - 发送 torque = 输出端力矩，无需再除 GR
  *     - 反馈 torque = 输出端力矩，无需再乘 GR
- *   因此 DM4340 构造时设置 torque_is_output_side_ = true，跳过 Motor 层换算。
+ *   因此 DM4340 构造时设置 torque_is_output_side_ = true，跳过发送换算。
  *   若错误地按电机端处理（除以 40），28 N·m 会被缩成 0.7 N·m，Fold 完全抬不动。
  */
 class DM4340 : public DMMotorBase<1>

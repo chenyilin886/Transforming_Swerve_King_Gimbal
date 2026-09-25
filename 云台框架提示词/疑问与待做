@@ -69,7 +69,7 @@ pitch还没有重新标定 但是pitch使用imu值 目前没有影响
 
 卡弹检测
 
-
+视觉vofa
 APP::Vofa.Send6Floats(
         VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
         IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
@@ -80,6 +80,8 @@ APP::Vofa.Send6Floats(
     );
 
 
-    挡位预改变 S1中 S2中的时候摇杆可以控制左右小陀螺，S1中 S2上的时候固定小陀螺旋转，实现小陀螺平移
+挡位预改变 S1中 S2中的时候摇杆可以控制左右小陀螺，S1中 S2上的时候固定小陀螺旋转，实现小陀螺平移
 
+摇杆速度映射上限
+gimbalInit.cpp#L1347：
     

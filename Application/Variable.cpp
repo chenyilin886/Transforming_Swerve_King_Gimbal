@@ -127,7 +127,7 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .yaw = {
         .target_angle    = 0.0f,
-        .kp              = 18.0f,    // 角度环 P, 18
+        .kp              = 13.0f,    // 角度环 P, 18
         .ki              = 0.00095f,    // 角度环 I
         .kd              = 2.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 30.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
@@ -619,6 +619,17 @@ LK4005_Data_t LK4005_Data = {
     .online          = 0,
 };
 
+// 旧A1对槽配置仅为Watch和结构兼容保留；DialController不再读取这些值。
+// 上电、停火以及raw_override退出均不会据此产生修正动作。
+Dial_Calibration_t Dial_Calibration = {
+    .zero_output_deg = 0.114807,
+    .home_tolerance_deg = 0.3f,
+    .home_velocity_limit = 5.0f,
+    .home_raw_limit = 300.0f,
+    .stop_align_delay_ms = 1000,
+    .home_settle_ms = 300,
+};
+
 // ========================================================================
 // LK4005 拨盘双环控制配置 / 状态全局实例
 // ========================================================================
@@ -629,27 +640,27 @@ LK4005_Data_t LK4005_Data = {
 //     - 双环 PID：位置环(位置式) → 速度环(位置式) → LK raw 命令
 //     - 卡弹检测：力矩饱和 + 位置误差大持续 → 反转解卡
 //
-// 初始化策略：
-//   - feature_enable=1, enabled=1：保留拨盘控制入口；PID 全 0 时仍不会输出力矩
-//   - 位置环/速度环 PID 参数全 0：满足"4005 初始 PID 参数为 0，Debug 手动修改"
-//   - 拨盘槽位数 9：参考工程默认值（单发角度 = 360/9 = 40°）
-//   - 拨轮阈值 0.5：比旧版 0.8 更低，操作手体验更柔和
-//   - 长按 1000ms：与参考工程一致
-//   - raw_output_limit=500：初调阶段保守限幅
-//   - jam_detect_enable=0：初调时关闭卡弹检测，速度环稳定后再开
-//
-// Watch 调试建议：
-//   ① Watch 添加 Dial_Config / Dial_Status / LK4005_Data
-//   ② 确认 LK4005_Data.online=1
-//   ③ Dial_Config.enabled=1
-//   ④ 先调速度环(内环): vel_kp=50, vel_kd=1.0, vel_ki=0
-//      - 用 raw_override_enable=1 + raw_override_cmd=300 强制转一下，确认方向
-//      - 然后关闭 override, 给 vel_kp=50, vel_kd=1.0
-//      - 拨轮上抬 → 观察 feedback_velocity 是否跟随 target_velocity
-//   ⑤ 再调位置环(外环): pos_kp=8.0, pos_kd=0.3, pos_ki=0
-//      - 拨轮短暂上抬一次 → 观察 target_angle 应减 40°(≈0.698 rad)
-//      - feedback_angle 应跟随到目标位置
-//   ⑥ 速度环稳定后再开卡弹检测: jam_detect_enable=1
+// 两个挡位共用下列PID和限幅，保留已有调参值，Watch修改实时生效。
+// 射频/触发方式分别在 Dial_Config_UpUp 和 Dial_Config_UpDown 中设置。
+// Watch修改不跨断电保存，需要永久保存时修改这里的初值并编译下载。
+Dial_PID_Config_t Dial_PID_Config = {
+    // === 位置环(外环) PID ===
+    .pos_kp                = 41.0f,    // P
+    .pos_ki                = 0.0f,    // I, 保持 0
+    .pos_kd                = 12.0f,    // D
+    .pos_break_i           = 3.1f,     // 位置误差积分隔离阈值(rad)
+    .pos_limit_i           = 10.0f,    // 位置环 I 项限幅(rad/s)
+    .pos_vel_limit         = 80.0f,    // 速度目标限幅(rad/s)
+
+    // === 速度环(内环) PID ===
+    .vel_kp                = 40.0f,    // P
+    .vel_ki                = 0.0f,    // I, 保持 0
+    .vel_kd                = 18.0f,    // D
+    .vel_break_i           = 10.0f,    // 速度误差积分隔离阈值(rad/s)
+    .vel_limit_i           = 80.0f,   // 速度环 I 项限幅 80 raw
+    .raw_output_limit      = 2048.0f,  // 力矩raw限幅
+};
+
 Dial_Config_t Dial_Config = {
     // === 功能开关 ===
     .feature_enable        = 1,       // 1=允许拨盘控制流程
@@ -662,25 +673,10 @@ Dial_Config_t Dial_Config = {
 
     // === 拨轮触发 ===
     .wheel_start_threshold = 0.5f,    // wheel > 0.5 触发(比旧版0.8更柔和)
+    .fire_mode             = DialFireMode::SINGLE_THEN_AUTO,
     .long_press_ms         = 800,     // 持续 800ms 切换为连发
     .auto_fire_hz          = 5.0f,    // 视觉/手动固定连发频率 5 Hz
     .wheel_to_hz           = 0.0f,    // 0=关闭拨轮幅度调速
-
-    // === 位置环(外环) PID ===
-    .pos_kp                = 41.0f,    // P, 调好速度环后改 8.0
-    .pos_ki                = 0.0f,    // I, 保持 0
-    .pos_kd                = 12.0f,    // D, 调好速度环后改 0.3
-    .pos_break_i           = 3.1f,    // 位置误差<0.1rad 才积分
-    .pos_limit_i           = 10.0f,    // 位置环 I 项限幅 5 rad/s
-    .pos_vel_limit         = 80.0f,   //
-
-    // === 速度环(内环) PID ===
-    .vel_kp                = 40.0f,    // P, 起步 50
-    .vel_ki                = 0.0f,    // I, 保持 0
-    .vel_kd                = 18.0f,    // D, 起步 1.0
-    .vel_break_i           = 10.0f,    // 速度误差<5rad/s 才积分
-    .vel_limit_i           = 80.0f,   // 速度环 I 项限幅 80 raw
-    .raw_output_limit      = 2048.0f, 
 
     // === raw_override 模式(调试用) ===
     .raw_override_enable   = 0,       // 默认关闭, 调试时置 1 + 设置 raw_override_cmd
@@ -696,10 +692,11 @@ Dial_Config_t Dial_Config = {
 };
 
 // Copy defaults once at startup; each object has independent Watch storage.
-// PID/geometry/jam defaults follow Dial_Config; trigger settings are editable here.
+// PID uses Dial_PID_Config directly; trigger settings remain independent.
 Dial_Config_t Dial_Config_UpUp = [] {
     Dial_Config_t cfg = Dial_Config;
     cfg.wheel_start_threshold = 0.5f;
+    cfg.fire_mode = DialFireMode::SINGLE_THEN_AUTO;
     cfg.long_press_ms = 800;
     cfg.auto_fire_hz = 5.0f;
     cfg.wheel_to_hz = 0.0f;
@@ -709,7 +706,8 @@ Dial_Config_t Dial_Config_UpUp = [] {
 Dial_Config_t Dial_Config_UpDown = [] {
     Dial_Config_t cfg = Dial_Config;
     cfg.wheel_start_threshold = 0.5f;
-    cfg.long_press_ms = 1;
+    cfg.fire_mode = DialFireMode::DIRECT_AUTO;
+    cfg.long_press_ms = 0; // DIRECT_AUTO不使用此参数，不触发起始单发
     cfg.auto_fire_hz = 5.0f;
     cfg.wheel_to_hz = 0.0f;
     return cfg;
@@ -738,6 +736,12 @@ Dial_Status_t Dial_Status = {
     .config_mode        = 0,
     .vision_control     = 0,
     .waiting_release    = 0,
+    .home_state         = 0,
+    .home_delta_deg     = 0.0f,
+    .slot_reference_valid = 0,
+    .home_feedback_valid = 0,
+    .home_error_deg = 0.0f,
+    .a1_output_deg = 0.0f,
 };
 
 // ========================================================================
@@ -876,96 +880,39 @@ VisionComm_Data_t VisionComm_Data = {
 /**
  * @brief VOFA+ 6 通道发送函数
  *
-
+ * 通道值直接取自调用方传入的 PID::pid.cin / PID::pid.feedback，保证每一对
+ * 数据就是 GetPidPos() 本周期实际使用的目标值和反馈值。
  *
- * 修改通道配置示例：
- *   - 观察 Pitch：改用 Controller_Data.pitch.target_angle 等
- *   - 观察 Joint：改用 Joint_Data.yaw.real_angle 等
- *   - 观察电机原始数据：改用 Motor 层接口（需 extern 声明）
+ * 通道分配：
+ *   CH0: Pitch 角度外环目标（rad）
+ *   CH1: Pitch 角度外环反馈（rad）
+ *   CH2: Pitch 速度内环目标（rad/s）
+ *   CH3: Pitch 速度内环反馈（rad/s）
+ *   CH4: Yaw 当前控制环目标（非跟随=角度 rad；跟随=角速度 rad/s）
+ *   CH5: Yaw 当前控制环反馈（非跟随=角度 rad；跟随=角速度 rad/s）
  *
- * @note 调用频率：由 GimbalInit.cpp 降频控制（500Hz）
+ * @note Yaw 跟随模式只执行速度环，因此 CH4/CH5 会随控制模式切换单位。
+ *       调用频率由 GimbalInit.cpp 控制（500Hz 降频）。
  */
-void VofaSendDebugChannels(void)
+void VofaSendDebugChannels(float pitch_pos_target,
+                           float pitch_pos_feedback,
+                           float pitch_vel_target,
+                           float pitch_vel_feedback,
+                           float yaw_active_target,
+                           float yaw_active_feedback)
 {
-    // === 4005 拨盘电机观测（目标值 vs 反馈）===
-    //   CH0(通道1): Dial_Status.target_angle       拨盘目标角度(rad, 多圈)
-    //   CH1(通道2): Dial_Status.feedback_angle     拨盘反馈角度(rad, LK4005累计角度)
-    //   CH2(通道3): Dial_Status.target_velocity    速度环目标(rad/s) = 位置环输出
-    //   CH3(通道4): Dial_Status.feedback_velocity  速度环反馈(rad/s)
-    //   CH4(通道5): Dial_Status.error              位置环误差(rad)
-    //   CH5(通道6): Dial_Status.torque_cmd         最终发送的 LK raw 力矩命令
     APP::Vofa.Send6Floats(
-        Dial_Status.target_angle,               // CH0(通道1): 拨盘目标角度
-        Dial_Status.feedback_angle,             // CH1(通道2): 拨盘反馈角度
-        Dial_Status.target_velocity,            // CH2(通道3): 速度环目标
-        Dial_Status.feedback_velocity,          // CH3(通道4): 速度环反馈
-        Dial_Status.error,                      // CH4(通道5): 位置环误差
-        (float)Dial_Status.torque_cmd           // CH5(通道6): 输出力矩命令(raw)
+        Joint_Data.pitch.real_angle,               // CH0(通道1): 拨盘目标角度
+        Joint_Data.pitch.velocity,             // CH1(通道2): 拨盘反馈角度
+        Joint_Data.pitch.torque,            // CH2(通道3): Yaw目标角度
+        Joint_Data.yaw.real_angle,               // CH0(通道1): 拨盘目标角度
+        Joint_Data.yaw.velocity,             // CH1(通道2): 拨盘反馈角度
+        Joint_Data.yaw.torque    // CH5(通道6): Yaw 当前控制环反馈
     );
 
+    
 
-
-    // === 视觉跟踪 6 通道（原配置，已注释）===
-    /*
-    APP::Vofa.Send6Floats(
-        VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
-        IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
-        VisionComm_Data.pitch_angle,            // CH2(通道3): 视觉 Pitch 目标
-        IMU_Data.pitch,                         // CH3(通道4): IMU Pitch 反馈
-        Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
-        Friction_Data.right.velocity_rpm        // CH5(通道6): 右摩擦轮转速(RPM)
-    );
-    */
-
-    // === Fold 重力补偿 6 通道（Stage04 标定观测，已注释）===
-    //   标定 gravity_k 时切回此配置
-    /*
-    APP::Vofa.Send6Floats(
-        Controller_Data.fold.target_angle,     // CH0: 目标角度
-        Controller_Data.fold.feedback_angle,   // CH1: 反馈角度
-        Controller_Data.fold.torque_output,    // CH2: 总输出力矩
-        Controller_Data.fold.gravity_torque,   // CH3: 重力补偿力矩（关键）
-        Controller_Data.fold.vel_target,       // CH4: 速度环目标
-        Controller_Data.fold.vel_feedback      // CH5: 速度环反馈
-    );
-    */
-
-    // === Pitch 串级 PID 6 通道（Stage03 配置，已注释）===
-    /*
-    APP::Vofa.Send6Floats(
-        Controller_Data.pitch.target_angle,    // CH0: 目标角度
-        Controller_Data.pitch.feedback_angle,  // CH1: 反馈角度
-        Controller_Data.pitch.error,           // CH2: 角度环误差
-        Controller_Data.pitch.torque_output,   // CH3: 输出力矩
-        Controller_Data.pitch.vel_target,      // CH4: 速度环目标
-        Controller_Data.pitch.vel_feedback     // CH5: 速度环反馈
-    );
-    */
-
-    // === 其他观测示例 ===
-    /*
-    // 示例：观察 Yaw 关节
-    APP::Vofa.Send6Floats(
-        Controller_Data.yaw.target_angle,      // CH0: Yaw 目标
-        Controller_Data.yaw.feedback_angle,    // CH1: Yaw 反馈
-        Controller_Data.yaw.error,             // CH2: Yaw 误差
-        Controller_Data.yaw.torque_output,     // CH3: Yaw 输出
-        0.0f,                                  // CH4: 预留
-        0.0f                                   // CH5: 预留
-    );
-    */
-
-    /*
-    // 示例：观察 Joint 层原始角度
-    APP::Vofa.Send6Floats(
-        Joint_Data.fold.real_angle,            // CH0: Joint 真实角度
-        Joint_Data.fold.encoder_angle,         // CH1: 编码器原始值
-        Joint_Data.fold.velocity,              // CH2: 关节速度
-        Joint_Data.fold.torque,                // CH3: 关节力矩
-        (float)Joint_Data.fold.online,         // CH4: 在线状态
-        0.0f                                   // CH5: 预留
-    );
-    */
+    
 }
 
 // ========================================================================

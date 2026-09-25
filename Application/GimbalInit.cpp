@@ -1721,7 +1721,7 @@ void GimbalUpdate()
     // ---------------------------------------------------------------
     if (BSP::MOTOR::LK::lk4005_motor != nullptr)
     {
-        // SI 单位（输出端，来自 MotorBase::unit_data_）
+        // SI 单位（angle 是转子单圈 rad；velocity/torque 是输出端）
         LK4005_Data.angle       = BSP::MOTOR::LK::lk4005_motor->getAngleRad(1);
         LK4005_Data.velocity    = BSP::MOTOR::LK::lk4005_motor->getVelocityRad(1);
         LK4005_Data.torque      = BSP::MOTOR::LK::lk4005_motor->getTorque(1);
@@ -1802,7 +1802,21 @@ void GimbalUpdate()
         if (vofa_counter >= 2)  // 1000Hz / 2 = 500Hz
         {
             vofa_counter = 0;
-            VofaSendDebugChannels();
+
+            // Yaw 非跟随模式执行角度外环；跟随模式(cascade_mode=0)只执行
+            // 速度环。直接发送对应 PID 保存的 cin/feedback，确保 VOFA 中
+            // 每一对曲线与 GetPidPos() 的实际输入完全一致。
+            const PID &yaw_active_pid = gimbal_controller.yaw.cascade_mode
+                                      ? gimbal_controller.yaw.position_pid
+                                      : gimbal_controller.yaw.velocity_pid;
+
+            VofaSendDebugChannels(
+                (float)gimbal_controller.pitch.position_pid.pid.cin,
+                (float)gimbal_controller.pitch.position_pid.pid.feedback,
+                (float)gimbal_controller.pitch.velocity_pid.pid.cin,
+                (float)gimbal_controller.pitch.velocity_pid.pid.feedback,
+                (float)yaw_active_pid.pid.cin,
+                (float)yaw_active_pid.pid.feedback);
         }
     }
 

@@ -34,7 +34,7 @@
  *     data[1]:    temperature(°C)
  *     data[2-3]:  current(int16_t, little-endian, 反馈电流原始值)
  *     data[4-5]:  velocity(int16_t, little-endian, 1 dps/LSB)
- *     data[6-7]:  angle(uint16_t, little-endian, 输出端编码器计数)
+ *     data[6-7]:  angle(uint16_t, little-endian, 转子单圈编码器计数)
  *
  *   状态1响应帧(0x9A/0x9B 响应):
  *     data[0]:    cmd(0x9A 或 0x9B)
@@ -52,7 +52,7 @@
  *   力矩常数:      0.06 N·m/A
  *   反馈电流最大值: 2048 (原始值)
  *   实际电流最大值: 4 A
- *   编码器分辨率:   65536 counts/rev (16位, 输出端)
+ *   A1编码器分辨率: 65536 counts/rev (16位, 转子端)
  *
  * 继承说明：
  *   参考工程 H_SG-SG_New BSP/Motor/Lk/Lk_motor.hpp 适配移植。
@@ -61,7 +61,7 @@
  *   2. CAN 发送方式: 全局 get_can_bus_instance() → can_device_ 指针(与 DM 一致)
  *   3. UnitData 适配: 双精度 angle_Deg/angle_Rad/... → 单精度 angle/velocity/...
  *      (gimbal 工程 MotorBase 使用 float, 统一 SI 单位)
- *   4. 移除多圈累计(multi_angle_data_): gimbal 工程由 Joint 层处理多圈
+ *   4. 拨盘通过转子角度增量除减速比，维护输出端多圈累计
  *   5. 移除 PendingReply 超时机制: 简化为直接解析, 状态1缓存可选
  */
 
@@ -83,10 +83,10 @@ struct LKParameters
     float torque_constant;          // 力矩常数(N·m/A)
     float feedback_current_max;     // 反馈电流最大原始值(如 2048)
     float current_max;              // 实际电流最大值(A)
-    float encoder_resolution;       // 编码器分辨率(counts/rev, 输出端)
+    float encoder_resolution;       // 编码器分辨率(counts/rev, 转子端)
 
     // --- 派生转换系数(构造时自动计算) ---
-    float encoder_to_deg;           // 编码器计数 → 度(输出端)
+    float encoder_to_deg;           // 编码器计数 → 度(转子端)
     float dps_to_output_radps;      // speed feedback dps -> output-side rad/s
     float current_to_torque;        // 反馈电流原始值 → 输出端力矩(N·m)
     float feedback_to_current;      // 反馈电流原始值 → 实际电流(A)
@@ -103,7 +103,7 @@ struct LKParameters
         : reduction_ratio(rr), torque_constant(tc),
           feedback_current_max(fmc), current_max(mc), encoder_resolution(er)
     {
-        // 编码器计数 → 输出端角度(度): 360° / resolution
+        // 编码器计数 → 转子单圈角度(度): 360° / resolution
         encoder_to_deg = 360.0f / encoder_resolution;
 
         // LK feedback speed is 1 dps/LSB. Convert motor-side dps to
@@ -136,7 +136,7 @@ struct LKFeedback
     uint8_t  temperature;   // 温度(°C, 直接值)
     int16_t  current;       // 电流原始值(反馈电流, ±2048 对应 ±current_max A)
     int16_t  velocity;      // Speed raw value, 1 dps/LSB.
-    uint16_t angle;         // 角度原始值(输出端编码器计数, 0~65535)
+    uint16_t angle;         // 角度原始值(转子单圈编码器计数, 0~65535)
 };
 
 /**
@@ -151,6 +151,42 @@ struct LKStatus1
     uint16_t voltage = 0;       // 电压(mV)
     uint8_t  error_state = 0;   // 错误状态位(0=无错误)
     bool     is_valid = false;  // 是否已收到有效响应
+};
+
+// Verified on this motor: 0x94 wraps every ROTOR revolution (0..35999).
+// At 10:1 its output-equivalent phase repeats every 36 degrees. It is NOT
+// an absolute output-shaft position and cannot identify a 40-degree slot.
+struct LKSingleCircle
+{
+    uint32_t raw = 0;
+    float output_deg = 0.0f; // output-equivalent rotor phase [0, 360 / ratio)
+    float accumulated_rad = 0.0f; // A1 output coordinate at reception
+    uint32_t received_ms = 0;
+    bool valid = false;
+    bool accumulated_valid = false;
+};
+
+// 0x92 carries seven little-endian bytes of a signed motor angle (0.01 deg).
+// Generic diagnostic API; the feeder control currently uses only A1 feedback.
+struct LKMultiTurnPosition
+{
+    int64_t raw = 0;
+    double output_deg = 0.0;
+    float accumulated_rad = 0.0f; // A1 output coordinate at reception
+    float velocity_rad = 0.0f;    // Paired A1 output speed, for stationary-reference gating
+    uint32_t received_ms = 0;
+    bool valid = false;
+    bool accumulated_valid = false;
+};
+
+// One coherent snapshot of the fast motion response. No position-query command needed.
+struct LKA1Position
+{
+    float output_phase_deg = 0.0f; // Rotor single-turn angle / reduction, [0,36) for LK4005
+    float accumulated_rad = 0.0f;
+    float velocity_rad = 0.0f;
+    uint32_t received_ms = 0;
+    bool valid = false;
 };
 
 /**
@@ -205,13 +241,16 @@ public:
      *   1. 遍历 recv_idxs_ 匹配帧 ID(0x140 + motor_id)
      *   2. 根据 data[0](cmd) 判断帧类型：
      *      - 0x9A/0x9B → 状态1响应帧 → 更新 status1_ 缓存
-     *      - 其他      → 周期反馈帧  → 解析 + Configure → 填充 unit_data_
-     *   3. 调用 updateTimestamp 刷新在线状态
+     *      - 0x94      → 转子单圈相位缓存，不改写 A1 数据
+     *      - 0x92      → 通用多圈位置诊断缓存，当前拨盘A1控制不使用
+     *      - 0x9C/A1..A8 → 周期反馈帧 → Configure + 刷新运动反馈在线状态
+     *      - 其他      → 忽略（使能等确认帧不是运动反馈）
      *
      * @note  此函数注册到 CanDevice::register_rx_callback，在中断中执行
      */
     virtual void Parse(const HAL::CAN::Frame &frame) override
     {
+        if (frame.dlc != 8 || frame.is_remote_frame || frame.is_extended_id) return;
         for (uint8_t i = 0; i < N; ++i)
         {
             // 匹配反馈帧 ID = 0x140 + motor_id
@@ -219,6 +258,46 @@ public:
             {
                 const uint8_t *pData = frame.data;
                 uint8_t cmd = pData[0];
+
+                if (cmd == 0x92)
+                {
+                    uint64_t bits = 0;
+                    for (uint8_t b = 0; b < 7; ++b)
+                        bits |= uint64_t(pData[b + 1]) << (8U * b);
+                    // Subtract 2^56 for negative signed-56-bit values. All casts
+                    // stay within int64_t, including the most negative value.
+                    const int64_t raw = int64_t(bits) -
+                        ((bits & (uint64_t(1) << 55)) ? (int64_t(1) << 56) : 0);
+                    auto &sample = multi_turn_position_[i];
+                    sample.raw = raw;
+                    sample.output_deg = double(raw) / (100.0 * params_.reduction_ratio);
+                    sample.accumulated_rad = multi_turn_angle_rad_[i];
+                    sample.velocity_rad = multi_turn_inited_[i] ? this->unit_data_[i].velocity : 0.0f;
+                    sample.received_ms = HAL_GetTick();
+                    sample.valid = true;
+                    sample.accumulated_valid = multi_turn_inited_[i] &&
+                        (sample.received_ms - motion_feedback_ms_[i] <= 20U);
+                    return; // Do not overwrite A1 or refresh motion online state.
+                }
+
+                if (cmd == 0x94)
+                {
+                    const uint32_t raw = uint32_t(pData[4]) | (uint32_t(pData[5]) << 8)
+                        | (uint32_t(pData[6]) << 16) | (uint32_t(pData[7]) << 24);
+                    auto &sample = single_circle_[i];
+                    sample.valid = (raw < 36000U);
+                    sample.accumulated_valid = false;
+                    if (sample.valid)
+                    {
+                        sample.raw = raw;
+                        sample.output_deg = raw / (100.0f * params_.reduction_ratio);
+                        sample.accumulated_rad = multi_turn_angle_rad_[i];
+                        sample.received_ms = HAL_GetTick();
+                        sample.accumulated_valid = multi_turn_inited_[i] &&
+                            (sample.received_ms - motion_feedback_ms_[i] <= 20U);
+                    }
+                    return; // Never decode query payload as A1 or refresh motion online state.
+                }
 
                 if (cmd == 0x9A || cmd == 0x9B)
                 {
@@ -228,7 +307,7 @@ public:
                     status1_[i].error_state = pData[7];
                     status1_[i].is_valid    = true;
                 }
-                else
+                else if (cmd == 0x9C || (cmd >= 0xA1 && cmd <= 0xA8))
                 {
                     // --- 周期反馈帧(正常上报数据) ---
                     feedback_[i].cmd         = cmd;
@@ -239,10 +318,11 @@ public:
 
                     // 原始值 → SI 单位
                     Configure(i, feedback_[i]);
+                    motion_feedback_ms_[i] = HAL_GetTick();
+                    this->updateTimestamp(i + 1);
                 }
 
-                // 刷新在线时间戳
-                this->updateTimestamp(i + 1);
+                // Status/enable/query acknowledgements are not motion feedback.
                 break;  // 一帧只匹配一台电机
             }
         }
@@ -316,6 +396,62 @@ public:
         return sendRaw(init_address + send_idxs_[id - 1], data);
     }
 
+    bool ReadSingleCircle(uint8_t id)
+    {
+        if (id == 0 || id > N) return false;
+        const uint8_t data[8] = {0x94, 0, 0, 0, 0, 0, 0, 0};
+        return sendRaw(init_address + send_idxs_[id - 1], data);
+    }
+
+    float getSingleCirclePeriodDeg() const { return 360.0f / params_.reduction_ratio; }
+
+    LKA1Position getA1Position(uint8_t id) const
+    {
+        if (id == 0 || id > N) return {};
+        const uint32_t irq_mask = __get_PRIMASK();
+        __disable_irq();
+        const uint8_t i = id - 1;
+        LKA1Position result{};
+        if (multi_turn_inited_[i])
+        {
+            result.output_phase_deg = feedback_[i].angle * params_.encoder_to_deg / params_.reduction_ratio;
+            result.accumulated_rad = multi_turn_angle_rad_[i];
+            result.velocity_rad = this->unit_data_[i].velocity;
+            result.received_ms = motion_feedback_ms_[i];
+            result.valid = true;
+        }
+        __set_PRIMASK(irq_mask);
+        return result;
+    }
+
+    bool ReadMultiTurnPosition(uint8_t id)
+    {
+        if (id == 0 || id > N) return false;
+        const uint8_t data[8] = {0x92, 0, 0, 0, 0, 0, 0, 0};
+        return sendRaw(init_address + send_idxs_[id - 1], data);
+    }
+
+    LKMultiTurnPosition getMultiTurnPosition(uint8_t id) const
+    {
+        if (id == 0 || id > N) return {};
+        const uint32_t irq_mask = __get_PRIMASK();
+        __disable_irq();
+        const LKMultiTurnPosition result = multi_turn_position_[id - 1];
+        __set_PRIMASK(irq_mask);
+        return result;
+    }
+
+    LKSingleCircle getSingleCircle(uint8_t id) const
+    {
+        if (id == 0 || id > N) return {};
+        // CAN ISR writes all fields together; the task must read a coherent snapshot.
+        const uint32_t irq_mask = __get_PRIMASK();
+        __disable_irq();
+        const LKSingleCircle result = single_circle_[id - 1];
+        __set_PRIMASK(irq_mask);
+        return result;
+    }
+
     /**
      * @brief 力矩控制指令
      * @param id      1-based 电机索引
@@ -366,7 +502,7 @@ public:
     // 维护方式：
     //   Configure() 中每次解析反馈时：
     //     delta = wrapToPi(curr_angle - last_angle_rad_[i])  // 跨边界处理
-    //     multi_turn_angle_rad_[i] += delta
+    //     multi_turn_angle_rad_[i] += delta / reduction_ratio
     //     last_angle_rad_[i] = curr_angle
     //
     // 使用场景：
@@ -465,6 +601,9 @@ protected:
     LKParameters params_;                   // 电机参数(型号相关)
     LKFeedback feedback_[N] = {};          // 原始反馈数据(中间存储)
     LKStatus1  status1_[N] = {};           // 状态1缓存(0x9A 响应)
+    LKSingleCircle single_circle_[N] = {};
+    LKMultiTurnPosition multi_turn_position_[N] = {};
+    uint32_t motion_feedback_ms_[N] = {};
 
     // --- 多圈累计角度相关(拨盘位置环专用) ---
     // 设计原因：LK 协议只反馈单圈角度(0~2π)，位置环需要连续累计角度。
