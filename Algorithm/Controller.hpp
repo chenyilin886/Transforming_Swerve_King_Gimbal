@@ -31,6 +31,60 @@
 #include "Joint.hpp"
 #include "DmMotor.hpp"
 
+// ========================================================================
+// Pitch 扫频辨识（可微物理仿真参数辨识用）
+// ========================================================================
+// 注意：必须放在全局作用域（namespace BSP::CTRL 之外）——
+//   放进命名空间会被 C++ name-mangling，Keil Watch 无法用简单名
+//   "pitch_idf" 观察（工程惯例：Joint_Data/FollowMode_Data 等调试
+//   变量均为全局裸符号）。
+/**
+ * @struct PitchIdfState
+ * @brief Pitch 关节扫频(chirp)辨识状态与参数
+ *
+ * 用途：
+ *   叠加在重力前馈之上的线性扫频力矩激励，覆盖 PID 输出，
+ *   用于采集 (τ, θ, ω) 数据做云台动力学参数辨识。
+ *   辨识模型（重力已被 gravity_k·cos(fb) 前馈抵消）：
+ *     J·θ̈ + B·θ̇ + τc·sign(θ̇) = τ_chirp
+ *
+ * 数据流：
+ *   Watch 写 pitch_idf.enable=1 → Update() 每周期(1kHz)生成 chirp
+ *     ↓
+ *   torque = gravity_k·cosf(fb) + amp·ramp·sinf(φ(t))   （direction 相乘前叠加）
+ *     ↓
+ *   ctrl_Mit(2, ...) → VOFA CH0/1/2 录制 pitch 角度/速度/总力矩(500Hz)
+ *
+ * 扫频相位（线性扫频）：
+ *   瞬时频率 f(t) = f0 + (f1-f0)·t/T
+ *   相位       φ(t) = 2π·(f0·t + (f1-f0)·t²/(2T))
+ *
+ * 安全阀（任一触发 → enable=0 自动停止）：
+ *   stop_reason = 1 扫频完成(t≥T)  2 角速度超限(|vel|>6rad/s)
+ *                 3 偏离中心角超窗(|fb-center|>0.21rad≈12°)
+ *   center 在启动沿自动捕获当前反馈角。
+ *   停止沿调用 snapTargetToFeedback() 归位目标+清PID，无扰切回串级控制。
+ *
+ * @note 实例定义在 GimbalInit.cpp（Watch 可在线调参）。
+ *       仅在串级模式分支生效；IMU 离线时 pitch 分支本身不控制。
+ */
+struct PitchIdfState
+{
+    uint8_t  enable;       ///< 辨识运行中: 0=停止, 1=运行（Watch 写 1 启动）
+    uint8_t  was_on;       ///< 启停沿检测（内部用）
+    uint32_t tick;         ///< 1kHz 周期计数（扫频时间源）
+    float    amp;          ///< 扫频幅值（指令单位，实际输出≈amp/10 N·m，ctrl_Mit ÷10 映射）
+    float    f0;           ///< 起始频率 Hz（pitch 建议 ≥2，摆幅∝1/f² 防超窗）
+    float    f1;           ///< 终止频率 Hz（覆盖机械谐振，≤采样率/5 防混叠）
+    float    T;            ///< 扫频时长 s（越长低频段周期数越多，信噪比越好）
+    float    center;       ///< 中心角(rad)，启动沿捕获，位置窗安全阀基准
+    float    cmd;          ///< 当前周期 chirp 指令值（Watch 观察）
+    uint8_t  stop_reason;  ///< 0=运行中 1=扫完自停 2=超速自停 3=超位置窗自停
+};
+
+extern PitchIdfState pitch_idf;
+
+
 namespace BSP::CTRL
 {
 
@@ -773,7 +827,64 @@ public:
                 //   机械限位延后到 Morphology Manager 阶段
                 float tgt = pitch.target_angle;
                 float vel = jm.pitch.getVelocity();
-                float torque = pitch.Compute(tgt, fb, vel);
+
+                // === 扫频辨识模式：chirp 叠加重力前馈，覆盖 PID 输出 ===
+                //   启动沿捕获中心角；三重安全阀（超时/超速/超位置窗）自动停止；
+                //   停止沿 snapTargetToFeedback 无扰切回串级 PID。
+                //   重力前馈与 Compute 内部同式同位置（direction 相乘之前叠加）。
+                float torque;
+                if (pitch_idf.enable)
+                {
+                    if (!pitch_idf.was_on)              // 启动沿：复位计时+捕获中心角
+                    {
+                        pitch_idf.tick        = 0;
+                        pitch_idf.center      = fb;
+                        pitch_idf.stop_reason = 0;
+                        pitch_idf.was_on      = 1;
+                    }
+
+                    float t    = pitch_idf.tick * 0.001f;            // 1kHz 计时
+                    float phi  = 6.2831853f * (pitch_idf.f0 * t        // 线性扫频相位
+                              + (pitch_idf.f1 - pitch_idf.f0) * t * t
+                                / (2.0f * pitch_idf.T));
+                    float ramp = (t < 0.5f) ? (t * 2.0f) : 1.0f;     // 0.5s 软启动
+                    float cmd  = pitch_idf.amp * ramp * sinf(phi);
+
+                    // --- 安全阀：任一触发 → 自动停止（本周期立即切断激励）---
+                    if (t >= pitch_idf.T)                        // 1. 扫频自然完成
+                    {
+                        pitch_idf.enable = 0;
+                        pitch_idf.stop_reason = 1;
+                    }
+                    else if (fabsf(vel) > 6.0f)                  // 2. 角速度超限 6 rad/s
+                    {
+                        pitch_idf.enable = 0;
+                        pitch_idf.stop_reason = 2;
+                    }
+                    else if (fabsf(fb - pitch_idf.center) > 0.21f)  // 3. 偏离中心角超 ±12°
+                    {
+                        pitch_idf.enable = 0;
+                        pitch_idf.stop_reason = 3;
+                    }
+
+                    // 重力前馈（与 Compute 同式）+ chirp 叠加
+                    float g = (pitch.gravity_enable && pitch.cascade_mode)
+                            ? pitch.gravity_k * cosf(fb) : 0.0f;
+
+                    pitch_idf.tick++;
+                    pitch_idf.cmd = cmd;
+                    torque = g + cmd;
+                }
+                else
+                {
+                    if (pitch_idf.was_on)                // 停止沿：目标归位+清PID，防退出冲击
+                    {
+                        pitch.snapTargetToFeedback(fb);
+                        pitch_idf.was_on = 0;
+                    }
+                    torque = pitch.Compute(tgt, fb, vel);
+                }
+
                 dm4310->ctrl_Mit(2, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.pitch.getConfig().direction);
                 pitch_fb_source = 1;  // 标记当前使用 IMU 反馈
             }

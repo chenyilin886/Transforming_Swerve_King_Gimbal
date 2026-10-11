@@ -92,6 +92,31 @@ static BSP::JOINT::JointManager joint_manager;
 static BSP::CTRL::GimbalController gimbal_controller;
 
 // ========================================================================
+// Pitch 扫频辨识实例（可微物理仿真参数辨识用）
+// ========================================================================
+// 使用方法（详见 Controller.hpp 中 PitchIdfState 注释）：
+//   ① 挡位 S1=上 S2=下（MANUAL 串级模式），IMU 在线，gravity_enable=1
+//   ② 枪管调至近水平 → Watch 写 pitch_idf.enable=1 启动扫频
+//   ③ VOFA+ 录制 CH0/1/2（pitch 角度/速度/总力矩，500Hz），导出 CSV
+//   ④ 60s 后自动停止（stop_reason=1）；2=超速 3=超±12°位置窗
+//   ⑤ 数据处理：τ_net = τ_CH2 - gravity_k·cos(θ_IMU) 后喂给可微仿真
+// 默认参数：amp=3.0(实际≈0.3N·m) f=2→50Hz T=60s，大幅值组改 amp=6.0
+// 注意：全局作用域定义（与 Controller.hpp 中 extern 声明一致），
+//       保证 Keil Watch 可用简单名 "pitch_idf" 直接观察/修改。
+PitchIdfState pitch_idf = {
+    .enable      = 0,
+    .was_on      = 0,
+    .tick        = 0,
+    .amp         = 3.0f,     // 指令单位 → 实际输出≈0.3 N·m（ctrl_Mit ÷10 映射）
+    .f0          = 2.0f,     // 起始频率 Hz（≥2 防低频摆幅超位置窗）
+    .f1          = 50.0f,    // 终止频率 Hz（500Hz 采样的 1/10，无混叠）
+    .T           = 60.0f,    // 扫频时长 s
+    .center      = 0.0f,     // 启动沿自动捕获，无需手动设置
+    .cmd         = 0.0f,
+    .stop_reason = 0
+};
+
+// ========================================================================
 // TransformPlanner 全局实例(Stage05 变形规划器)
 // ========================================================================
 // 设计原因：
@@ -1201,7 +1226,7 @@ void GimbalUpdate()
                     ch1 = 0.0f;
                 }
 
-                const float max_speed = 2.8f;
+                const float max_speed = 3.5f;
                 const float target_velocity = ch1 * max_speed;
                 const float dt = 0.001f;
 
@@ -1344,7 +1369,7 @@ void GimbalUpdate()
             }
 
             // 速度映射：ch0 × max_yaw_speed → 目标角速度(rad/s)
-            const float max_yaw_speed = 2.8f;  // rad/s
+            const float max_yaw_speed = 3.5f;  // rad/s
             float target_velocity = ch0 * max_yaw_speed;
 
             // ========== 5. 控制计算（模式自适应） ==========

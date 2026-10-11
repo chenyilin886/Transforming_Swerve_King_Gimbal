@@ -164,14 +164,14 @@ Controller_Data_t Controller_Data = {
     //     ⑤ ki/vel_ki 最后加, 消除稳态误差
     .pitch = {
         .target_angle    = 0.0f,
-        .kp              = 16.0f,    // 角度环 P, 15
+        .kp              = 16.0f,    // 角度环 P, 16
         .ki              = 0.0f,    // 角度环 I
         .kd              = 0.0f,    // 角度环 D, 建议起点 0.1
         .torque_limit    = 35.0f,    // 输出端力矩限幅(N·m) → 电机端 1 N·m (DM4310 TMAX=10)
         .break_i         = 0.1f,     // 角度误差<0.1rad 才积分
         .limit_i         = 2.0f,     // 角度环 I 项 ≤ 2 N·m
         .cascade_mode    = 1,        // ← 启用串级模式(角度环+速度环均位置式)
-        .vel_kp          = 13.0f,    // 速度环 P, 12
+        .vel_kp          = 13.0f,    // 速度环 P, 13
         .vel_ki          = 0.1f,    // 速度环 I
         .vel_kd          = 0.0f,    // 速度环 D, 建议起点 0.001
         .vel_limit       = 30.0f,    // 速度目标限幅 10 rad/s (DM4310 VMAX=30, 保守)
@@ -901,16 +901,22 @@ void VofaSendDebugChannels(float pitch_pos_target,
                            float yaw_active_target,
                            float yaw_active_feedback)
 {
-    APP::Vofa.Send6Floats(
-        Joint_Data.pitch.real_angle,               // CH0(通道1): 拨盘目标角度
-        Joint_Data.pitch.velocity,             // CH1(通道2): 拨盘反馈角度
-        Joint_Data.pitch.torque,            // CH2(通道3): Yaw目标角度
-        Joint_Data.yaw.real_angle,               // CH0(通道1): 拨盘目标角度
-        Joint_Data.yaw.velocity,             // CH1(通道2): 拨盘反馈角度
-        Joint_Data.yaw.torque    // CH5(通道6): Yaw 当前控制环反馈
+    APP::Vofa.Send6Floats(          
+        
+            Dial_Status.target_angle,               
+        Dial_Status.feedback_angle,          
+        Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
+        Friction_Data.right.velocity_rpm,               
+        Joint_Data.pitch.velocity,           
+        Joint_Data.pitch.torque   
     );
 
-    
+    //     Joint_Data.yaw.real_angle,               
+    //     Joint_Data.yaw.velocity,          
+    //     Joint_Data.yaw.torque,
+    //     Joint_Data.pitch.real_angle,               
+    //     Joint_Data.pitch.velocity,           
+    //     Joint_Data.pitch.torque
 
     
 }
