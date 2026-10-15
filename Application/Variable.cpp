@@ -321,22 +321,22 @@ Controller_Data_t Vision_Controller_Data = {
     },
     .pitch = {
         .target_angle    = 0.0f,
-        .kp              = 23.0f,
+        .kp              = 0.0f,//23
         .ki              = 0.001f,
         .kd              = 0.0f,
         .torque_limit    = 22.0f,
         .break_i         = 0.1f,
         .limit_i         = 2.0f,
         .cascade_mode    = 1,
-        .vel_kp          = 16.0f,
+        .vel_kp          = 0.0f,//16
         .vel_ki          = 0.1f,
         .vel_kd          = 0.0f,
         .vel_limit       = 30.0f,
         .break_i_vel     = 1.0f,
         .limit_i_vel     = 2.0f,
         .enabled         = 1,
-        .gravity_k       = 14.0f,
-        .gravity_enable  = 1,
+        .gravity_k       = 14.0f,//14重力前馈也会输出
+        .gravity_enable  = 1,//不需要pitch参与测试的时候需要关闭
         .feedback_angle  = 0.0f,
         .error           = 0.0f,
         .vel_target      = 0.0f,
@@ -838,11 +838,11 @@ volatile GyroFixedSpeed_Config_t GyroFixedSpeed_Config = {
 };
 
 // ========================================================================
-// 视觉通信数据全局实例（Stage07: 视觉通信 — RCIA协议）
+// 视觉通信数据全局实例（Stage07: 视觉通信 — SP + CRC16协议）
 // ========================================================================
 // 数据来源：
-//   - VisionComm::Manager::Parse() → 解析视觉上位机发来的 RCIA 帧（RX, 19字节）
-//   - 视觉发来的角度：int32 / 100.0 → 度数（angle_scale = 100.0）
+//   - VisionComm::Manager::Parse() → 解析视觉上位机发来的 SP 帧（RX, 29字节）
+//   - 视觉发来的 yaw/pitch：float rad → 通信层转换为度数
 // Watch 添加 VisionComm_Data → 观察：
 //   - pitch_angle/yaw_angle：视觉目标角度(deg)
 //   - vision_ready：视觉就绪(0/1)
@@ -851,6 +851,10 @@ volatile GyroFixedSpeed_Config_t GyroFixedSpeed_Config = {
 VisionComm_Data_t VisionComm_Data = {
     .pitch_angle  = 0.0f,
     .yaw_angle    = 0.0f,
+    .yaw_velocity = 0.0f,
+    .yaw_acceleration = 0.0f,
+    .pitch_velocity = 0.0f,
+    .pitch_acceleration = 0.0f,
     .pitch_raw    = 0,
     .yaw_raw      = 0,
     .vision_ready = 0,
@@ -864,14 +868,34 @@ VisionComm_Data_t VisionComm_Data = {
     .tx_count      = 0,      // 成功发送次数（应持续增长）
     .tx_skip_count = 0,      // 跳过发送次数（USB忙时应很少）
     .tx_busy       = 0,      // 发送忙标志（0=空闲, 1=忙）
+    .tx_complete_count = 0,
+    .tx_abort_count = 0,
 
     // --- 调试开关 ---
-    .force_send    = 1,      // [调试] 强制发送开关（0=正常模式, 1=强制发送）
+    .force_send    = 1,      // [兼容字段] 保留旧 Watch 布局，当前不再门控发送
 
     .rx_head0     = 0,
     .rx_head1     = 0,
     .rx_tail      = 0,
     .yaw_offset_deg = 80.3f,  // [标定] Yaw 视觉零点偏移(deg)，Watch 可调
+};
+
+// Yaw LQR-ESO 参数独立存放，避免与视觉通信数据混在一起。
+YawLqrEsoTuneConfig_t YawLqrEso_Config = {
+    .j_kg_m2 = 0.0126f,             // 等效转动惯量 J (kg*m^2)
+    .b_nms_rad = 0.145f,            // 粘性阻尼系数 B (N*m*s/rad)
+    .k_theta = 4.2f,               // LQR 角度误差反馈增益
+    .k_omega = 0.19f,              // LQR 角速度误差反馈增益
+    .eso_bandwidth_rad_s = 60.0f,   // ESO 带宽 w0 (rad/s)
+    .eso_enable = 1U,               // ESO 观测器运行
+    .eso_comp_enable = 0U,          // 初始关闭扰动补偿
+    .eso_comp_gain = 0.0f,          // 补偿开启后使用完整 ESO 估计
+    .eso_comp_limit_nm = 0.5f,      // ESO 补偿力矩限幅，开启补偿时先限制影响
+    .tau_coulomb_nm = 0.0f,        // 辨识约 0.14~0.16 N*m，采用均值作初值
+    .coulomb_smooth_rad_s = 0.0f,   // 摩擦方向 tanh 平滑速度，初始调试值
+    .torque_limit_nm = 0.68f,        // 输出力矩对称限幅 (+/-N*m)
+    .torque_slew_rate_nm_s = 0.0f, // 输出力矩变化率上限 (N*m/s)
+    .torque_slew_enable = 1U,       // 启用力矩变化率限制
 };
 
 // ========================================================================
@@ -903,12 +927,12 @@ void VofaSendDebugChannels(float pitch_pos_target,
 {
     APP::Vofa.Send6Floats(          
         
-            Dial_Status.target_angle,               
-        Dial_Status.feedback_angle,          
-        Friction_Data.left.velocity_rpm,        // CH4(通道5): 左摩擦轮转速(RPM)
-        Friction_Data.right.velocity_rpm,               
-        Joint_Data.pitch.velocity,           
-        Joint_Data.pitch.torque   
+        VisionComm_Data.yaw_angle,              // CH0(通道1): 视觉 Yaw 目标
+        IMU_Data.yaw,                           // CH1(通道2): IMU Yaw 反馈
+        VisionComm_Data.pitch_angle,           // CH2(通道3): 视觉 Pitch 目标
+        IMU_Data.pitch,                       // CH3(通道4): IMU Pitch 反馈
+        VisionComm_Data.yaw_velocity,         // CH4(通道5): 视觉 Yaw 角速度(rad/s)
+        VisionComm_Data.yaw_acceleration      // CH5(通道6): 视觉 Yaw 角加速度(rad/s^2)
     );
 
     //     Joint_Data.yaw.real_angle,               

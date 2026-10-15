@@ -784,4 +784,5 @@ transforming_swerve_king_gimbal/shootfsm.o: ..\Application\ShootFSM.cpp \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\pointer_to_unary_function.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\unary_negate.h \
   ..\BSP\Remote\DR16.hpp ..\Core\Inc\usart.h ..\Application\Variable.hpp \
+  ..\Algorithm\yaw_auto_lqr_eso_controller.h \
   ..\BSP\Motor\Dji\DjiMotor.hpp

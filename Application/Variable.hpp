@@ -18,6 +18,8 @@
 #ifndef GIMBAL_VARIABLE_HPP
 #define GIMBAL_VARIABLE_HPP
 
+#include "yaw_auto_lqr_eso_controller.h"
+
 #include "main.h"   // 提供 uint8_t 等基础类型(C/C++ 兼容)
 
 #ifdef __cplusplus
@@ -994,45 +996,51 @@ typedef struct
 } ChassisModeDebug_t;
 
 // ========================================================================
-// 视觉通信数据结构（Stage07: 视觉通信 — RCIA协议）
+// 视觉通信数据结构（Stage07: 视觉通信 — SP + CRC16协议）
 // ========================================================================
 /**
  * @brief 视觉通信数据（Watch 可观察）
  *
  * 数据来源：
- *   - VisionComm::Manager::Parse() → 解析视觉上位机发来的 RCIA 帧（RX）
- *   - VisionComm::Manager::Send()  → 打包 IMU 四元数等发送给视觉（TX, 不在 Watch 中）
+ *   - VisionComm::Manager::Parse() → 解析视觉上位机发来的 SP 帧（RX）
+ *   - VisionComm::Manager::Send()  → 打包云台状态发送给视觉（TX, 不在 Watch 中）
  *
  * Watch 观察项：
  *   - pitch_angle/yaw_angle：视觉发来的目标角度(deg)
+ *   - yaw_velocity/pitch_velocity：视觉目标角速度(rad/s)
+ *   - yaw_acceleration/pitch_acceleration：视觉目标角加速度(rad/s^2)
  *   - vision_ready：视觉就绪标志(0=未就绪, 1=已就绪)
  *   - fire：开火信号(0/1)
  *   - online：视觉在线状态(0=离线, 1=在线)
- *   - timestamp：视觉时间戳(ms)
+ *   - timestamp：最近一次有效视觉帧的本机接收时间(ms)
  *
- * 协议说明（RCIA, 全大端序）：
- *   - 视觉发来的角度 = int32 / 100.0 得到度数
- *   - angle_scale = 100.0（与 gimbal(1).cpp 一致）
+ * 协议说明（SP + CRC16）：
+ *   - 视觉发来的 yaw/pitch 使用小端 float，单位为 rad
+ *   - 通信层转换为 deg 后写入 pitch_angle/yaw_angle，兼容现有控制代码
  *
  * 使用方式：
  *   在 Keil Watch 中添加 VisionComm_Data 即可展开全部字段。
  *
  * 数据流：
- *   USART6 DMA 空闲中断 → HAL_UARTEx_RxEventCallback
- *     → VisionComm::Manager::Parse() → 大端解码
+ *   USB CDC 接收回调 → VisionComm::Manager::Parse()
+ *     → CRC 校验和小端解码
  *       → 写入 VisionComm_Data → Watch 观察
  *
- * @note 视觉通信与 VOFA 共享 USART6，自动检测切换
+ * @note 视觉通信使用 USB CDC；VOFA 继续使用独立的 USART6
  */
 typedef struct
 {
-    float    pitch_angle;     ///< Pitch 目标角度(deg)，绝对角度（= pitch_raw / 100.0）
-    float    yaw_angle;       ///< Yaw 目标角度(deg)，绝对角度（= yaw_raw / 100.0）
-    int32_t  pitch_raw;       ///< [调试] 收到的原始 pitch_i（int32 BE，未除 scale）
-    int32_t  yaw_raw;         ///< [调试] 收到的原始 yaw_i（int32 BE，未除 scale）
+    float    pitch_angle;     ///< Pitch 目标角度(deg)，由协议 rad 转换
+    float    yaw_angle;       ///< Yaw 目标角度(deg)，由协议 rad 转换
+    float    yaw_velocity;    ///< 视觉目标 yaw 角速度(rad/s)，接入 yaw LQR
+    float    yaw_acceleration;///< 视觉目标 yaw 角加速度(rad/s^2)，接入 yaw LQR 前馈
+    float    pitch_velocity;  ///< 视觉目标 pitch 角速度(rad/s)，暂不接入控制器
+    float    pitch_acceleration; ///< 视觉目标 pitch 角加速度(rad/s^2)，暂不接入控制器
+    int32_t  pitch_raw;       ///< [调试] 转换后的 pitch 角度(deg * 100)
+    int32_t  yaw_raw;         ///< [调试] 转换后的 yaw 角度(deg * 100)
     uint8_t  vision_ready;    ///< 视觉就绪标志（0/1）
     uint8_t  fire;            ///< 开火信号（0/1）
-    uint32_t timestamp;       ///< 视觉时间戳(ms)
+    uint32_t timestamp;       ///< 最近一次有效视觉帧的本机接收时间(ms)
     uint8_t  aim_x;           ///< 瞄准点 X（预留）
     uint8_t  aim_y;           ///< 瞄准点 Y（预留）
     uint8_t  online;          ///< 视觉在线状态（0=离线, 1=在线）
@@ -1041,16 +1049,40 @@ typedef struct
     uint32_t tx_count;        ///< 成功发送次数（应持续增长）
     uint32_t tx_skip_count;   ///< 跳过发送次数（USB忙时应很少）
     uint32_t tx_busy;         ///< 发送忙标志（0=空闲, 1=忙）
+    uint32_t tx_complete_count; ///< USB IN 发送完成回调次数
+    uint32_t tx_abort_count;  ///< USB 复位/断开时中止的在途发送次数
 
     // --- 调试开关 ---
-    uint8_t  force_send;      ///< [调试] 强制发送开关（0=正常模式, 1=强制发送）。调试USB发送功能时，在Watch中置1可绕过视觉在线检查
+    uint8_t  force_send;      ///< [兼容字段] 发送已按协议持续进行；当前不再用此字段门控 USB 发送
 
     // --- 调试信息 ---
-    uint8_t  rx_head0;        ///< [调试] 收到的帧头字节0（应为 0x39）
-    uint8_t  rx_head1;        ///< [调试] 收到的帧头字节1（应为 0x39）
-    uint8_t  rx_tail;         ///< [调试] 收到的帧尾字节（应为 0xFF）
+    uint8_t  rx_head0;        ///< [调试] 收到的帧头字节0（应为 0x53）
+    uint8_t  rx_head1;        ///< [调试] 收到的帧头字节1（应为 0x50）
+    uint8_t  rx_tail;         ///< [兼容字段] SP 协议无帧尾，固定为 0
     float    yaw_offset_deg;  ///< [标定] Yaw 视觉零点偏移(deg)，Watch 可调。标定方法：云台对准视觉正前方 → 读取 IMU_Data.yaw → 填入此值
 } VisionComm_Data_t;
+
+// --- Yaw LQR-ESO 核心调参项（与 VisionComm_Data 通信数据分离） ---
+// Watch 中单独添加 YawLqrEso_Config。其余扩展功能固定为内部默认值。
+typedef struct
+{
+    float j_kg_m2;              // Yaw 等效转动惯量 J (kg*m^2)，辨识后设置
+    float b_nms_rad;            // Yaw 粘性阻尼系数 B (N*m*s/rad)，辨识后设置
+    float k_theta;              // LQR 角度误差反馈增益 (N*m/rad)
+    float k_omega;              // LQR 角速度误差反馈增益 (N*m/(rad/s))
+    float eso_bandwidth_rad_s;  // ESO 带宽 w0 (rad/s)，beta1/2/3 由程序计算
+    uint8_t eso_enable;         // ESO 观测器开关 (1=运行)
+    uint8_t eso_comp_enable;    // ESO 扰动补偿开关 (1=加入输出)
+    float eso_comp_gain;        // ESO 扰动补偿比例 (建议从0到1逐步调高)
+    float eso_comp_limit_nm;    // ESO 补偿力矩限幅 (N*m；<=0=不限幅)
+    float tau_coulomb_nm;        // 库仑摩擦力矩估计 (N*m)
+    float coulomb_smooth_rad_s;  // tanh 摩擦方向平滑速度 (rad/s)，非辨识参数
+    float torque_limit_nm;      // 对称最终力矩限幅 +/-N*m (<=0=关闭)
+    float torque_slew_rate_nm_s;// 力矩变化率上限 (N*m/s；<=0=关闭)
+    uint8_t torque_slew_enable; // 力矩变化率限制开关 (1=启用)
+} YawLqrEsoTuneConfig_t;
+
+extern YawLqrEsoTuneConfig_t YawLqrEso_Config;
 
 // ========================================================================
 // 全局变量 extern 声明(定义在 Variable.cpp)

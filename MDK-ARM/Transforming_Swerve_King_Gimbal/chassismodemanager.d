@@ -48,4 +48,5 @@ transforming_swerve_king_gimbal/chassismodemanager.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\string.h \
   C:\Keil_v5\ARM\ARMCLANG\include\string.h ..\BSP\..\BSP\Remote\DR16.hpp \
   ..\BSP\Common\StateWatch\state_watch.hpp ..\Core\Inc\usart.h \
-  ..\BSP\..\Application\Variable.hpp
+  ..\BSP\..\Application\Variable.hpp \
+  ..\Algorithm\yaw_auto_lqr_eso_controller.h

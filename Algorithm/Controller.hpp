@@ -30,6 +30,7 @@
 #include "PID.hpp"
 #include "Joint.hpp"
 #include "DmMotor.hpp"
+#include "../Application/Variable.hpp"
 
 // ========================================================================
 // Pitch 扫频辨识（可微物理仿真参数辨识用）
@@ -588,6 +589,26 @@ public:
      */
     uint8_t yaw_fb_source;
 
+    // Vision yaw LQR-ESO state. Internal torque is output-side physical N*m.
+    YawAutoLqrEso_t yaw_lqr;
+    YawAutoLqrEsoConfig_t yaw_lqr_runtime_cfg;
+    YawAutoLqrEsoOutput_t yaw_lqr_output;
+    YawAutoLqrEsoReference_t yaw_lqr_reference;
+    uint8_t yaw_lqr_requested;
+    uint8_t yaw_lqr_active;
+    float yaw_lqr_tau_cmd_nm;
+
+    void SetYawLqrReference(float theta_ref_rad,
+                            float omega_ref_rad_s,
+                            float alpha_ref_rad_s2,
+                            uint8_t enable)
+    {
+        yaw_lqr_reference.theta_rad = theta_ref_rad;
+        yaw_lqr_reference.omega_rad_s = omega_ref_rad_s;
+        yaw_lqr_reference.alpha_rad_s2 = alpha_ref_rad_s2;
+        yaw_lqr_requested = enable ? 1U : 0U;
+    }
+
     /**
      * @brief IMU Pitch 反馈角度(rad)
      *
@@ -697,6 +718,24 @@ public:
         imu_online      = 0;        // 默认 IMU 离线，GimbalUpdate 中根据实际状态设置
         yaw_fb_source   = 0;        // 默认编码器反馈
         pitch_fb_source = 0;        // 默认编码器反馈
+
+        // Optional controller extensions stay fixed here, outside Watch tuning.
+        yaw_lqr_runtime_cfg = YawAutoLqrEsoConfig_t{};
+        yaw_lqr_runtime_cfg.k_i = 0.0f;
+        yaw_lqr_runtime_cfg.theta_integral_limit_rad_s = 0.0f;
+        yaw_lqr_runtime_cfg.eso_comp_limit_nm = 0.0f;
+        yaw_lqr_runtime_cfg.eso_omega_gate_rad_s = 0.0f;
+        yaw_lqr_runtime_cfg.eso_alpha_gate_rad_s2 = 0.0f;
+        yaw_lqr_runtime_cfg.tau_bias_ki = 0.0f;
+        yaw_lqr_runtime_cfg.tau_bias_limit_nm = 0.0f;
+        yaw_lqr_runtime_cfg.tau_meas_lpf_alpha = 0.0f;
+        yaw_lqr_runtime_cfg.theta_deadband_rad = 0.0f;
+        YawAutoLqrEso_Init(&yaw_lqr);
+        yaw_lqr_output = YawAutoLqrEsoOutput_t{};
+        yaw_lqr_reference = YawAutoLqrEsoReference_t{};
+        yaw_lqr_requested = 0U;
+        yaw_lqr_active = 0U;
+        yaw_lqr_tau_cmd_nm = 0.0f;
     }
 
     /**
@@ -791,15 +830,99 @@ public:
                 float vel = (imu_online && yaw_use_imu_feedback && !yaw_inner_vel_use_encoder)
                           ? yaw_imu_velocity
                           : jm.yaw.getVelocity();
-                float tgt = yaw.target_angle;
-                float torque = yaw.Compute(tgt, fb, vel);
-                dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f, torque * jm.yaw.getConfig().direction);
+                const bool lqr_should_run =
+                    (yaw_lqr_requested != 0U) &&
+                    (imu_online != 0U) &&
+                    (yaw_use_imu_feedback != 0U) &&
+                    (jm.yaw.isOnline()) &&
+                    (yaw.enabled != 0U);
+
+                if (lqr_should_run)
+                {
+                    YawAutoLqrEsoFeedback_t feedback{};
+                    feedback.theta_rad = yaw_imu_angle;
+                    feedback.omega_rad_s = yaw_imu_velocity;
+                    feedback.tau_meas_nm = jm.yaw.getTorque() * jm.yaw.getConfig().direction;
+                    feedback.feedback_ok = 1U;
+
+                    yaw_lqr_runtime_cfg.j_kg_m2 = YawLqrEso_Config.j_kg_m2;
+                    yaw_lqr_runtime_cfg.b_nms_rad = YawLqrEso_Config.b_nms_rad;
+                    yaw_lqr_runtime_cfg.k_theta = YawLqrEso_Config.k_theta;
+                    yaw_lqr_runtime_cfg.k_omega = YawLqrEso_Config.k_omega;
+                    yaw_lqr_runtime_cfg.eso_bandwidth_rad_s =
+                        YawLqrEso_Config.eso_bandwidth_rad_s;
+                    yaw_lqr_runtime_cfg.eso_enable = YawLqrEso_Config.eso_enable;
+                    yaw_lqr_runtime_cfg.eso_comp_enable = YawLqrEso_Config.eso_comp_enable;
+                    yaw_lqr_runtime_cfg.eso_comp_gain = YawLqrEso_Config.eso_comp_gain;
+                    yaw_lqr_runtime_cfg.eso_comp_limit_nm =
+                        YawLqrEso_Config.eso_comp_limit_nm;
+                    yaw_lqr_runtime_cfg.tau_coulomb_nm = YawLqrEso_Config.tau_coulomb_nm;
+                    yaw_lqr_runtime_cfg.coulomb_smooth_rad_s =
+                        YawLqrEso_Config.coulomb_smooth_rad_s;
+                    yaw_lqr_runtime_cfg.torque_soft_limit_nm = 0.0f;
+                    if (YawLqrEso_Config.torque_limit_nm > 0.0f)
+                    {
+                        yaw_lqr_runtime_cfg.torque_min_nm =
+                            -YawLqrEso_Config.torque_limit_nm;
+                        yaw_lqr_runtime_cfg.torque_max_nm =
+                            YawLqrEso_Config.torque_limit_nm;
+                    }
+                    else
+                    {
+                        yaw_lqr_runtime_cfg.torque_min_nm = 1.0f;
+                        yaw_lqr_runtime_cfg.torque_max_nm = -1.0f;
+                    }
+                    yaw_lqr_runtime_cfg.torque_slew_rate_nm_s =
+                        YawLqrEso_Config.torque_slew_rate_nm_s;
+                    yaw_lqr_runtime_cfg.torque_slew_enable =
+                        YawLqrEso_Config.torque_slew_enable;
+
+                    YawAutoLqrEso_Calc(&yaw_lqr, &yaw_lqr_runtime_cfg,
+                                       &feedback, &yaw_lqr_reference,
+                                       0.001f, &yaw_lqr_output);
+                    yaw_lqr_active = 1U;
+                    yaw_lqr_tau_cmd_nm = yaw_lqr_output.tau_cmd_nm;
+
+                    yaw.feedback_angle = feedback.theta_rad;
+                    yaw.vel_feedback = feedback.omega_rad_s;
+                    yaw.error = yaw_lqr_output.e_theta_rad;
+                    yaw.vel_target = yaw_lqr_output.omega_ref_rad_s;
+                    yaw.vel_error = yaw_lqr_output.e_omega_rad_s;
+                    yaw.torque_output = yaw_lqr_output.tau_cmd_nm * 10.0f;
+
+                    // ctrl_Mit keeps the legacy DM4310 /10 conversion.
+                    const float torque_to_mit = yaw_lqr_output.tau_cmd_nm * 10.0f;
+                    dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f,
+                                     torque_to_mit * jm.yaw.getConfig().direction);
+                    yaw_fb_source = 1;
+                }
+                else
+                {
+                    if (yaw_lqr_active != 0U)
+                    {
+                        YawAutoLqrEso_Reset(&yaw_lqr, fb, vel);
+                        yaw_lqr_active = 0U;
+                        yaw_lqr_tau_cmd_nm = 0.0f;
+                        yaw.snapTargetToFeedback(fb);
+                    }
+
+                    float tgt = yaw.target_angle;
+                    float torque = yaw.Compute(tgt, fb, vel);
+                    dm4310->ctrl_Mit(1, 0.0f, 0.0f, 0.0f, 0.0f,
+                                     torque * jm.yaw.getConfig().direction);
+                }
             }
         }
         else
         {
             yaw.Clear();
             yaw_fb_source = 0;
+            if (yaw_lqr_active != 0U)
+            {
+                YawAutoLqrEso_Reset(&yaw_lqr, yaw_imu_angle, yaw_imu_velocity);
+                yaw_lqr_active = 0U;
+                yaw_lqr_tau_cmd_nm = 0.0f;
+            }
         }
 
         // --- Pitch 关节（DM4310 #2, IMU 传感器闭环）---

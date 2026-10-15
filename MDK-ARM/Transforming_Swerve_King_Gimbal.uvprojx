@@ -857,6 +857,16 @@
               <FileType>5</FileType>
               <FilePath>../Algorithm/Controller.hpp</FilePath>
             </File>
+            <File>
+              <FileName>yaw_auto_lqr_eso_controller.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../Algorithm/yaw_auto_lqr_eso_controller.h</FilePath>
+            </File>
+            <File>
+              <FileName>yaw_auto_lqr_eso_controller.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Algorithm/yaw_auto_lqr_eso_controller.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

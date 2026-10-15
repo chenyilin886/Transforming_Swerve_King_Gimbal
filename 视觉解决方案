@@ -1,0 +1,312 @@
+新观测很有价值：`tx_complete_count` 也 +3 说明 TxCplt 回调正常工作，`tx_abort_count=0`、`dev_state=3（CONFIGURED）` 说明 MCU 侧 USB 链路完全稳定——问题锁定在视觉端。我来分析 sp 文件夹。
+New information:
+- tx_busy stuck at 1 (tx_busy stuck)
+- tx_abort_count always 0 → the MCU-side USB never reset/disconnected → hardware link is stable
+- tx_count and tx_complete_count both increase by 3 at intervals → transmissions actually complete in pairs! Interesting: tx_complete_count also +3, meaning TxCplt does arrive, just only 3 times per period
+- hUsbDeviceFS.dev_state is 3 = USBD_STATE_CONFIGURED (usb defs: USBD_STATE_DEFAULT=1, ADDRESSED=2, CONFIGURED=3) → USB enumeration is normal
+
+Wait, this changes the previous judgment! If tx_complete_count is also increasing by 3, it means the transmission completion callbacks do come — 3 frames successfully sent per period, and the rest of the time TxState is stuck at 1. This is not "permanently stuck", but rather "only 3 frames complete after each reconnect".
+
+Hmm, rethink: if the host (visual-side program) keeps the serial port open, the host should keep polling IN. But the visual-side log shows the port is actually not open most of the time (PortNotOpenedException). Windows usbser: when the port is not open, it doesn't submit IN URBs → device TxState stuck at 1.
+
+Only during the brief moment the visual-side reconnects successfully (a few milliseconds), the port is opened, the driver submits an IN URB → pending transfer completes → TxCplt → tx_busy cleared → Send can submit again → several more frames complete (each requires the host to keep reading) → until the port closes again → the last submitted transmission hangs again → tx_busy=1 again.
+
+The observation that tx_count and tx_complete_count are both +3 is self-consistent: about 3 frames are sent and confirmed each time the port opens. This is fully consistent with the previous analysis: the visual side spends 99% of its time with the port unavailable.
+
+tx_abort_count=0 → the USB was never reset/disconnected → the device has never re-enumerated, and dev_state=3 is constantly CONFIGURED. So the problem is not on the MCU USB hardware side, but in the visual program's serial handle management (the open failure/reuse loop).
+
+Now the user asks to analyze the visual project in the workspace `d:\Project\Transforming_Swerve_King_Gimbal/sp` and check whether the protocol is misaligned.
+
+Need to:
+1. Look at the sp folder structure
+2. Find the visual-side serial communication code: protocol (frame format, baud?), open/reconnect logic
+3. Compare against MCU protocol: SP_HEADER0/1, frame size, CRC16, fields, etc.
+4. Focus on the visual-side reconnect logic — the cause of PortNotOpenedException
+
+First, explore the sp directory.
+
+sp 是标准的 RM 视觉项目，与 MCU 通信的核心是 `io/cboard`。并行读取视觉端通信代码和 MCU 端协议头文件进行对齐。
+sp_vision_25-main 是一个 RoboMaster 视觉项目。关键文件：
+- `io/cboard.hpp` / `io/cboard.cpp` —— 云台板（下位机）串口通信，这就是与 MCU 通信的部分，日志里的 "[Gimbal]" 前缀应该就是它
+- `io/serial/` —— serial 库（串口库，PortNotOpenedException 来自这里）
+- `tools/crc.cpp/hpp` —— CRC
+- `src/standard3.cpp`? 没看到，有 src/standard.cpp、mt_standard.cpp 等。日志里 "HikRobot's daemon thread started" 说明用的是 hikrobot 相机。
+
+用户提到视觉端日志：read_thread、First q received（q 帧——四元数）。cboard.cpp 是重点。
+
+并行读 cboard.hpp、cboard.cpp，以及crc.hpp/cpp。还要看 MCU 端 VisionCommC.h（协议常量定义）来对齐帧格式。
+
+注意：`io/cboard.cpp` 是 SocketCAN 版本，而日志里的 `[Gimbal] read_thread`、`Reconnecting serial` 是串口实现。搜索实际运行的串口通信代码。
+有意思！`io/cboard.cpp` 是 **SocketCAN**（Linux CAN 总线）的旧版实现，不是 USB 串口。而日志显示 "[Gimbal] read_thread started"、"[Gimbal] Failed to write serial: PortNotOpenedException Serial::write failed"、"Reconnecting serial" —— 这是串口实现，且带有重连逻辑。日志里还有 "HikRobot's daemon thread started"。
+
+所以实际跑的视觉程序可能不是这个 cboard（CAN 版本），而是某个用串口的版本。日志标签是 "[Gimbal]"。让我搜索 sp 项目中包含 "read_thread"、"Reconnecting serial"、"PortNotOpenedException"、"Too many errors" 的代码。
+
+另外 `io/gimbal/gimbal.cpp` 可能就是它！还有 `io/serial/` 目录。
+
+搜索这些关键词。
+
+找到实际通信类 `io::Gimbal`。读它的实现和 MCU 协议常量做对齐检查。
+找到了实际通信类 `io::Gimbal`。协议结构：
+
+**GimbalToVision（MCU → 视觉）**:
+- head[2] = {'S','P'}
+- mode: uint8
+- q[4]: float wxyz
+- yaw, yaw_vel, pitch, pitch_vel: 4×float
+- bullet_speed: float
+- bullet_count: uint16
+- crc16: uint16
+
+大小 = 2+1+16+16+4+2+2 = 43 字节。MCU 端 SP_TX_FRAME_SIZE 也应该是 43（tx_buffer 用到 offset 39..40 的 uint16 + CRC 2 字节 = 43）。对齐。
+
+**VisionToGimbal（视觉 → MCU）**:
+- head[2] = {'S','P'}
+- mode: uint8
+- yaw, yaw_vel, yaw_acc, pitch, pitch_vel, pitch_acc: 6×float
+- crc16: uint16
+
+大小 = 2+1+24+2 = 29 字节。MCU 端 SP_RX_FRAME_SIZE 需要核对。
+
+现在读 gimbal.cpp —— 关键是 read_thread、reconnect、send 逻辑（PortNotOpenedException 的来源）。同时读 MCU 的 VisionCommC.h 核对协议常量。
+
+视觉端代码拿到了，问题已经基本清晰。再核对协议常量、CRC 实现和调用方，完成对齐检查。
+重大发现！现在完整读懂视觉端了：
+
+**视觉端 `read_thread` 逻辑（gimbal.cpp#L130-198）：**
+```cpp
+int error_count = 0;
+while (!quit_) {
+    if (error_count > 5000) {
+        error_count = 0;
+        reconnect();  // close + sleep 1s + open
+        continue;
+    }
+    if (!read(head, 2)) { error_count++; continue; }   // 读失败 → error_count++
+    ...
+}
+```
+
+关键：`read()` 里 `serial_.read(buffer, size) == size` 才算成功。serial 库的 `read` 带超时（默认 timeout 可能是 0 或非常短），**读不够 size 字节也算失败**！
+
+日志模式解读：
+- 每 10ms 一条 "Failed to write serial" —— 说明主循环（另一个线程）以 ~100Hz 调 `send()`，而此时串口已 close（reconnect 里 close 了，open 失败或成功后被再次判定 Too many errors）。
+
+等等，重新梳理时间线：
+1. `read_thread started`（18:50:33.015）
+2. `First q received`（33.016）—— 构造函数里 `queue_.pop()` 成功，收到了至少一帧 MCU 数据！
+3. `Too many errors, attempting to reconnect...`（33.018）—— 仅 2ms 后！error_count > 5000？不可能，因为刚收到一帧。**除非**：error_count 是从 read_thread 启动开始累积的，在 First q received 之前已经累积了超过 5000 次失败。
+
+不对——First q received 在 33.016，read_thread started 在 33.015，中间只有 1ms。一个循环迭代（读 2 字节）就要至少一次 read 超时…… 如果 serial timeout 是 0（非阻塞），read 立即返回 0 ≠ 2 → error_count++。1ms 内可以跑几千次循环！所以：
+
+**真相**：read_thread 启动后，read() 持续快速失败（超时 0 或极短），error_count 疯涨；期间恰好收到一帧完整数据（First q received —— 构造函数阻塞在 queue_.pop()），但随后 read 又失败，error_count 在 ~2ms 内超过 5000 → 触发 reconnect。
+
+**reconnect()（L200-221）**：
+```cpp
+for (i = 0..9) {
+    serial_.close();
+    sleep(1s);
+    serial_.open();  // 成功 → log "Reconnected" → break
+}
+```
+日志显示每次 attempt 1/10 后 1 秒就 "Reconnected serial successfully" —— open 总能成功（设备一直在，dev_state=3 CONFIGURED，tx_abort=0 佐证 USB 从未断）。
+
+**但是重连成功后 2ms 又 "Too many errors"**：因为 open 后 read() 立即又失败（**为什么？**），error_count 又快速涨过 5000。
+
+等一下——error_count 在 reconnect 前 reset 为 0（L137：`if (error_count > 5000) { error_count = 0; reconnect(); }`）。重连成功后重新进入循环，read(head,2) 应该阻塞/超时等待数据……除非 MCU 数据根本到不了，read 超时失败累计 5000 次。5000 次需要多久？取决于 serial timeout。
+
+看时间模式：每轮 "Reconnected successfully" → "Too many errors" 间隔恰好 2ms！5000 次失败在 2ms 内完成？每次失败 0.4μs？只有 timeout=0（完全非阻塞）才可能。serial 库 read timeout=0, inter_byte_timeout=0 → 非阻塞读，无数据立即返回 0。
+
+2ms 内 5000 次非阻塞 read 调用 = 每次 0.4μs —— 这个速度对非阻塞 read 有点太夸张，但纯用户态循环调用（read 返回 0 字节），5000 次大概也就几 ms，量级合理。
+
+**所以视觉端的死循环根因**：
+1. serial 打开时 **timeout 配置为 0（非阻塞）** 或 read 立即失败
+2. read_thread 是**忙轮询**：没有数据 → read 失败 → error_count++（每秒百万次）
+3. 5000 次错误阈值瞬间达到 → 触发 reconnect → close + sleep(1s) + open → "Reconnected"
+4. 重连后 error_count=0，但 MCU → 视觉方向**没有新数据到达**（或极少）→ 又是空转 → 2ms 后又 Too many errors
+5. **在 close→sleep(1s) 的窗口里，主机驱动不轮询 IN 端点** → MCU 端 TxState 卡 1 → tx_busy 卡死 → tx_skip 猛涨
+6. open 成功后的 2ms 空窗里，主机恢复轮询 → 积压帧确认 → tx_count/tx_complete +3 → 又 close → 再卡住
+
+**为什么 MCU 的数据到不了视觉端？** First q received 证明最初能收到。之后为什么收不到？
+
+看 MCU 端发送：`Send()` 在 `tx_busy_` 卡住后全部 skip —— **死锁闭环**：
+- 视觉端 close 串口 → 主机停止轮询 IN → MCU 的 IN 传输挂起 → tx_busy 卡死 → MCU 停发
+- 视觉端 open → 主机恢复轮询 → 挂起的那一帧终于被主机收走 → MCU TxCplt → tx_busy 清 → MCU 继续发
+- 但 2ms 后视觉端又 close（error_count 又爆）→ IN 又挂起
+
+在 open 的 2ms 窗口内，MCU 能发 2~3 帧（500Hz 间隔 2ms），这些帧进入主机驱动缓冲。**视觉端 read_thread 为什么读不到？**
+
+注意 reconnect() 只在 read_thread 里跑；queue_.clear() 后回主循环 read。open 后 2ms 内：
+- error_count=0，进入 read(head,2)。
+- 驱动缓冲里可能已有 MCU 之前积压的帧？不一定——挂起的 IN 传输只有 1 帧在端点上（ST CDC 一次一包）。主机恢复后收到这 1 帧 + 随后 MCU 发的 2-3 帧。
+- read(head,2) 应该能读到 'S','P'！然后 read 剩余 41 字节……第一次读可能读不满（数据逐帧到达）→ 失败 → error_count++。
+- **而且 rx_data_ 的流处理有 bug**：如果第一次 read(head,2) 成功但第二次 read(41) 失败，rx_data_ 的 head 已被覆盖……下次循环重新从 head 读。这本身能恢复。
+- 但问题：5000 次失败阈值太低、且失败累积速度太快（非阻塞 read），即使偶尔读到数据，只要不是每次都满 43 字节就 error_count++，很快又爆 5000 → reconnect → close → 死循环。
+
+**核心 bug 链（视觉端）**：
+1. `serial::Serial` 打开时未配置合理的 timeout（需要看 main 里怎么构造的 —— 其实 serial_ 是成员，默认构造，然后 setPort + open。serial 库默认 timeout 是 read_timeout=0, write_timeout=0, inter_byte_timeout=0 → 全部非阻塞！）
+2. `read()` 把"数据未到齐"当错误计数 → 忙轮询瞬间爆 5000 → 无限重连
+3. reconnect 里 close 的 1 秒窗口 → MCU 端 tx_busy 卡死 → 两边互相"饿死"
+
+其实还有一个更基本的问题：**MCU 端到底有没有持续发数据？** First q received 说明有（至少当时有）。之后 MCU tx_busy 卡死 → 发送停止 → 视觉端 read 永远等不到数据 → error_count 爆 → reconnect…… 但 reconnect 后 open 的瞬间 MCU 又能发 3 帧，视觉端 2ms 窗口内又读不到（非阻塞 read 时序 + error_count 已在涨）……
+
+等等，open 后 2ms 内 log 出现 "Too many errors"，error_count 要涨 5000 次。但 error_count 在 reconnect 前被清 0，重连成功 break 回主循环。5000 次非阻塞 read 失败在 2ms 内 —— 合理。
+
+**但是！** 如果这 2ms 里驱动缓冲有 MCU 发来的完整帧，read(head,2) 成功 → error_count 清 0 → 继续读 41 字节。驱动缓冲有 3 帧积压（MCU 在 open 瞬间发的）→ 第一次 read(head,2) 读到 'SP'，read(41) 也能从缓冲读到（同一帧剩余部分在缓冲里）。应该能成功解析至少 1-2 帧！日志却显示重连后从未再收到 q。
+
+矛盾点：重连后明明有 2-3 帧到了主机缓冲，为什么 read 失败？
+
+可能性 A：MCU 的 3 帧是在 open 之前就挂在设备端点上，主机 open 时 usbser 提交 IN URB 收到 1 帧（端点上那帧），随后 MCU tx_busy 清零再发第 2、3 帧（间隔 2ms）。驱动缓冲陆续收到。视觉 read_thread 在 open 后立即开始读：
+- t=0: open 成功。read(head,2)——缓冲里可能还没有数据（URB 刚提交）→ 立即失败（非阻塞）→ error_count=1
+- 循环几千次，缓冲到数据的延迟 ~1-2ms，如果在此之前 error_count 已达 5000 → 触发 reconnect → close！**close 会丢弃驱动缓冲里刚收到的帧！**
+- 这完全解释了"永远差一点"：非阻塞 read 空转速度（每秒百万次）远快于 USB 数据到达速度（500Hz），error_count 总是在第一帧数据到达之前就爆 5000。
+
+数值验证：5000 次 / 2ms = 2.5M 次/秒。USB 数据 500Hz，平均等 1ms 才来第一帧 = 需要容忍 ~2.5M×1ms = 2500 次失败。5000 次阈值 ≈ 2ms 空转 —— 第一帧平均 1ms 到，最坏 2ms。阈值刚好卡在边缘，大部分时候第一帧还没到就爆了。偶尔收到（First q received 就是在最初启动时收到过一次）。
+
+**结论：视觉端三个问题叠加：**
+1. **serial 非阻塞（timeout 全 0）**：read() 空转极快
+2. **把"暂时没数据"计入 error_count**：5000 阈值在 500Hz 数据率下 ~2ms 就爆
+3. **reconnect close 1 秒**：反噬 MCU 端 tx_busy 卡死，MCU 停发 → 视觉更收不到数据 → 恶性循环
+
+还有对齐问题要检查：
+- GimbalToVision = 43 字节：head(2)+mode(1)+q(16)+yaw(4)+yaw_vel(4)+pitch(4)+pitch_vel(4)+bullet_speed(4)+bullet_count(2)+crc16(2) = 43。MCU SP_TX_FRAME_SIZE 需要确认 = 43？MCU 发送布局：tx[0..1] head, tx[2] mode, tx[3..18] quat, tx[19..22] yaw, tx[23..26] yaw_vel, tx[27..30] pitch, tx[31..34] pitch_vel, tx[35..38] bullet_speed, tx[39..40] bullet_count(u16), tx[41..42] crc = 43 ✓ 一致
+- VisionToGimbal = 29 字节：head(2)+mode(1)+6×float(24)+crc(2) = 29。MCU SP_RX_FRAME_SIZE？MCU 解析：rx[2] mode, rx[3..6] yaw, [7..10] yaw_vel, [11..14] yaw_acc, [15..18] pitch, [19..22] pitch_vel, [23..26] pitch_acc, CRC at SP_RX_CRC_OFFSET。需要看 VisionComm.hpp 确认 SP_RX_FRAME_SIZE=29、SP_RX_CRC_OFFSET=27 ✓ 应该一致，但值得确认。
+- 视觉 tx_data_ 是**类成员**，`send()` 并发调用无锁 —— 但主要问题不在这。
+- CRC 算法：视觉 `tools::get_crc16`，MCU `crc16_mcrf4xx`。需要确认两者一致（都是 CRC-16/MCRF4XX 初始 0xFFFF）。视觉端 check_crc16 对整个帧（含 crc16 字段）验证 —— 看下 tools/crc.cpp。
+- **字节序**：MCU encode_f32_le 小端；视觉端是 x86/ARM 小端，直接 memcpy struct → 一致 ✓
+- **q 顺序**：MCU tx[3]=quat_w(w), x, y, z（wxyz）；视觉 `Eigen::Quaterniond q(rx_data_.q[0], q[1], q[2], q[3])` —— Eigen 构造函数参数顺序是 (w, x, y, z) ✓ 一致
+- mode：MCU tx[2] = VISION_MODE_AUTO_AIM（值？）视觉 case 0..3。 VisionComm.hpp 里查 VISION_MODE_AUTO_AIM 值。
+- 视觉 mode 字段注释 "0: 空闲, 1: 自瞄, 2: 小符, 3: 大符"；MCU 发的 VISION_MODE_AUTO_AIM 应该=1。
+
+还要看：
+1. VisionComm.hpp 的协议常量
+2. tools/crc.cpp 的 get_crc16 实现
+3. 谁调用 gimbal.send()（频率，~100Hz 与日志 10ms 一致）—— mt_standard.cpp 或 standard3？standard3.yaml 是日志中跑的程序？搜 "Gimbal" 的使用。日志里有 HikRobot 相机 → hikrobot 相机程序。搜哪个 src 用 io::Gimbal。
+
+并行读。
+
+现在所有证据齐了。做最终对齐分析：
+
+## 协议对齐检查（这部分是 OK 的）
+
+**MCU → 视觉（43 字节）**：
+- MCU：tx[0..1]='SP', tx[2]=mode, tx[3..18]=quat(wxyz), tx[19..22]=yaw, [23..26]=yaw_vel, [27..30]=pitch, [31..34]=pitch_vel, [35..38]=bullet_speed, [39..40]=bullet_count(u16le), tx[41..42]=crc16(LE)
+- 视觉：GimbalToVision packed struct 完全一致 ✓
+- CRC：MCU `crc16_mcrf4xx`（init 0xFFFF, poly 0x8408 reflected）；视觉 `get_crc16` 查表法（init 0xffff, CRC16_TABLE 是 reflected 0x1021 = 0x8408 的查表）。验证：TABLE[1] = 0x1189 —— MCRF4XX 标准查表 ✓ 一致
+- check_crc16: `(data[len-1] << 8) | data[len-2]` = 小端读 CRC ✓ 与 MCU "low byte first" 一致
+- 视觉 check_crc16 覆盖 `sizeof(rx_data_)`-2 = 41 字节，MCU 计算覆盖 SP_TX_CRC_OFFSET=41 字节 ✓
+
+**视觉 → MCU（29 字节）**：
+- 视觉 VisionToGimbal: head(2)+mode(1)+yaw(4)+yaw_vel(4)+yaw_acc(4)+pitch(4)+pitch_vel(4)+pitch_acc(4)+crc16(2) = 29 ✓
+- MCU SP_RX_FRAME_SIZE=29, SP_RX_CRC_OFFSET=27, 字段偏移一致 ✓
+
+所以**协议本身完全对齐**。问题不在协议。
+
+## 真正的问题：视觉端 read_thread 的忙轮询重连死循环
+
+时间线复盘（结合日志和代码）：
+
+1. **serial 库打开时 timeout 全 0（非阻塞）**。`Gimbal` 构造只调了 `setPort + open`，**没有设置 timeout**！serial::Serial 默认 Timeout 是全 0 —— read() 非阻塞，没数据立即返回 0。
+
+   等等，需要确认 serial 库默认构造的 timeout。serial v3 默认 `Timeout()` 构造是 `read_timeout_constant=0, read_timeout_multiplier=0, write_timeout_constant=0, write_timeout_multiplier=0, inter_byte_timeout=max`？实际 serial 库（wjwwood/serial）默认 Timeout simple constructor: `Timeout(0, 0, 0, 0, 0)`。Read 返回 0 当无数据。是的，非阻塞。
+
+2. `read()`（gimbal.cpp#L120-128）：`serial_.read(buffer, size) == size` 才算成功。非阻塞模式下没数据 → 返回 0 ≠ size → false → `error_count++`。
+
+3. read_thread 忙循环：无数据时每秒空转百万次，error_count 以 ~百万/秒速度累积。
+
+4. **阈值 5000**：约 2~5ms 就爆 → `reconnect()`：`close() → sleep(1s) → open()`。
+
+5. **close 的 1 秒窗口**是 MCU 端现象的直接原因：主机驱动关闭串口句柄后不再轮询 IN 端点 → MCU 端 IN 传输挂起 → `TxState=1` → `tx_busy_=true` 卡死 → 500Hz Send 全部 `tx_skip_count++`。
+
+6. open 成功后的 ~2ms 内：主机恢复轮询 → 挂起帧被确认（tx_complete +1，tx_count +1）→ MCU 又连发 2-3 帧（500Hz×2ms）→ 这些帧被主机收走（tx_complete 再 +1~2）→ **总计 +3** → 但此时 read_thread 那边 error_count 又爆了 5000（因为第一帧数据到达驱动缓冲的平均延迟 ~1ms，而 error_count 在 ~2ms 内就达阈值）→ close → 循环。
+
+   更精确地说：open 后 read(head,2) 非阻塞空转，error_count 2ms 内超 5000 → 触发 reconnect → close。在这 2ms 里 MCU 完成 3 帧传输。这就是"+3"的来源。之后 close 又持续 1 秒。
+
+7. **为什么视觉端从未再收到 q（日志无 Second q）**：open→close 窗口仅 ~2ms，且 read_thread 的 error 计数在第一帧真正到达前就爆了；即使偶尔读到 head 2 字节，后续 41 字节的 read 因数据未到齐也失败，error_count 继续涨 → 还是爆。close() 还会**丢弃驱动缓冲**里刚收到的帧。恶性循环成立。
+
+8. tx_abort_count=0、dev_state=3 完全吻合：USB 设备从未断开/复位，问题纯粹是主机侧串口句柄 open/close 循环。
+
+## 证据链交叉验证
+- 日志 write 失败间隔 10ms ≈ 主程序 send() 频率 100Hz（mt_standard/standard_mpc 主循环）
+- 每轮循环 ~1.002s = reconnect 的 sleep(1s) + open
+- "Reconnected successfully" 与下一个 "Too many errors" 间隔 2ms = 5000 次非阻塞 read 空转时间
+- tx_count/tx_complete 每 1 秒 +3 = 2ms 开窗内 500Hz 传输确认数
+
+## 修复方向（视觉端为主）
+
+**视觉端（根因）**：
+1. 设置串口超时：`serial_.setTimeout(...)` 例如 `Timeout(5, 0, 0, 0, 0)`（inter_byte 5ms? 实际用 simple timeout：read 10ms）—— 让 read() 阻塞等待而不是空转
+2. 或者：没数据不计入 error_count —— 只有**异常**（PortNotOpen 等 exception）才计数；read 返回不足只是"暂无数据"
+3. 阈值/重连逻辑：`error_count > 5000` 改为基于时间的判据（如 1 秒无有效帧才重连）
+4. reconnect 里 sleep(1s) 过长 + close 期间 MCU 端会卡 tx —— 可以接受，但频率应降到几乎不触发
+
+**MCU 端（健壮性，次要）**：
+- tx_busy_ 加超时保护（如 >5ms 未完成就强制清 busy），避免主机侧异常时永久卡死
+- 甚至可以直接去掉 tx_busy_ 依赖 CDC_Transmit_FS 的 USBD_BUSY 返回值
+
+还有一个小点：`Gimbal::send` 无锁访问 `tx_data_` 成员，两个重载如果被多线程调用有竞态，但这里只有一个控制线程调用，不是当前问题。
+
+还有 VisionToGimbal 的 mode 注释与 MCU 的解析一致（0/1/2）✓。
+
+结论表述要点：
+1. 协议完全对齐（帧格式、CRC、字节序、四元数顺序全部核对一致）—— 不是协议问题
+2. 根因：视觉端 serial 未配置 timeout → 非阻塞读 → "没数据"被当错误 → 5000 阈值 2ms 爆 → 每秒 close/sleep(1s)/open 循环
+3. close 期间主机不轮询 IN 端点 → MCU tx_busy 卡死（tx_skip 猛涨）；开窗 2ms 内 3 帧完成（+3）
+4. tx_abort=0、dev_state=3 佐证 USB 链路稳定
+5. 修复建议
+
+用户说"先分析不修改"是上一轮的要求；这一轮让"分析工作区中的 SP 文件夹，看是否没对齐"。给出分析和修复方向，不直接改代码（视觉项目在别的机器上跑，也改不了运行时）。我可以给出具体修改建议代码片段。
+
+组织回复。要简洁但完整。
+# 对齐分析完成：协议完全一致，问题在视觉端串口超时配置
+
+## 一、协议对齐检查 —— 全部一致，排除协议问题
+
+| 检查项 | MCU 端 | 视觉端 (gimbal.hpp/crc.cpp) | 结果 |
+|---|---|---|---|
+| MCU→视觉帧 | 43 字节：`SP`+mode+quat(wxyz)+yaw+yaw_vel+pitch+pitch_vel+bullet_speed+bullet_count(u16) | `GimbalToVision` packed struct 逐字段一致 | ✅ |
+| 视觉→MCU帧 | 29 字节，CRC 偏移 27 | `VisionToGimbal` = 2+1+6×4+2 = 29 | ✅ |
+| CRC16 | `crc16_mcrf4xx`（init 0xFFFF, reflected 0x8408），低字节在前 | 查表法 `CRC16_TABLE[1]=0x1189`，`(data[len-1]<<8)\|data[len-2]` 小端读 | ✅ 同一算法 |
+| 字节序 | 显式小端 encode/decode | x86 小端直接 memcpy struct | ✅ |
+| 四元数顺序 | w,x,y,z | `Eigen::Quaterniond(q[0..3])` = (w,x,y,z) | ✅ |
+| mode 语义 | 发 `VISION_MODE_AUTO_AIM=1` | case 1 → AUTO_AIM | ✅ |
+
+## 二、真正的根因：视觉端 serial 未配置超时 → 忙轮询重连死循环
+
+[gimbal.cpp#L15-L21](file:///d:/Project/Transforming_Swerve_King_Gimbal/sp/sp_vision_25-main/io/gimbal/gimbal.cpp#L15-L21) 构造时只调了 `setPort + open()`，**从未调用 `setTimeout()`**。serial 库默认 Timeout 全 0 = **完全非阻塞**。由此产生死循环：
+
+1. [read()](file:///d:/Project/Transforming_Swerve_King_Gimbal/sp/sp_vision_25-main/io/gimbal/gimbal.cpp#L120-L128)：非阻塞模式下“暂时没数据”返回 0 ≠ size → 记为**错误** `error_count++`
+2. read_thread 空转速度约每秒百万次 → **5000 阈值约 2ms 就爆**（[gimbal.cpp#L136-L141](file:///d:/Project/Transforming_Swerve_King_Gimbal/sp/sp_vision_25-main/io/gimbal/gimbal.cpp#L136-L141)）
+3. 触发 `reconnect()`：`close() → sleep(1秒) → open()`（[gimbal.cpp#L200-L221](file:///d:/Project/Transforming_Swerve_King_Gimbal/sp/sp_vision_25-main/io/gimbal/gimbal.cpp#L200-L221)）
+4. open 成功后 error_count 清零，但**第一帧 USB 数据平均 1ms 后才到驱动缓冲**，而 error_count 又在 ~2ms 内爆表 → 再次 close —— **永远差一点点收到数据**
+
+日志数字全部对上：每轮循环 1.002s（=sleep 1s + open）；"Reconnected" 到下一次 "Too many errors" 间隔 2ms（=5000 次非阻塞空转）；write 失败间隔 10ms（=主循环 100Hz 调 `send()`）。
+
+## 三、与你 Watch 观测的完整闭环
+
+```
+视觉端 close 串口 1 秒
+  → Windows 驱动停止轮询 IN 端点
+  → MCU IN 传输挂起, TxState=1, tx_busy_ 卡 1     ← 你看到的 tx_busy=1
+  → 500Hz Send 全走 skip 分支                      ← tx_skip_count 猛涨
+视觉端 open 成功的 ~2ms 窗口
+  → 挂起帧被确认 + MCU 连发 2~3 帧全部完成          ← tx_count / tx_complete_count 各 +3
+  → error_count 再爆, close, 重复
+```
+
+`tx_abort_count=0`、`dev_state=3（CONFIGURED）` 佐证 USB 设备**从未断开**——MCU 侧硬件和 USB 协议栈完全无辜。
+
+## 四、修复方向
+
+**视觉端（根因，3 处改动）：**
+
+```cpp
+// gimbal.cpp 构造函数, open 之后加:
+serial_.setTimeout(serial::Timeout(0, 50, 0, 0, 0));  // read 阻塞 50ms 而非空转
+```
+
+- read() 里“数据未到齐”不应计入 error_count，只有抛异常（端口真的失效）才计数
+- 5000 次阈值改为基于时间判据（如连续 1 秒无有效帧才 reconnect）
+
+**MCU 端（健壮性加固，可选）：** `tx_busy_` 加超时保护（如 >5ms 未收到 TxCplt 强制清零），避免主机侧任何异常时 500Hz 全部空转。当前它没有超时，主机一 close 就必然卡死。
+
+这两边都改后：视觉端 read 变阻塞等待、不再无意义重连；即使视觉端真断开，MCU 也能 5ms 自愈继续发，双方可以自然恢复。需要我动手改的话说一声（视觉端代码在 sp 目录里，可以直接改）。

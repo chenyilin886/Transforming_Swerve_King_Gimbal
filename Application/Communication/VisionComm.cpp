@@ -1,12 +1,13 @@
 /**
  * @file VisionComm.cpp
- * @brief RCIA vision protocol over USB CDC virtual COM port.
+ * @brief SP + CRC16 vision protocol over USB CDC virtual COM port.
  */
 
 #include "VisionComm.hpp"
 #include "VisionCommC.h"
 #include "../Variable.hpp"
 #include "BoardComm.hpp"
+#include <cmath>
 
 extern "C" {
 #include "usbd_cdc_if.h"
@@ -40,7 +41,7 @@ void Manager::ConsumeByte(uint8_t byte)
 {
     if (rx_stream_len_ == 0U)
     {
-        if (byte == RCIA_HEADER)
+        if (byte == SP_HEADER0)
         {
             rx_buffer_[rx_stream_len_++] = byte;
         }
@@ -49,7 +50,7 @@ void Manager::ConsumeByte(uint8_t byte)
 
     if (rx_stream_len_ == 1U)
     {
-        if (byte == RCIA_HEADER)
+        if (byte == SP_HEADER1)
         {
             rx_buffer_[rx_stream_len_++] = byte;
         }
@@ -62,7 +63,7 @@ void Manager::ConsumeByte(uint8_t byte)
 
     rx_buffer_[rx_stream_len_++] = byte;
 
-    if (rx_stream_len_ >= RCIA_RX_FRAME_SIZE)
+    if (rx_stream_len_ >= SP_RX_FRAME_SIZE)
     {
         if (ParseFrame())
         {
@@ -77,34 +78,66 @@ void Manager::ConsumeByte(uint8_t byte)
 
 bool Manager::ParseFrame()
 {
-    if (rx_buffer_[0] != RCIA_HEADER || rx_buffer_[1] != RCIA_HEADER)
+    if (rx_buffer_[0] != SP_HEADER0 || rx_buffer_[1] != SP_HEADER1)
     {
         return false;
     }
 
-    if (rx_buffer_[12] != RCIA_TAIL)
+    const uint16_t received_crc = decode_u16_le(&rx_buffer_[SP_RX_CRC_OFFSET]);
+    const uint16_t calculated_crc = crc16_mcrf4xx(rx_buffer_, SP_RX_CRC_OFFSET);
+    if (received_crc != calculated_crc)
     {
         return false;
     }
 
-    const int32_t pitch_raw = decode_i32_be(&rx_buffer_[2]);
-    const int32_t yaw_raw   = decode_i32_be(&rx_buffer_[6]);
+    const uint8_t mode = rx_buffer_[2];
+    if (mode > VISION_CONTROL_AIM_AND_FIRE)
+    {
+        return false;
+    }
 
-    rx_.pitch_angle  = static_cast<float>(pitch_raw) / ANGLE_SCALE;
-    rx_.yaw_angle    = static_cast<float>(yaw_raw) / ANGLE_SCALE;
-    rx_.vision_ready = rx_buffer_[10];
-    rx_.fire         = rx_buffer_[11];
-    rx_.timestamp    = decode_u32_be(&rx_buffer_[13]);
-    rx_.aim_x        = rx_buffer_[17];
-    rx_.aim_y        = rx_buffer_[18];
+    const float yaw = decode_f32_le(&rx_buffer_[3]);
+    const float yaw_vel = decode_f32_le(&rx_buffer_[7]);
+    const float yaw_acc = decode_f32_le(&rx_buffer_[11]);
+    const float pitch = decode_f32_le(&rx_buffer_[15]);
+    const float pitch_vel = decode_f32_le(&rx_buffer_[19]);
+    const float pitch_acc = decode_f32_le(&rx_buffer_[23]);
+    if (!std::isfinite(yaw) || !std::isfinite(yaw_vel) ||
+        !std::isfinite(yaw_acc) || !std::isfinite(pitch) ||
+        !std::isfinite(pitch_vel) || !std::isfinite(pitch_acc))
+    {
+        return false;
+    }
+
+    rx_.mode = mode;
+    rx_.yaw = yaw;
+    rx_.yaw_vel = yaw_vel;
+    rx_.yaw_acc = yaw_acc;
+    rx_.pitch = pitch;
+    rx_.pitch_vel = pitch_vel;
+    rx_.pitch_acc = pitch_acc;
+
+    // Keep the existing control interface in degrees while the wire protocol
+    // uses radians.
+    rx_.pitch_angle = pitch * RAD_TO_DEG;
+    rx_.yaw_angle = yaw * RAD_TO_DEG;
+    rx_.vision_ready = (mode != VISION_CONTROL_IDLE) ? 1U : 0U;
+    rx_.fire = (mode == VISION_CONTROL_AIM_AND_FIRE) ? 1U : 0U;
+    rx_.timestamp = HAL_GetTick();
+    rx_.aim_x = 0;
+    rx_.aim_y = 0;
     rx_.online       = 1;
 
     rx_watch_.UpdateLastTime();
 
     VisionComm_Data.pitch_angle  = rx_.pitch_angle;
     VisionComm_Data.yaw_angle    = rx_.yaw_angle;
-    VisionComm_Data.pitch_raw    = pitch_raw;
-    VisionComm_Data.yaw_raw      = yaw_raw;
+    VisionComm_Data.yaw_velocity = rx_.yaw_vel;
+    VisionComm_Data.yaw_acceleration = rx_.yaw_acc;
+    VisionComm_Data.pitch_velocity = rx_.pitch_vel;
+    VisionComm_Data.pitch_acceleration = rx_.pitch_acc;
+    VisionComm_Data.pitch_raw    = static_cast<int32_t>(rx_.pitch_angle * 100.0f);
+    VisionComm_Data.yaw_raw      = static_cast<int32_t>(rx_.yaw_angle * 100.0f);
     VisionComm_Data.vision_ready = rx_.vision_ready;
     VisionComm_Data.fire         = rx_.fire;
     VisionComm_Data.timestamp    = rx_.timestamp;
@@ -113,7 +146,7 @@ bool Manager::ParseFrame()
     VisionComm_Data.online       = rx_.online;
     VisionComm_Data.rx_head0     = rx_buffer_[0];
     VisionComm_Data.rx_head1     = rx_buffer_[1];
-    VisionComm_Data.rx_tail      = rx_buffer_[12];
+    VisionComm_Data.rx_tail      = 0;
 
     return true;
 }
@@ -122,7 +155,7 @@ void Manager::ResyncRxStream()
 {
     for (uint8_t i = 1; i + 1 < rx_stream_len_; ++i)
     {
-        if (rx_buffer_[i] == RCIA_HEADER && rx_buffer_[i + 1] == RCIA_HEADER)
+        if (rx_buffer_[i] == SP_HEADER0 && rx_buffer_[i + 1] == SP_HEADER1)
         {
             const uint8_t remaining = static_cast<uint8_t>(rx_stream_len_ - i);
             std::memmove(rx_buffer_, &rx_buffer_[i], remaining);
@@ -131,9 +164,9 @@ void Manager::ResyncRxStream()
         }
     }
 
-    if (rx_stream_len_ > 0U && rx_buffer_[rx_stream_len_ - 1U] == RCIA_HEADER)
+    if (rx_stream_len_ > 0U && rx_buffer_[rx_stream_len_ - 1U] == SP_HEADER0)
     {
-        rx_buffer_[0] = RCIA_HEADER;
+        rx_buffer_[0] = SP_HEADER0;
         rx_stream_len_ = 1;
     }
     else
@@ -151,26 +184,54 @@ void Manager::Send()
         return;
     }
 
-    tx_buffer_[0] = RCIA_HEADER;
-    tx_buffer_[1] = RCIA_HEADER;
+    tx_buffer_[0] = SP_HEADER0;
+    tx_buffer_[1] = SP_HEADER1;
 
-    encode_f32_be(&tx_buffer_[2],  IMU_Data.quat_w);
-    encode_f32_be(&tx_buffer_[6],  IMU_Data.quat_x);
-    encode_f32_be(&tx_buffer_[10], IMU_Data.quat_y);
-    encode_f32_be(&tx_buffer_[14], IMU_Data.quat_z);
+    // Work mode is kept at AUTO_AIM during the first protocol migration.
+    tx_buffer_[2] = VISION_MODE_AUTO_AIM;
+
+    // The vision side waits for a valid quaternion during startup. Use the
+    // identity quaternion until IMU data is online instead of sending zeros.
+    float quat_w = IMU_Data.quat_w;
+    float quat_x = IMU_Data.quat_x;
+    float quat_y = IMU_Data.quat_y;
+    float quat_z = IMU_Data.quat_z;
+    const float quat_norm_sq = quat_w * quat_w + quat_x * quat_x +
+                               quat_y * quat_y + quat_z * quat_z;
+    if (IMU_Data.online == 0U || !std::isfinite(quat_w) ||
+        !std::isfinite(quat_x) || !std::isfinite(quat_y) ||
+        !std::isfinite(quat_z) || quat_norm_sq < 0.5f || quat_norm_sq > 1.5f)
+    {
+        quat_w = 1.0f;
+        quat_x = 0.0f;
+        quat_y = 0.0f;
+        quat_z = 0.0f;
+    }
+
+    encode_f32_le(&tx_buffer_[3],  quat_w);
+    encode_f32_le(&tx_buffer_[7],  quat_x);
+    encode_f32_le(&tx_buffer_[11], quat_y);
+    encode_f32_le(&tx_buffer_[15], quat_z);
+
+    encode_f32_le(&tx_buffer_[19], Joint_Data.yaw.real_angle);
+    encode_f32_le(&tx_buffer_[23], Joint_Data.yaw.velocity);
+    encode_f32_le(&tx_buffer_[27], Joint_Data.pitch.real_angle);
+    encode_f32_le(&tx_buffer_[31], Joint_Data.pitch.velocity);
 
     const float bullet_speed = BoardComm::Gimbal_to_Chassis::Instance().getLaunchSpeed();
-    encode_f32_be(&tx_buffer_[18], bullet_speed);
+    encode_f32_le(&tx_buffer_[35], bullet_speed);
 
-    tx_buffer_[22] = ENEMY_COLOR_BLUE;
-    tx_buffer_[23] = VISION_MODE_AUTO_AIM;
-    tx_buffer_[24] = RCIA_TAIL;
-    encode_u32_be(&tx_buffer_[25], HAL_GetTick());
+    // The current counter is a planned shot-command counter, not a referee
+    // confirmed projectile count. Send zero until that semantic is finalized.
+    encode_u16_le(&tx_buffer_[39], 0U);
+
+    const uint16_t crc = crc16_mcrf4xx(tx_buffer_, SP_TX_CRC_OFFSET);
+    encode_u16_le(&tx_buffer_[SP_TX_CRC_OFFSET], crc);
 
     tx_busy_ = true;
     VisionComm_Data.tx_busy = 1;  // 同步到全局变量
     
-    const uint8_t result = CDC_Transmit_FS(tx_buffer_, RCIA_TX_FRAME_SIZE);
+    const uint8_t result = CDC_Transmit_FS(tx_buffer_, SP_TX_FRAME_SIZE);
     if (result == USBD_OK)
     {
         tx_count_++;
@@ -204,6 +265,21 @@ void Manager::TxComplete()
 {
     tx_busy_ = false;
     VisionComm_Data.tx_busy = 0;  // 同步到全局变量
+    tx_complete_count_++;
+    VisionComm_Data.tx_complete_count = tx_complete_count_;
+}
+
+void Manager::TxAbort()
+{
+    if (tx_busy_)
+    {
+        tx_abort_count_++;
+        VisionComm_Data.tx_abort_count = tx_abort_count_;
+    }
+
+    // USB reset/disconnect cancels the in-flight transfer without a TxCplt callback.
+    tx_busy_ = false;
+    VisionComm_Data.tx_busy = 0;
 }
 
 } // namespace VisionComm
@@ -216,4 +292,9 @@ extern "C" void VisionComm_USBReceive(const uint8_t *data, uint32_t len)
 extern "C" void VisionComm_USBTxComplete(void)
 {
     VisionComm::Manager::Instance().TxComplete();
+}
+
+extern "C" void VisionComm_USBTxAbort(void)
+{
+    VisionComm::Manager::Instance().TxAbort();
 }

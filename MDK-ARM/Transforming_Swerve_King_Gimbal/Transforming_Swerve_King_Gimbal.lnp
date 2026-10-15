@@ -48,6 +48,7 @@
 "transforming_swerve_king_gimbal\dr16.o"
 "transforming_swerve_king_gimbal\hi12h3_imu.o"
 "transforming_swerve_king_gimbal\pid.o"
+"transforming_swerve_king_gimbal\yaw_auto_lqr_eso_controller.o"
 "transforming_swerve_king_gimbal\can_device.o"
 "transforming_swerve_king_gimbal\can_bus.o"
 "transforming_swerve_king_gimbal\can_device_impl.o"

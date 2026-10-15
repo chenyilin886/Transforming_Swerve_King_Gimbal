@@ -8,6 +8,7 @@ extern "C" {
 
 void VisionComm_USBReceive(const uint8_t *data, uint32_t len);
 void VisionComm_USBTxComplete(void);
+void VisionComm_USBTxAbort(void);
 
 #ifdef __cplusplus
 }

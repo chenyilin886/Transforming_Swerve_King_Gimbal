@@ -37,9 +37,10 @@ transforming_swerve_king_gimbal/gimbalinit.o: \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pcd.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_ll_usb.h \
   ..\Drivers\STM32F4xx_HAL_Driver\Inc\stm32f4xx_hal_pcd_ex.h \
-  ..\Application\Variable.hpp ..\Application\Vofa.hpp \
-  ..\Core\Inc\usart.h ..\Core\Inc\can.h ..\HAL\CAN\can_hal.hpp \
-  ..\HAL\CAN\interface\can_bus.hpp ..\HAL\CAN\interface\can_device.hpp \
+  ..\Application\Variable.hpp ..\Algorithm\yaw_auto_lqr_eso_controller.h \
+  ..\Application\Vofa.hpp ..\Core\Inc\usart.h ..\Core\Inc\can.h \
+  ..\HAL\CAN\can_hal.hpp ..\HAL\CAN\interface\can_bus.hpp \
+  ..\HAL\CAN\interface\can_device.hpp \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\functional \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__algorithm\search.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__algorithm\comp.h \
@@ -786,6 +787,7 @@ transforming_swerve_king_gimbal/gimbalinit.o: \
   ..\BSP\Common\StateWatch\state_watch.hpp ..\BSP\Motor\Lk\LkMotor.hpp \
   ..\BSP\Motor\Dji\DjiMotor.hpp ..\Joint\Joint.hpp \
   ..\Algorithm\Controller.hpp ..\Algorithm\PID.hpp ..\BSP\stdxxx.hpp \
+  ..\Algorithm\..\Application\Variable.hpp \
   ..\Planner\TransformPlanner.hpp ..\BSP\Remote\DR16.hpp \
   ..\BSP\IMU\HI12H3_IMU.hpp ..\Application\Communication\BoardComm.hpp \
   ..\Application\Communication\ChassisModeManager.hpp \

@@ -786,6 +786,7 @@ transforming_swerve_king_gimbal/boardcomm.o: \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\pointer_to_unary_function.h \
   C:\Keil_v5\ARM\ARMCLANG\include\libcxx\__functional\unary_negate.h \
   ..\BSP\Motor\DM\DmMotor.hpp ..\Application\Variable.hpp \
+  ..\Algorithm\yaw_auto_lqr_eso_controller.h \
   ..\BSP\..\Application\Variable.hpp \
   ..\Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os.h \
   ..\Middlewares\Third_Party\FreeRTOS\Source\include\FreeRTOS.h \

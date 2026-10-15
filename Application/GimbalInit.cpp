@@ -35,7 +35,7 @@
 #include "HI12H3_IMU.hpp"
 #include "Communication/BoardComm.hpp"
 #include "Communication/ChassisModeManager.hpp"  // 底盘模式状态机
-#include "Communication/VisionComm.hpp"         // Vision communication (RCIA)
+#include "Communication/VisionComm.hpp"         // Vision communication (SP + CRC16)
 
 // ========================================================================
 // 全局电机指针
@@ -386,6 +386,11 @@ static inline bool isKeyboardRotateChassisMode(bool keyboard_mode)
            fabsf(Transform_Status.fold_err) <= Transform_Config.arrive_eps;
 }
 
+static inline float nearestYawReference(float reference_rad, float feedback_rad)
+{
+    return feedback_rad - BSP::JOINT::wrapToPi(feedback_rad - reference_rad);
+}
+
 // ========================================================================
 // 初始化
 // ========================================================================
@@ -445,7 +450,7 @@ void GimbalInit()
     // 8. 初始化 IMU(Stage03 接入传感器, USART1 DMA空闲中断接收)
     BSP::IMU::imu.Init();
 
-    // Stage07 vision communication init (USART6 DMA idle RX)
+    // Stage07 vision communication init (USB CDC virtual COM RX)
     VisionComm::Manager::Instance().Init();
 
     // 9. 使能全部电机
@@ -1495,6 +1500,52 @@ void GimbalUpdate()
     bool is_transition = BSP::PLANNER::isTransitionState(
         static_cast<BSP::PLANNER::TransformState>(Transform_Status.state));
 
+    // LQR consumes the same vision yaw direction as the existing target-angle
+    // path. The vision trajectory also supplies yaw velocity and acceleration
+    // references in rad/s and rad/s^2.
+    const uint32_t vision_reference_age_ms =
+        HAL_GetTick() - VisionComm_Data.timestamp;
+    const bool vision_reference_fresh =
+        (VisionComm_Data.online != 0U) &&
+        (vision_reference_age_ms <= 50U);
+    const bool yaw_lqr_request =
+        (vision_active != 0U) &&
+        (!is_transition) &&
+        (FollowMode_Data.control_mode == 0U) &&
+        (gimbal_controller.imu_online != 0U) &&
+        (joint_manager.yaw.isOnline()) &&
+        vision_reference_fresh;
+
+    // If vision remains selected but stops updating, hold the current IMU
+    // angle while the LQR path is being disabled instead of chasing the stale
+    // target through the legacy PID fallback.
+    if (vision_active != 0U && !vision_reference_fresh &&
+        gimbal_controller.imu_online != 0U)
+    {
+        Controller_Data.yaw.target_angle = gimbal_controller.yaw_imu_angle;
+    }
+
+    float yaw_lqr_reference_rad = gimbal_controller.yaw_imu_angle;
+    float yaw_lqr_velocity_ref_rad_s = 0.0f;
+    float yaw_lqr_acceleration_ref_rad_s2 = 0.0f;
+    if (yaw_lqr_request)
+    {
+        const float vision_yaw_rad =
+            (VisionComm_Data.yaw_angle - VisionComm_Data.yaw_offset_deg) *
+            (3.14159265358979f / 180.0f);
+        // Preserve the existing visual yaw sign convention.
+        yaw_lqr_reference_rad = -vision_yaw_rad;
+        yaw_lqr_velocity_ref_rad_s = -VisionComm_Data.yaw_velocity;
+        yaw_lqr_acceleration_ref_rad_s2 = -VisionComm_Data.yaw_acceleration;
+        yaw_lqr_reference_rad = nearestYawReference(
+            yaw_lqr_reference_rad, gimbal_controller.yaw_imu_angle);
+    }
+    gimbal_controller.SetYawLqrReference(
+        yaw_lqr_reference_rad,
+        yaw_lqr_velocity_ref_rad_s,
+        yaw_lqr_acceleration_ref_rad_s2,
+        yaw_lqr_request ? 1U : 0U);
+
     Controller_Data_Unit_t yaw_sync = vision_active ? Vision_Controller_Data.yaw : Controller_Data.yaw;
     yaw_sync.target_angle = Controller_Data.yaw.target_angle;
     yaw_sync.enabled = Controller_Data.yaw.enabled;
@@ -1807,14 +1858,13 @@ void GimbalUpdate()
     //   Vision uses USB CDC virtual COM; VOFA uses USART6 DMA.
     //   Keep both producers alive so enabling vision does not silence VOFA.
     // ---------------------------------------------------------------
-    const bool vision_online = VisionComm::Manager::Instance().IsConnected();
-    const bool force_send_enabled = (VisionComm_Data.force_send != 0);
-
-    if (vision_online || force_send_enabled)
+    // The protocol requires the gimbal to keep publishing 43-byte state
+    // frames so the vision side can receive its first frame during startup.
+    // Connection status is still refreshed above, but must not gate TX.
     {
         static uint8_t vision_counter = 0;
         vision_counter++;
-        if (vision_counter >= 2)  // 1000Hz / 5 = 200Hz
+        if (vision_counter >= 2)  // GimbalUpdate 1kHz / 2 = 500Hz
         {
             vision_counter = 0;
             VisionComm::Manager::Instance().Send();
